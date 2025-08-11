@@ -41,7 +41,8 @@ def login():
         "openid", 
         "email", 
         "profile", 
-        "https://www.googleapis.com/auth/youtube.readonly"
+        "https://www.googleapis.com/auth/youtube.readonly",
+        "https://www.googleapis.com/auth/youtube"
     ]
 
     request_uri = client.prepare_request_uri(

@@ -30,7 +30,6 @@ class YouTubeService:
                         pageToken=next_page_token
                     )
                     response = request.execute()
-                    print(f"--- YOUTUBE API RESPONSE ---\n{response}\n--------------------------")
                     
                     item_count = len(response.get('items', []))
                     watch_later_count += item_count
