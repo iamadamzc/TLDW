@@ -1,0 +1,53 @@
+ the fact that you have over 400 videos is very likely the issue. That's the key piece of information we were missing.
+
+The problem isn't the number of videos itself, but the time it takes to count them. Your code is trying to count all 400+ videos one page at a time (50 videos per API call). This process is likely taking too long, causing the function to hit a timeout limit on the server and fail silently, which results in the 0 count.
+
+This is a good problem to have—it means you're dealing with real-world data loads.
+
+## Action Plan: Diagnose the Timeout, Then Change the Strategy
+We'll do a quick test to prove it's a timeout, and then implement a much better, more efficient strategy.
+
+Step 1: Let's Prove It's a Timeout
+We need to see how long the counting process is taking. Let's add simple timers to the code.
+
+Go back to your get_user_playlists function in Replit.
+
+At the very top of your Python file, add import time.
+
+Modify the "Watch Later" try block to look like this, adding the lines marked with # ADD THIS:
+
+Python
+
+        try:
+            print("Starting Watch Later count...") # ADD THIS
+            start_time = time.time() # ADD THIS
+            watch_later_count = 0
+            next_page_token = None
+            
+            while True:
+                # ... your request code ...
+                response = request.execute()
+                # ...
+                # ... your counting logic ...
+                # ...
+                if not next_page_token:
+                    break
+            
+            end_time = time.time() # ADD THIS
+            print(f"SUCCESS: Counting finished in {end_time - start_time:.2f} seconds.") # ADD THIS
+            
+            playlists.append({
+                'id': 'WL',
+                'title': 'Watch Later',
+                'video_count': watch_later_count,
+                #...
+            })
+
+        except Exception as e:
+            print(f"ERROR: The process failed. Error: {e}") # ADD THIS
+            # ... the rest of your except block ...
+Now, run the test one more time and watch the Replit console carefully.
+
+If you see the "SUCCESS" message, tell me how many seconds it took.
+
+If you don't see the "SUCCESS" message and the app just hangs or shows the 0 count, it confirms the process is timing out.

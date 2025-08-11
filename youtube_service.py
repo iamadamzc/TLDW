@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -18,6 +19,8 @@ class YouTubeService:
             
             # First, add the special "Watch Later" playlist
             try:
+                print("Starting Watch Later count...")  # ADD THIS
+                start_time = time.time()  # ADD THIS
                 watch_later_count = 0
                 next_page_token = None
                 
@@ -38,6 +41,9 @@ class YouTubeService:
                     if not next_page_token:
                         break  # Exit loop if there are no more pages
                 
+                end_time = time.time()  # ADD THIS
+                print(f"SUCCESS: Counting finished in {end_time - start_time:.2f} seconds.")  # ADD THIS
+                
                 playlists.append({
                     'id': 'WL',
                     'title': 'Watch Later',
@@ -49,6 +55,7 @@ class YouTubeService:
                 logging.info(f"Successfully counted {watch_later_count} videos in Watch Later.")
 
             except HttpError as e:
+                print(f"ERROR: The process failed. Error: {e}")  # ADD THIS
                 logging.error(f"Could not access Watch Later playlist, even with permissions: {e}")
                 # Add it with a zero count so the UI doesn't break
                 playlists.append({
@@ -60,6 +67,7 @@ class YouTubeService:
                     'is_special': True
                 })
             except Exception as e:
+                print(f"ERROR: The process failed. Error: {e}")  # ADD THIS
                 logging.error(f"Unexpected error accessing Watch Later: {e}")
                 playlists.append({
                     'id': 'WL',
