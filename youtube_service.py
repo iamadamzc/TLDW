@@ -31,10 +31,11 @@ class YouTubeService:
                 watch_later_count = 0
                 next_page_token = None
                 
-                # Directly count the items in the "Watch Later" playlist by paginating
+                # Try different approaches to access Watch Later
+                # First, try getting full details to see if there are hidden items
                 while True:
                     request = self.youtube.playlistItems().list(
-                        part="id",  # We only need the ID to count, which is efficient
+                        part="snippet,contentDetails,status",  # Get more detail including status
                         playlistId="WL",
                         maxResults=50,
                         pageToken=next_page_token
@@ -43,6 +44,18 @@ class YouTubeService:
                     print(f"Watch Later API response: {response}")
                     print(f"Items count: {len(response.get('items', []))}")
                     print(f"Page info: {response.get('pageInfo', {})}")
+                    
+                    # Also try to get the playlist metadata itself on first iteration
+                    if next_page_token is None:
+                        try:
+                            playlist_request = self.youtube.playlists().list(
+                                part="snippet,contentDetails,status",
+                                id="WL"
+                            )
+                            playlist_response = playlist_request.execute()
+                            print(f"Watch Later playlist metadata: {playlist_response}")
+                        except Exception as e:
+                            print(f"Could not get Watch Later playlist metadata: {e}")
                     
                     item_count = len(response.get('items', []))
                     watch_later_count += item_count
