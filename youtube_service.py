@@ -15,6 +15,14 @@ class YouTubeService:
     def get_user_playlists(self):
         """Get user's YouTube playlists, including Watch Later and filtering out YouTube Music"""
         try:
+            # Debug: Check which YouTube channel we're accessing
+            channel_response = self.youtube.channels().list(part="snippet", mine=True).execute()
+            if channel_response.get('items'):
+                channel_info = channel_response['items'][0]['snippet']
+                print(f"DEBUG: Accessing YouTube channel: {channel_info.get('title')} ({channel_info.get('customUrl', 'No custom URL')})")
+            else:
+                print("DEBUG: No YouTube channel found for this account")
+            
             playlists = []
             
             # First, add the special "Watch Later" playlist

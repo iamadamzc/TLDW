@@ -69,6 +69,8 @@ def callback():
     )
 
     token_data = token_response.json()
+    print(f"DEBUG: OAuth token response: {token_data}")
+    print(f"DEBUG: Granted scopes: {token_data.get('scope', 'No scope info')}")
     client.parse_request_body_response(json.dumps(token_data))
 
     userinfo_endpoint = google_provider_cfg["userinfo_endpoint"]
