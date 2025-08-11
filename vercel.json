@@ -20,11 +20,5 @@
     "FLASK_ENV": "production",
     "PYTHONPATH": "/var/task"
   },
-  "functions": {
-    "api/index.py": {
-      "maxDuration": 30,
-      "memory": 1024
-    }
-  },
   "regions": ["iad1"]
 }
