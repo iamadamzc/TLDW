@@ -29,6 +29,15 @@ def dashboard():
         
         logging.info(f"Retrieved {len(playlists)} playlists")
         
+        # Debug: Log Watch Later playlist details
+        watch_later = next((p for p in playlists if p['id'] == 'WL'), None)
+        if watch_later:
+            logging.info(f"🎯 WATCH LATER PLAYLIST: {watch_later['title']} - {watch_later['video_count']} videos")
+            if 'Error' in watch_later['title']:
+                logging.warning(f"Watch Later error: {watch_later['description']}")
+        else:
+            logging.warning("Watch Later playlist not found in results")
+        
         # Get user's selected playlist if any
         selected_playlist_id = current_user.selected_playlist_id
         videos = []
@@ -76,6 +85,36 @@ def select_playlist():
     except Exception as e:
         logging.error(f"Error selecting playlist: {e}")
         return jsonify({"error": "Failed to load playlist videos"}), 500
+
+@main_routes.route("/test-watch-later")
+@login_required
+def test_watch_later():
+    """Test route to verify Watch Later fix"""
+    try:
+        youtube_service = YouTubeService(current_user.access_token)
+        playlists = youtube_service.get_user_playlists()
+        
+        watch_later = next((p for p in playlists if p['id'] == 'WL'), None)
+        
+        if watch_later:
+            result = {
+                "status": "success",
+                "watch_later": watch_later,
+                "message": f"Watch Later playlist found with {watch_later['video_count']} videos"
+            }
+        else:
+            result = {
+                "status": "error",
+                "message": "Watch Later playlist not found"
+            }
+            
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "message": f"Error testing Watch Later: {str(e)}"
+        })
 
 @main_routes.route("/api/summarize", methods=["POST"])
 @login_required
