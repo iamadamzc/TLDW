@@ -82,17 +82,31 @@ def select_playlist():
 def summarize_videos():
     """API endpoint to summarize selected videos"""
     try:
+        logging.info(f"Summarize endpoint called by user: {current_user.email}")
+        
         data = request.get_json()
+        if not data:
+            logging.error("No JSON data received")
+            return jsonify({"error": "Invalid request format"}), 400
+            
         video_ids = data.get("video_ids", [])
+        logging.info(f"Processing {len(video_ids)} video IDs: {video_ids}")
         
         if not video_ids:
             return jsonify({"error": "No videos selected"}), 400
         
+        # Check if user has access token
+        if not current_user.access_token:
+            logging.error("User has no access token")
+            return jsonify({"error": "Authentication required. Please sign in again."}), 401
+
         # Initialize services
         youtube_service = YouTubeService(current_user.access_token)
         transcript_service = TranscriptService()
         summarizer = VideoSummarizer()
         email_service = EmailService()
+        
+        logging.info("Services initialized successfully")
         
         summaries_data = []
         
@@ -144,5 +158,8 @@ def summarize_videos():
             return jsonify({"error": "Failed to send email digest"}), 500
             
     except Exception as e:
-        logging.error(f"Error in summarize_videos: {e}")
-        return jsonify({"error": "Failed to process videos"}), 500
+        logging.error(f"Error in summarize_videos endpoint: {e}")
+        logging.error(f"Error type: {type(e).__name__}")
+        import traceback
+        logging.error(f"Full traceback: {traceback.format_exc()}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
