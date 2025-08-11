@@ -21,8 +21,13 @@ def index():
 def dashboard():
     """Main dashboard after login"""
     try:
+        logging.info(f"Loading dashboard for user {current_user.email}")
+        logging.info(f"Access token exists: {bool(current_user.access_token)}")
+        
         youtube_service = YouTubeService(current_user.access_token)
         playlists = youtube_service.get_user_playlists()
+        
+        logging.info(f"Retrieved {len(playlists)} playlists")
         
         # Get user's selected playlist if any
         selected_playlist_id = current_user.selected_playlist_id
@@ -39,8 +44,12 @@ def dashboard():
                              
     except Exception as e:
         logging.error(f"Error loading dashboard: {e}")
-        flash("Error loading YouTube data. Please try signing in again.", "error")
-        return redirect(url_for("google_auth.logout"))
+        flash("The YouTube API requires additional permissions. Please sign out and sign in again to grant YouTube access.", "error")
+        return render_template("index.html", 
+                             authenticated=True,
+                             playlists=[], 
+                             videos=[],
+                             selected_playlist_id=None)
 
 @main_routes.route("/api/select-playlist", methods=["POST"])
 @login_required

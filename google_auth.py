@@ -49,7 +49,8 @@ def login():
         redirect_uri=request.base_url.replace("http://", "https://") + "/callback",
         scope=scopes,
         access_type="offline",  # Request refresh token
-        prompt="consent"  # Force consent to get refresh token
+        prompt="consent",  # Force consent to get refresh token
+        include_granted_scopes="true"  # Include previously granted scopes
     )
     return redirect(request_uri)
 
