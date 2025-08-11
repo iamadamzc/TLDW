@@ -4,6 +4,13 @@
 
 TL;DW is a web application that generates AI-powered summaries of YouTube videos from user playlists and delivers them via email. The application integrates with Google OAuth for authentication, YouTube API for playlist access, and OpenAI for intelligent summarization. Users can select videos from their YouTube playlists, generate summaries with a single click, and receive formatted email digests containing the summarized content.
 
+## Recent Changes (August 2025)
+
+- **Watch Later Limitation Identified**: YouTube Data API has restricted access to Watch Later playlists, showing 0 videos even when the web interface shows 449 videos. This is an API limitation, not a permissions or timeout issue.
+- **Music Playlist Filtering**: Successfully implemented filtering to exclude auto-generated YouTube Music playlists while preserving user-created music playlists.
+- **OAuth Scope Enhancement**: Added full YouTube management permissions to enable comprehensive playlist access.
+- **Email System**: Fully functional email delivery using Resend API with formatted HTML templates.
+
 ## User Preferences
 
 Preferred communication style: Simple, everyday language.
