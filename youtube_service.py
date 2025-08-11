@@ -19,6 +19,7 @@ class YouTubeService:
             
             # First, add the special "Watch Later" playlist
             try:
+                print("Starting Watch Later count...")
                 watch_later_count = 0
                 next_page_token = None
                 
@@ -31,6 +32,9 @@ class YouTubeService:
                         pageToken=next_page_token
                     )
                     response = request.execute()
+                    print(f"Watch Later API response: {response}")
+                    print(f"Items count: {len(response.get('items', []))}")
+                    print(f"Page info: {response.get('pageInfo', {})}")
                     
                     item_count = len(response.get('items', []))
                     watch_later_count += item_count
