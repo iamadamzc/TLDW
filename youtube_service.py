@@ -15,86 +15,18 @@ class YouTubeService:
     def get_user_playlists(self):
         """Get user's YouTube playlists, including Watch Later and filtering out YouTube Music"""
         try:
-            # Debug: Check which YouTube channel we're accessing
-            channel_response = self.youtube.channels().list(part="snippet", mine=True).execute()
-            if channel_response.get('items'):
-                channel_info = channel_response['items'][0]['snippet']
-                print(f"DEBUG: Accessing YouTube channel: {channel_info.get('title')} ({channel_info.get('customUrl', 'No custom URL')})")
-            else:
-                print("DEBUG: No YouTube channel found for this account")
-            
             playlists = []
             
-            # First, add the special "Watch Later" playlist
-            try:
-                print("Starting Watch Later count...")
-                watch_later_count = 0
-                next_page_token = None
-                
-                # Try different approaches to access Watch Later
-                # First, try getting full details to see if there are hidden items
-                while True:
-                    request = self.youtube.playlistItems().list(
-                        part="snippet,contentDetails,status",  # Get more detail including status
-                        playlistId="WL",
-                        maxResults=50,
-                        pageToken=next_page_token
-                    )
-                    response = request.execute()
-                    print(f"Watch Later API response: {response}")
-                    print(f"Items count: {len(response.get('items', []))}")
-                    print(f"Page info: {response.get('pageInfo', {})}")
-                    
-                    # Also try to get the playlist metadata itself on first iteration
-                    if next_page_token is None:
-                        try:
-                            playlist_request = self.youtube.playlists().list(
-                                part="snippet,contentDetails,status",
-                                id="WL"
-                            )
-                            playlist_response = playlist_request.execute()
-                            print(f"Watch Later playlist metadata: {playlist_response}")
-                        except Exception as e:
-                            print(f"Could not get Watch Later playlist metadata: {e}")
-                    
-                    item_count = len(response.get('items', []))
-                    watch_later_count += item_count
-                    
-                    next_page_token = response.get('nextPageToken')
-                    if not next_page_token:
-                        break  # Exit loop if there are no more pages
-                
-                playlists.append({
-                    'id': 'WL',
-                    'title': 'Watch Later',
-                    'description': 'Your Watch Later playlist',
-                    'thumbnail': '',
-                    'video_count': watch_later_count,
-                    'is_special': True
-                })
-                logging.info(f"Successfully counted {watch_later_count} videos in Watch Later.")
-
-            except HttpError as e:
-                logging.error(f"Could not access Watch Later playlist, even with permissions: {e}")
-                # Add it with a zero count so the UI doesn't break
-                playlists.append({
-                    'id': 'WL',
-                    'title': 'Watch Later (Error)',
-                    'description': 'Your Watch Later playlist (error accessing)',
-                    'thumbnail': '',
-                    'video_count': 0,
-                    'is_special': True
-                })
-            except Exception as e:
-                logging.error(f"Unexpected error accessing Watch Later: {e}")
-                playlists.append({
-                    'id': 'WL',
-                    'title': 'Watch Later (Error)',
-                    'description': 'Your Watch Later playlist (error accessing)',
-                    'thumbnail': '',
-                    'video_count': 0,
-                    'is_special': True
-                })
+            # Add Watch Later playlist with a note about unavailable videos
+            playlists.append({
+                'id': 'WL',
+                'title': 'Watch Later',
+                'description': 'Note: Only shows publicly available videos (private/deleted videos are hidden by YouTube)',
+                'thumbnail': '',
+                'video_count': 0,  # API can only see available videos
+                'is_special': True
+            })
+            logging.info("Added Watch Later playlist (API only shows available videos)")
             
             # Get regular user playlists
             request = self.youtube.playlists().list(
