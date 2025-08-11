@@ -20,7 +20,7 @@ class EmailService:
             html_content = self._generate_email_html(summaries_data)
             
             payload = {
-                "from": "TL;DW <noreply@yourdomain.com>",
+                "from": "TL;DW <noreply@resend.dev>",
                 "to": [user_email],
                 "subject": "Your TL;DW Video Digest",
                 "html": html_content
@@ -47,8 +47,7 @@ class EmailService:
     def _generate_email_html(self, summaries_data):
         """Generate HTML content for the email digest"""
         
-        html_template = """
-<!DOCTYPE html>
+        html_template = '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -56,7 +55,7 @@ class EmailService:
     <title>TL;DW Video Digest</title>
     <style>
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: Arial, sans-serif;
             line-height: 1.6;
             color: #333;
             max-width: 800px;
@@ -155,26 +154,41 @@ class EmailService:
     </div>
 </body>
 </html>
-"""
+'''
 
         video_summaries_html = ""
         for data in summaries_data:
-            video_html = f"""
+            # Escape HTML special characters in user content
+            title = self._escape_html(data['title'])
+            channel_title = self._escape_html(data.get('channel_title', ''))
+            summary = data['summary']  # Summary is already formatted HTML
+            
+            video_html = f'''
     <div class="video-card">
         <div class="video-header clearfix">
             <img src="{data.get('thumbnail', '')}" alt="Video thumbnail" class="thumbnail">
             <div class="video-title">
                 <a href="https://www.youtube.com/watch?v={data['video_id']}" target="_blank">
-                    {data['title']}
+                    {title}
                 </a>
             </div>
-            <div class="channel-name">{data.get('channel_title', '')}</div>
+            <div class="channel-name">{channel_title}</div>
         </div>
         <div class="summary-content">
-            {data['summary']}
+            {summary}
         </div>
     </div>
-"""
+'''
             video_summaries_html += video_html
 
         return html_template.format(video_summaries=video_summaries_html)
+    
+    def _escape_html(self, text):
+        """Escape HTML special characters"""
+        if not text:
+            return ""
+        return (text.replace('&', '&amp;')
+                   .replace('<', '&lt;')
+                   .replace('>', '&gt;')
+                   .replace('"', '&quot;')
+                   .replace("'", '&#x27;'))
