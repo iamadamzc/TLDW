@@ -17,53 +17,27 @@ class YouTubeService:
             playlists = []
             
             # First, add the special "Watch Later" playlist
-            logging.info("Attempting to access Watch Later playlist...")
             try:
-                # Try different approaches to get Watch Later count
                 watch_later_count = 0
+                next_page_token = None
                 
-                # Method 1: Try getting a sample to see if we have access
-                test_request = self.youtube.playlistItems().list(
-                    part="snippet",
-                    playlistId="WL",
-                    maxResults=1
-                )
-                test_response = test_request.execute()
-                logging.info(f"Watch Later test response: {len(test_response.get('items', []))} items")
-                
-                if test_response.get('items'):
-                    # We have access, now count properly
-                    next_page_token = None
-                    total_results = test_response.get('pageInfo', {}).get('totalResults', 0)
-                    logging.info(f"Watch Later total results from pageInfo: {total_results}")
+                # Directly count the items in the "Watch Later" playlist by paginating
+                while True:
+                    request = self.youtube.playlistItems().list(
+                        part="id",  # We only need the ID to count, which is efficient
+                        playlistId="WL",
+                        maxResults=50,
+                        pageToken=next_page_token
+                    )
+                    response = request.execute()
                     
-                    # If totalResults is available and reasonable, use it
-                    if total_results and total_results < 1000:
-                        watch_later_count = total_results
-                    else:
-                        # Count manually by paginating
-                        while True:
-                            count_request = self.youtube.playlistItems().list(
-                                part="id",
-                                playlistId="WL",
-                                maxResults=50,
-                                pageToken=next_page_token
-                            )
-                            count_response = count_request.execute()
-                            current_batch = len(count_response.get('items', []))
-                            watch_later_count += current_batch
-                            logging.info(f"Watch Later batch: {current_batch} items, total so far: {watch_later_count}")
-                            
-                            next_page_token = count_response.get('nextPageToken')
-                            if not next_page_token or current_batch == 0:
-                                break
-                            
-                            # Safety limit to prevent infinite loops
-                            if watch_later_count > 2000:
-                                logging.warning("Watch Later count exceeded 2000, stopping pagination")
-                                break
+                    item_count = len(response.get('items', []))
+                    watch_later_count += item_count
+                    
+                    next_page_token = response.get('nextPageToken')
+                    if not next_page_token:
+                        break  # Exit loop if there are no more pages
                 
-                # Always add Watch Later
                 playlists.append({
                     'id': 'WL',
                     'title': 'Watch Later',
@@ -72,16 +46,15 @@ class YouTubeService:
                     'video_count': watch_later_count,
                     'is_special': True
                 })
-                logging.info(f"Successfully added Watch Later playlist with {watch_later_count} videos")
-                
+                logging.info(f"Successfully counted {watch_later_count} videos in Watch Later.")
+
             except HttpError as e:
-                logging.error(f"HttpError accessing Watch Later playlist: {e}")
-                logging.error(f"Error details: {e.resp.status}, {e.content}")
-                # Still add it, but mark as having permission issues
+                logging.error(f"Could not access Watch Later playlist, even with permissions: {e}")
+                # Add it with a zero count so the UI doesn't break
                 playlists.append({
                     'id': 'WL',
-                    'title': 'Watch Later',
-                    'description': 'Your Watch Later playlist (permission limited)',
+                    'title': 'Watch Later (Error)',
+                    'description': 'Your Watch Later playlist (error accessing)',
                     'thumbnail': '',
                     'video_count': 0,
                     'is_special': True
@@ -90,7 +63,7 @@ class YouTubeService:
                 logging.error(f"Unexpected error accessing Watch Later: {e}")
                 playlists.append({
                     'id': 'WL',
-                    'title': 'Watch Later',
+                    'title': 'Watch Later (Error)',
                     'description': 'Your Watch Later playlist (error accessing)',
                     'thumbnail': '',
                     'video_count': 0,

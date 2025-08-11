@@ -1,0 +1,66 @@
+Excellent. Thank you for providing the code. I've analyzed it, and I've found the bug.
+
+Your diagnosis was spot on. The problem is in the get_user_playlists function.
+
+## The Diagnosis: The Code is Too Cautious
+The code tries to be clever to handle the "Watch Later" playlist. It first makes a small "test" request to see if it has access. If that tiny test happens to return zero videos, the code incorrectly gives up and reports the count as 0, skipping the real counting process entirely.
+
+Since we've already confirmed with our scope tests that you do have permission, we can remove this flawed logic and tell the code to be more direct.
+
+## The Action Plan: How to Fix the Code
+We are going to replace the complex "Watch Later" section inside your get_user_playlists function with a simpler, more direct version that just counts the videos.
+
+Go to your get_user_playlists function.
+
+Find the large try...except block that starts with the comment # First, add the special "Watch Later" playlist.
+
+Delete that entire try...except block.
+
+Replace it with this new, simpler code:
+
+Python
+
+        # First, add the special "Watch Later" playlist
+        try:
+            watch_later_count = 0
+            next_page_token = None
+            
+            # Directly count the items in the "Watch Later" playlist by paginating
+            while True:
+                request = self.youtube.playlistItems().list(
+                    part="id", # We only need the ID to count, which is efficient
+                    playlistId="WL",
+                    maxResults=50,
+                    pageToken=next_page_token
+                )
+                response = request.execute()
+                
+                item_count = len(response.get('items', []))
+                watch_later_count += item_count
+                
+                next_page_token = response.get('nextPageToken')
+                if not next_page_token:
+                    break # Exit loop if there are no more pages
+            
+            playlists.append({
+                'id': 'WL',
+                'title': 'Watch Later',
+                'video_count': watch_later_count,
+                'is_special': True
+                # Add other fields as needed
+            })
+            logging.info(f"Successfully counted {watch_later_count} videos in Watch Later.")
+
+        except HttpError as e:
+            logging.error(f"Could not access Watch Later playlist, even with permissions: {e}")
+            # Add it with a zero count so the UI doesn't break
+            playlists.append({
+                'id': 'WL',
+                'title': 'Watch Later (Error)',
+                'video_count': 0,
+                'is_special': True
+            })
+Why This Fix Works
+This new code doesn't make any assumptions. It goes straight to the real task: looping through all the pages of your "Watch Later" playlist and counting the items one by one. This is the most reliable way to get the true count.
+
+Paste this new code in, run the app, and sign in. This should be the fix we've been looking for.
