@@ -84,8 +84,18 @@ def callback():
         flash("User email not available or not verified by Google.", "error")
         return redirect(url_for("main_routes.index"))
 
+    print(f"DEBUG: Looking for user with google_id: {google_id}")
     user = User.query.filter_by(google_id=google_id).first()
+    print(f"DEBUG: Found existing user: {user}")
+    
     if not user:
+        print(f"DEBUG: Creating new user: {users_name}, {users_email}")
+        # Check if username already exists and make it unique if needed
+        existing_username = User.query.filter_by(username=users_name).first()
+        if existing_username:
+            users_name = f"{users_name}_{google_id[-4:]}"  # Add last 4 digits of google_id
+            print(f"DEBUG: Username exists, using: {users_name}")
+        
         user = User(
             username=users_name, 
             email=users_email, 
@@ -95,7 +105,8 @@ def callback():
         )
         db.session.add(user)
     else:
-        # Update tokens
+        print(f"DEBUG: Updating existing user tokens")
+        # Update tokens for existing user
         user.access_token = token_data.get("access_token")
         if token_data.get("refresh_token"):  # Only update if we got a new one
             user.refresh_token = token_data.get("refresh_token")
