@@ -17,16 +17,66 @@ class YouTubeService:
         try:
             playlists = []
             
-            # Add Watch Later playlist with a note about unavailable videos
-            playlists.append({
-                'id': 'WL',
-                'title': 'Watch Later',
-                'description': 'Note: Only shows publicly available videos (private/deleted videos are hidden by YouTube)',
-                'thumbnail': '',
-                'video_count': 0,  # API can only see available videos
-                'is_special': True
-            })
-            logging.info("Added Watch Later playlist (API only shows available videos)")
+            # First, add the special "Watch Later" playlist - test timeout theory
+            try:
+                print("Starting Watch Later count...")
+                start_time = time.time()
+                watch_later_count = 0
+                next_page_token = None
+                page_number = 0
+                
+                # Count the items in the "Watch Later" playlist by paginating
+                while True:
+                    page_number += 1
+                    print(f"Processing page {page_number}...")
+                    
+                    request = self.youtube.playlistItems().list(
+                        part="id",  # Minimal data for counting
+                        playlistId="WL",
+                        maxResults=50,
+                        pageToken=next_page_token
+                    )
+                    response = request.execute()
+                    
+                    item_count = len(response.get('items', []))
+                    watch_later_count += item_count
+                    
+                    print(f"Page {page_number}: Found {item_count} videos, total so far: {watch_later_count}")
+                    
+                    next_page_token = response.get('nextPageToken')
+                    if not next_page_token:
+                        break  # Exit loop if there are no more pages
+                    
+                    # Safety check to prevent infinite loops
+                    if page_number > 20:  # Should be enough for 1000 videos
+                        print(f"Safety limit reached at page {page_number}")
+                        break
+                
+                end_time = time.time()
+                duration = end_time - start_time
+                print(f"SUCCESS: Counted {watch_later_count} videos in {duration:.2f} seconds across {page_number} pages")
+                
+                playlists.append({
+                    'id': 'WL',
+                    'title': 'Watch Later',
+                    'description': 'Your Watch Later playlist',
+                    'thumbnail': '',
+                    'video_count': watch_later_count,
+                    'is_special': True
+                })
+                logging.info(f"Successfully counted {watch_later_count} videos in Watch Later.")
+
+            except Exception as e:
+                print(f"ERROR: Watch Later counting failed: {e}")
+                logging.error(f"Error accessing Watch Later: {e}")
+                playlists.append({
+                    'id': 'WL',
+                    'title': 'Watch Later (Error)',
+                    'description': 'Your Watch Later playlist (error accessing)',
+                    'thumbnail': '',
+                    'video_count': 0,
+                    'is_special': True
+                })
             
             # Get regular user playlists
             request = self.youtube.playlists().list(
