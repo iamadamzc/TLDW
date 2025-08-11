@@ -37,18 +37,12 @@ def login():
     authorization_endpoint = google_provider_cfg["authorization_endpoint"]
 
     # Request YouTube access scope in addition to basic profile
-    scopes = [
-        "openid", 
-        "email", 
-        "profile", 
-        "https://www.googleapis.com/auth/youtube.readonly",
-        "https://www.googleapis.com/auth/youtube"
-    ]
+    scope_string = "openid email profile https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube"
 
     request_uri = client.prepare_request_uri(
         authorization_endpoint,
         redirect_uri=request.base_url.replace("http://", "https://") + "/callback",
-        scope=scopes,
+        scope=scope_string,
         access_type="offline",  # Request refresh token
         prompt="consent",  # Force consent to get refresh token
         include_granted_scopes="true"  # Include previously granted scopes
