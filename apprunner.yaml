@@ -8,28 +8,29 @@ run:
   command: gunicorn --bind 0.0.0.0:8080 --workers 1 app:app
   network:
     port: 8080
-  env:
+secrets:
+  - name: SESSION_SECRET
+    valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:SESSION_SECRET::
+  - name: GOOGLE_OAUTH_CLIENT_ID
+    valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:GOOGLE_OAUTH_CLIENT_ID::
+  - name: GOOGLE_OAUTH_CLIENT_SECRET
+    valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:GOOGLE_OAUTH_CLIENT_SECRET::
+  - name: OPENAI_API_KEY
+    valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:OPENAI_API_KEY::
+  - name: RESEND_API_KEY
+    valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:RESEND_API_KEY::
+  - name: DEEPGRAM_API_KEY
+    valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:DEEPGRAM_API_KEY::
+  secrets:
     - name: SESSION_SECRET
-      value_from:
-        secret_arn: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ
-        secret_key: SESSION_SECRET
+      value_from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:SESSION_SECRET::
     - name: GOOGLE_OAUTH_CLIENT_ID
-      value_from:
-        secret_arn: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ
-        secret_key: GOOGLE_OAUTH_CLIENT_ID
+      value_from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:GOOGLE_OAUTH_CLIENT_ID::
     - name: GOOGLE_OAUTH_CLIENT_SECRET
-      value_from:
-        secret_arn: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ
-        secret_key: GOOGLE_OAUTH_CLIENT_SECRET
+      value_from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:GOOGLE_OAUTH_CLIENT_SECRET::
     - name: OPENAI_API_KEY
-      value_from:
-        secret_arn: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ
-        secret_key: OPENAI_API_KEY
+      value_from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:OPENAI_API_KEY::
     - name: RESEND_API_KEY
-      value_from:
-        secret_arn: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ
-        secret_key: RESEND_API_KEY
+      value_from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:RESEND_API_KEY::
     - name: DEEPGRAM_API_KEY
-      value_from:
-        secret_arn: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ
-        secret_key: DEEPGRAM_API_KEY
+      value_from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GVLxiZ:DEEPGRAM_API_KEY::
