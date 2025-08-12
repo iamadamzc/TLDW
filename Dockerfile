@@ -29,6 +29,7 @@ EXPOSE 8000
 ENV FLASK_APP=app.py
 ENV FLASK_ENV=production
 ENV PYTHONPATH=/app
+ENV PORT=8000
 
 # Run the application with Gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "300", "app:app"]

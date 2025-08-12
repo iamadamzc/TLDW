@@ -3,7 +3,7 @@ runtime: docker
 build:
   commands:
     build:
-      - echo "Building the Docker image..."
+      - echo "Building Docker image"
 run:
   runtime-version: latest
   command: gunicorn --bind 0.0.0.0:8000 --workers 2 --timeout 300 app:app
@@ -15,3 +15,5 @@ run:
       value: production
     - name: PYTHONPATH
       value: /app
+    - name: PORT
+      value: "8000"
