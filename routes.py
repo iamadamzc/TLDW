@@ -65,10 +65,15 @@ def dashboard():
 def select_playlist():
     """API endpoint to select a playlist and get its videos"""
     try:
+        logging.info(f"Select playlist API called by user: {current_user.email}")
+        
         data = request.get_json()
         playlist_id = data.get("playlist_id")
         
+        logging.info(f"Requested playlist ID: {playlist_id}")
+        
         if not playlist_id:
+            logging.error("No playlist ID provided")
             return jsonify({"error": "Playlist ID required"}), 400
         
         # Save user's playlist selection
@@ -76,15 +81,25 @@ def select_playlist():
         from app import db
         db.session.commit()
         
+        logging.info(f"Saved playlist selection: {playlist_id}")
+        
         # Get videos from the selected playlist
         youtube_service = YouTubeService(current_user.access_token)
         videos = youtube_service.get_playlist_videos(playlist_id)
         
+        logging.info(f"Retrieved {len(videos)} videos from playlist {playlist_id}")
+        
+        # Log first few video titles for debugging
+        for i, video in enumerate(videos[:3]):
+            logging.info(f"Video {i+1}: {video.get('title', 'No title')}")
+        
         return jsonify({"videos": videos})
         
     except Exception as e:
-        logging.error(f"Error selecting playlist: {e}")
-        return jsonify({"error": "Failed to load playlist videos"}), 500
+        logging.error(f"Error selecting playlist {playlist_id}: {e}")
+        import traceback
+        logging.error(f"Full traceback: {traceback.format_exc()}")
+        return jsonify({"error": f"Failed to load playlist videos: {str(e)}"}), 500
 
 @main_routes.route("/test-watch-later")
 @login_required
