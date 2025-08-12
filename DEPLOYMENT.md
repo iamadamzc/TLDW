@@ -1,12 +1,172 @@
-# TL;DW Vercel Deployment Guide
+# TL;DW Deployment Guide
 
-## Prerequisites
+This guide covers deployment options for the TL;DW application, with a focus on AWS App Runner (recommended) and Vercel as an alternative.
+
+## AWS App Runner Deployment (Recommended)
+
+AWS App Runner provides a simple way to deploy containerized applications with automatic scaling and load balancing.
+
+### Prerequisites
+
+1. **AWS Account**: Sign up at [aws.amazon.com](https://aws.amazon.com)
+2. **GitHub Repository**: Push your code to GitHub
+3. **Environment Variables**: Prepare the required environment variables
+
+### Deployment Options
+
+You can deploy using either **Docker Runtime** or **Python Runtime**. Both configurations are provided and tested.
+
+#### Option 1: Docker Runtime (apprunner.yaml)
+- Uses the existing Dockerfile
+- Runs on port 8000
+- More control over the environment
+- Slightly longer build times
+
+#### Option 2: Python Runtime (apprunner-python-runtime.yaml) - **Recommended**
+- Uses App Runner's managed Python environment
+- Runs on port 8080
+- Faster deployments
+- Automatic dependency management
+
+### Step-by-Step Deployment
+
+#### 1. Choose Your Configuration
+
+**For Docker Runtime:**
+- Use the existing `apprunner.yaml` file
+- No changes needed
+
+**For Python Runtime:**
+- Rename `apprunner-python-runtime.yaml` to `apprunner.yaml`
+- Or copy its contents to replace the existing `apprunner.yaml`
+
+#### 2. Set Up App Runner Service
+
+1. Go to [AWS App Runner Console](https://console.aws.amazon.com/apprunner/)
+2. Click "Create service"
+3. Choose "Source code repository"
+4. Connect to GitHub and select your repository
+5. Choose branch (usually `main`)
+6. App Runner will automatically detect the `apprunner.yaml` configuration
+
+#### 3. Configure Environment Variables
+
+In the App Runner service configuration, add these environment variables:
+
+```
+SESSION_SECRET=your-super-secret-session-key-here
+GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
+OPENAI_API_KEY=your-openai-api-key
+DATABASE_URL=your-postgresql-database-url
+RESEND_API_KEY=your-resend-api-key
+```
+
+#### 4. Deploy
+
+1. Review your configuration
+2. Click "Create & deploy"
+3. App Runner will build and deploy your application
+4. You'll get a unique App Runner URL
+
+### Configuration Files Explained
+
+#### Docker Runtime Configuration (apprunner.yaml)
+```yaml
+version: 1.0
+runtime: docker
+build:
+  dockerfile: Dockerfile
+```
+
+#### Python Runtime Configuration (apprunner-python-runtime.yaml)
+```yaml
+version: 1.0
+runtime: python3
+build:
+  commands:
+    build:
+      - pip install -r requirements.txt
+run:
+  command: gunicorn --bind 0.0.0.0:8080 --workers 1 app:app
+  network:
+    port: 8080
+```
+
+### Google OAuth Setup for App Runner
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create OAuth 2.0 credentials
+3. Add your App Runner URL to authorized redirect URIs:
+   ```
+   https://your-app-runner-url.region.awsapprunner.com/auth/callback
+   ```
+
+### Troubleshooting App Runner Deployment
+
+#### Common Issues
+
+1. **CREATE_FAILED Status**
+   - **Cause**: Incorrect apprunner.yaml syntax
+   - **Solution**: Ensure you're using the correct configuration for your chosen runtime
+   - **Check**: Don't mix Docker and Python runtime syntax
+
+2. **Build Failures**
+   - **Cause**: Missing dependencies or syntax errors in requirements.txt
+   - **Solution**: Verify all dependencies are properly listed with versions
+   - **Check**: Test locally with `pip install -r requirements.txt`
+
+3. **Health Check Failures**
+   - **Cause**: Application not responding on the correct port
+   - **Solution**: Ensure your app runs on port 8000 (Docker) or 8080 (Python)
+   - **Check**: The `/health` endpoint should return HTTP 200
+
+4. **Runtime Conflicts**
+   - **Cause**: Using wrong configuration file
+   - **Solution**: Use only one apprunner.yaml file with consistent runtime syntax
+
+#### Debugging Steps
+
+1. **Check App Runner Logs**
+   - Go to App Runner console
+   - View deployment and application logs
+   - Look for specific error messages
+
+2. **Validate Configuration Locally**
+   ```bash
+   # For Docker runtime
+   docker build -t test-app .
+   docker run -p 8000:8000 test-app
+   curl http://localhost:8000/health
+   
+   # For Python runtime
+   pip install -r requirements.txt
+   gunicorn --bind 0.0.0.0:8080 --workers 1 app:app
+   ```
+
+3. **Check IAM Permissions**
+   - Ensure App Runner has necessary permissions
+   - Verify GitHub connection is working
+
+### Performance and Scaling
+
+App Runner automatically handles:
+- **Auto Scaling**: Based on incoming requests
+- **Load Balancing**: Distributes traffic across instances
+- **Health Checks**: Uses the `/health` endpoint
+- **HTTPS**: Automatic SSL certificate
+
+---
+
+## Vercel Deployment (Alternative)
+
+### Prerequisites for Vercel
 
 1. **Vercel Account**: Sign up at [vercel.com](https://vercel.com)
 2. **GitHub Repository**: Push your code to GitHub
 3. **Environment Variables**: Prepare the required environment variables
 
-## Required Environment Variables
+## Required Environment Variables (Both Platforms)
 
 Set these in your Vercel dashboard under Project Settings > Environment Variables:
 
@@ -17,6 +177,7 @@ GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id
 GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
 OPENAI_API_KEY=your-openai-api-key
 DATABASE_URL=your-postgresql-database-url
+RESEND_API_KEY=your-resend-api-key
 ```
 
 ### Optional Variables
@@ -145,8 +306,47 @@ vercel --prod
 3. **Performance**: Monitor function execution time
 4. **API Usage**: Track YouTube API quota usage
 
-## Support
+---
 
+## Deployment Platform Comparison
+
+| Feature | AWS App Runner | Vercel |
+|---------|----------------|--------|
+| **Ease of Setup** | Medium | Easy |
+| **Auto Scaling** | ✅ Built-in | ✅ Built-in |
+| **Custom Domains** | ✅ Supported | ✅ Supported |
+| **Database** | External required | Vercel Postgres available |
+| **Build Time** | Medium | Fast |
+| **Cold Starts** | Minimal | Some |
+| **Pricing** | Pay per use | Free tier + pay per use |
+| **Docker Support** | ✅ Native | ❌ Limited |
+| **Long-running Tasks** | ✅ Supported | ❌ 10s timeout |
+| **WebSocket Support** | ✅ Supported | ❌ Limited |
+
+### Recommendation
+
+- **Choose App Runner** if you need:
+  - Docker deployment flexibility
+  - Long-running background tasks
+  - Full control over the runtime environment
+  - WebSocket support
+
+- **Choose Vercel** if you need:
+  - Fastest deployment setup
+  - Built-in database options
+  - Edge network optimization
+  - Serverless architecture
+
+## Support and Resources
+
+### App Runner Resources
+- **AWS App Runner Docs**: [docs.aws.amazon.com/apprunner](https://docs.aws.amazon.com/apprunner/)
+- **Configuration Reference**: [docs.aws.amazon.com/apprunner/latest/dg/config-file.html](https://docs.aws.amazon.com/apprunner/latest/dg/config-file.html)
+
+### Vercel Resources
 - **Vercel Docs**: [vercel.com/docs](https://vercel.com/docs)
 - **Flask on Vercel**: [vercel.com/guides/using-flask-with-vercel](https://vercel.com/guides/using-flask-with-vercel)
-- **Issues**: Check Vercel dashboard logs and GitHub issues
+
+### General Support
+- **GitHub Issues**: Report bugs and issues in the repository
+- **Application Logs**: Check platform-specific logging for debugging
