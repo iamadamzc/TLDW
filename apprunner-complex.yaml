@@ -1,0 +1,19 @@
+version: 1.0
+runtime: docker
+build:
+  commands:
+    build:
+      - echo "Building Docker image"
+run:
+  runtime-version: latest
+  command: gunicorn --bind 0.0.0.0:8000 --workers 2 --timeout 300 --access-logfile - --error-logfile - app:app
+  network:
+    port: 8000
+    env: PORT
+  env:
+    - name: FLASK_ENV
+      value: production
+    - name: PYTHONPATH
+      value: /app
+    - name: PORT
+      value: "8000"

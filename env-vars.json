@@ -1,0 +1,5 @@
+{
+  "FLASK_ENV": "production",
+  "PYTHONPATH": "/app",
+  "SESSION_SECRET": "your-session-secret-here"
+}
