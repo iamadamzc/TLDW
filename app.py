@@ -51,3 +51,8 @@ from routes import main_routes
 
 app.register_blueprint(google_auth)
 app.register_blueprint(main_routes)
+
+# Add health check endpoint for App Runner
+@app.route('/health')
+def health_check():
+    return {'status': 'healthy', 'message': 'TL;DW API is running'}, 200
