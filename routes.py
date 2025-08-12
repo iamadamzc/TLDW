@@ -96,7 +96,8 @@ def select_playlist():
         return jsonify({"videos": videos})
         
     except Exception as e:
-        logging.error(f"Error selecting playlist {playlist_id}: {e}")
+        playlist_id_str = locals().get('playlist_id', 'unknown')
+        logging.error(f"Error selecting playlist {playlist_id_str}: {e}")
         import traceback
         logging.error(f"Full traceback: {traceback.format_exc()}")
         return jsonify({"error": f"Failed to load playlist videos: {str(e)}"}), 500
