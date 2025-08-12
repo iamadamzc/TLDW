@@ -3,8 +3,7 @@ runtime: docker
 build:
   commands:
     build:
-      - cp Dockerfile.simple Dockerfile
-      - echo "Using simple Dockerfile"
+      - echo "Building with Docker"
 run:
   runtime-version: latest
   command: gunicorn --bind 0.0.0.0:8000 --workers 1 app:app
