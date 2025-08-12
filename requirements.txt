@@ -11,4 +11,5 @@ requests==2.32.4
 oauthlib==3.3.1
 werkzeug==3.1.3
 sqlalchemy==2.0.43
-psycopg2-binary
+psycopg2-binaryguni
+corn==21.2.0
