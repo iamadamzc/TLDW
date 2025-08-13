@@ -10,14 +10,14 @@ run:
     port: 8080
   secrets:
     - name: SESSION_SECRET
-      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-SESSION-SECRET-hJDTQ1
+      valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-SESSION-SECRET-hJDTQ1
     - name: GOOGLE_OAUTH_CLIENT_ID
-      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN
+      valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN
     - name: GOOGLE_OAUTH_CLIENT_SECRET
-      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI
+      valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI
     - name: OPENAI_API_KEY
-      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-OPENAI-API-KEY-5rNo6a
+      valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-OPENAI-API-KEY-5rNo6a
     - name: RESEND_API_KEY
-      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-RESEND-API-KEY-5O5Kdx
+      valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-RESEND-API-KEY-5O5Kdx
     - name: DEEPGRAM_API_KEY
-      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv
+      valueFrom: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv
