@@ -55,4 +55,21 @@ app.register_blueprint(main_routes)
 # Add health check endpoint for App Runner
 @app.route('/health')
 def health_check():
-    return {'status': 'healthy', 'message': 'TL;DW API is running'}, 200
+    """Enhanced health check with proxy status information"""
+    health_info = {
+        'status': 'healthy', 
+        'message': 'TL;DW API is running',
+        'proxy_enabled': os.getenv('USE_PROXIES', 'false').lower() == 'true'
+    }
+    
+    # Add proxy status if enabled
+    if health_info['proxy_enabled']:
+        try:
+            from proxy_manager import ProxyManager
+            proxy_manager = ProxyManager()
+            proxy_stats = proxy_manager.get_session_stats()
+            health_info['proxy_status'] = proxy_stats
+        except Exception as e:
+            health_info['proxy_status'] = {'error': str(e)}
+    
+    return health_info, 200

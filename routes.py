@@ -187,8 +187,9 @@ def summarize_videos():
                     logging.warning(f"Could not get details for video {video_id}")
                     continue
                 
-                # Get transcript
-                transcript = transcript_service.get_transcript(video_id)
+                # Get transcript with caption information for MVP optimization
+                has_captions = video_details.get('has_captions', None)
+                transcript = transcript_service.get_transcript(video_id, has_captions=has_captions)
                 if not transcript:
                     logging.warning(f"Could not get transcript for video {video_id}")
                     continue

@@ -4,6 +4,8 @@
 
 
 
+
+
   - Create OpenAI API key secret named `tldw-openai-api-key` in AWS Secrets Manager
   - Create Resend API key secret named `tldw-resend-api-key` in AWS Secrets Manager
   - Document the generated ARNs for use in App Runner configuration
@@ -11,22 +13,33 @@
 
 - [ ] 2. Update App Runner service IAM role permissions
   - Add secretsmanager:GetSecretValue permission to App Runner instance role
+
+
   - Scope permissions to specific secret ARNs for security
+
   - Test permissions using AWS CLI to verify access
 
 
   - _Requirements: 2.3_
 
 - [ ] 3. Update apprunner.yaml with secrets configuration
+
+
+
+
   - Add secrets section to apprunner.yaml with proper ARN references
   - Map OPENAI_API_KEY environment variable to OpenAI secret ARN
 
 
   - Map RESEND_API_KEY environment variable to Resend secret ARN
+
+
   - Validate YAML syntax and App Runner configuration format
   - _Requirements: 3.1, 3.2, 3.3_
 
 - [x] 4. Enhance error handling in summarizer service
+
+
 
 
   - Add validation check for empty OPENAI_API_KEY in summarizer.py
@@ -40,6 +53,7 @@
 - [ ] 5. Enhance error handling in email service
   - Add validation check for empty RESEND_API_KEY in email_service.py
   - Implement specific error handling for Resend authentication failures
+
   - Add logging for email service failures and API key validation
 
 

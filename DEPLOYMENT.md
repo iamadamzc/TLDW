@@ -241,11 +241,33 @@ vercel --prod
 
 ## Post-Deployment
 
-1. **Test the application**: Visit your Vercel URL
-2. **Check logs**: Use `vercel logs` or Vercel dashboard
-3. **Monitor performance**: Watch for any timeout issues
-4. **Test OAuth flow**: Ensure Google login works
-5. **Test Watch Later fix**: Verify the playlist bug is fixed
+1. **Test the application**: Visit your App Runner URL
+2. **Check logs**: Use App Runner console to view deployment and application logs
+3. **Test proxy configuration**: Run the proxy configuration test (see below)
+4. **Monitor performance**: Watch for any timeout issues
+5. **Test OAuth flow**: Ensure Google login works
+6. **Test transcript fetching**: Verify YouTube transcript fetching works without IP blocking
+
+### Testing Proxy Configuration
+
+To verify that the proxy configuration is working properly in App Runner:
+
+1. **SSH into App Runner instance** (if available) or check logs for the following test
+2. **Run the proxy test script**:
+   ```bash
+   python test_proxy_config.py
+   ```
+3. **Expected output should show**:
+   - ✅ USE_PROXIES environment variable set to "true"
+   - ✅ OXYLABS_PROXY_CONFIG environment variable configured
+   - ✅ AWS Secrets Manager access working
+   - ✅ ProxyManager initialization successful
+   - ✅ Proxy connectivity test passed
+
+4. **Check application logs** for proxy usage:
+   - Look for "ProxyManager initialized with Oxylabs proxy" messages
+   - Monitor for "Session created" and "Request success" log entries
+   - Watch for any "YouTube blocking detected" warnings
 
 ## Troubleshooting
 

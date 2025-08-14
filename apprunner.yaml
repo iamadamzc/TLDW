@@ -22,3 +22,8 @@ run:
       value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-RESEND-API-KEY-5O5Kdx
     - name: DEEPGRAM_API_KEY
       value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv
+    - name: OXYLABS_PROXY_CONFIG
+      value-from: arn:aws:secretsmanager:us-west-2:528131355234:secret:tldw-oxylabs-proxy-config-mkbzlM
+  env:
+    - name: USE_PROXIES
+      value: "true"

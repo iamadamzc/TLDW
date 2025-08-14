@@ -265,7 +265,7 @@ class YouTubeService:
             return []
 
     def get_video_details(self, video_id):
-        """Get detailed information about a specific video"""
+        """Get detailed information about a specific video including caption availability"""
         try:
             request = self.youtube.videos().list(
                 part="snippet,contentDetails",
@@ -275,6 +275,10 @@ class YouTubeService:
             
             if response.get('items'):
                 item = response['items'][0]
+                
+                # Check if captions are available
+                has_captions = item['contentDetails'].get('caption', 'false') == 'true'
+                
                 return {
                     'id': video_id,
                     'title': item['snippet']['title'],
@@ -282,7 +286,8 @@ class YouTubeService:
                     'thumbnail': item['snippet']['thumbnails'].get('medium', {}).get('url', ''),
                     'channel_title': item['snippet']['channelTitle'],
                     'published_at': item['snippet']['publishedAt'],
-                    'duration': item['contentDetails']['duration']
+                    'duration': item['contentDetails']['duration'],
+                    'has_captions': has_captions
                 }
             return None
         except HttpError as e:
