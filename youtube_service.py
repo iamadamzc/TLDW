@@ -1,7 +1,6 @@
 import os
 import logging
 import time
-from functools import wraps
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -32,50 +31,44 @@ class YouTubeService:
             logging.error(f"Failed to build YouTube service for user {self.user.id}: {str(e)}")
             raise AuthenticationError(f"Authentication failed: {str(e)}")
     
-    def _handle_auth_error(self, func):
+    def _handle_auth_error_and_retry(self, api_call_func):
         """
-        Decorator to handle authentication errors with retry logic
+        Handle authentication errors with retry logic
         
         Args:
-            func: Function to wrap with auth error handling
+            api_call_func: Function that makes the API call
             
         Returns:
-            Wrapped function with retry logic
+            Result of the API call
         """
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            try:
-                # First attempt
-                return func(*args, **kwargs)
-            except HttpError as e:
-                if e.resp.status == 401:
-                    logging.warning(f"Authentication error (401) for user {self.user.id}, attempting token refresh")
-                    
-                    # Try to refresh token and rebuild service
-                    if self.token_manager.force_refresh():
-                        try:
-                            self.youtube = self._build_service()
-                            logging.info(f"Successfully refreshed token and rebuilt service for user {self.user.id}")
-                            
-                            # Retry the original function
-                            return func(*args, **kwargs)
-                        except Exception as retry_error:
-                            logging.error(f"Retry failed after token refresh for user {self.user.id}: {str(retry_error)}")
-                            raise AuthenticationError("Authentication failed after token refresh")
-                    else:
-                        logging.error(f"Token refresh failed for user {self.user.id}")
-                        raise AuthenticationError("Token refresh failed, re-authentication required")
+        try:
+            # First attempt
+            return api_call_func()
+        except HttpError as e:
+            if e.resp.status == 401:
+                logging.warning(f"Authentication error (401) for user {self.user.id}, attempting token refresh")
+                
+                # Try to refresh token and rebuild service
+                if self.token_manager.force_refresh():
+                    try:
+                        self.youtube = self._build_service()
+                        logging.info(f"Successfully refreshed token and rebuilt service for user {self.user.id}")
+                        
+                        # Retry the original function
+                        return api_call_func()
+                    except Exception as retry_error:
+                        logging.error(f"Retry failed after token refresh for user {self.user.id}: {str(retry_error)}")
+                        raise AuthenticationError("Authentication failed after token refresh")
                 else:
-                    # Re-raise non-auth errors
-                    raise
-            except Exception as e:
-                # Log unexpected errors
-                logging.error(f"Unexpected error in YouTube API call for user {self.user.id}: {str(e)}")
+                    logging.error(f"Token refresh failed for user {self.user.id}")
+                    raise AuthenticationError("Token refresh failed, re-authentication required")
+            else:
+                # Re-raise non-auth errors
                 raise
-        
-        return wrapper
-
-    @_handle_auth_error
+        except Exception as e:
+            # Log unexpected errors
+            logging.error(f"Unexpected error in YouTube API call for user {self.user.id}: {str(e)}")
+            raise
     def _get_watch_later_count(self):
         """
         Efficiently count videos in Watch Later playlist using pagination.
@@ -195,10 +188,9 @@ class YouTubeService:
                 'error_message': error_message
             }
 
-    @_handle_auth_error
     def get_user_playlists(self):
         """Get user's YouTube playlists, including Watch Later and filtering out YouTube Music"""
-        try:
+        def _get_playlists():
             playlists = []
             
             # Add Watch Later playlist with dynamic video counting
@@ -282,15 +274,18 @@ class YouTubeService:
                 logging.info(f"Playlist: {playlist['title']} (special: {playlist.get('is_special', False)})")
             
             return playlists
-            
-        except HttpError as e:
+        
+        try:
+            return self._handle_auth_error_and_retry(_get_playlists)
+        except AuthenticationError:
+            raise
+        except Exception as e:
             logging.error(f"YouTube API error getting playlists: {e}")
             return []
 
-    @_handle_auth_error
     def get_playlist_videos(self, playlist_id):
         """Get videos from a specific playlist, including Watch Later"""
-        try:
+        def _get_videos():
             # Handle Watch Later playlist specially
             if playlist_id == 'WL':
                 # For Watch Later, we need to get more items since it's commonly used
@@ -326,14 +321,18 @@ class YouTubeService:
             
             logging.info(f"Retrieved {len(videos)} videos from playlist {playlist_id}")
             return videos
-        except HttpError as e:
+        
+        try:
+            return self._handle_auth_error_and_retry(_get_videos)
+        except AuthenticationError:
+            raise
+        except Exception as e:
             logging.error(f"YouTube API error getting playlist videos: {e}")
             return []
 
-    @_handle_auth_error
     def get_video_details(self, video_id):
         """Get detailed information about a specific video including caption availability"""
-        try:
+        def _get_details():
             request = self.youtube.videos().list(
                 part="snippet,contentDetails",
                 id=video_id
@@ -357,6 +356,11 @@ class YouTubeService:
                     'has_captions': has_captions
                 }
             return None
-        except HttpError as e:
+        
+        try:
+            return self._handle_auth_error_and_retry(_get_details)
+        except AuthenticationError:
+            raise
+        except Exception as e:
             logging.error(f"YouTube API error getting video details: {e}")
             return None
