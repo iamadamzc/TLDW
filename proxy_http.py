@@ -162,9 +162,9 @@ class ProxyHTTPClient:
     def _check_youtube_blocking(self, response: requests.Response, url: str) -> None:
         """Check if YouTube is blocking the request"""
         
-        # Check HTTP status codes that indicate blocking
-        if response.status_code in [403, 429]:
-            raise YouTubeBlockingError(f"HTTP {response.status_code} - YouTube blocking detected")
+        # Check HTTP status codes that indicate blocking (including 407 proxy auth errors)
+        if response.status_code in [403, 407, 429]:
+            raise YouTubeBlockingError(f"HTTP {response.status_code} - YouTube/Proxy blocking detected")
         
         # Check for specific YouTube blocking patterns in response text
         if response.status_code == 200:
@@ -178,7 +178,8 @@ class ProxyHTTPClient:
                 "captcha",
                 "verify you're human",
                 "blocked",
-                "access denied"
+                "access denied",
+                "sign in to confirm"
             ]
             
             for indicator in blocking_indicators:

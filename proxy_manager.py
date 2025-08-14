@@ -3,8 +3,10 @@ import json
 import time
 import logging
 import hashlib
+import re
 from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
+from urllib.parse import quote
 import boto3
 from botocore.exceptions import ClientError
 
@@ -20,11 +22,54 @@ class ProxySession:
         self.failed_count = 0
         self.is_blocked = False
         self.session_id = self._generate_session_id()
+        # New properties for backward compatibility
+        self.proxy_url = self._build_proxy_url()
+        self.expires_at = self._calculate_expires_at()
         
     def _generate_session_id(self) -> str:
         """Generate a unique session ID based on video_id and timestamp"""
-        data = f"{self.video_id}_{self.created_at.isoformat()}"
+        import time
+        # Include microseconds to ensure uniqueness on rotation
+        data = f"{self.video_id}_{self.created_at.isoformat()}_{time.time()}"
         return hashlib.md5(data.encode()).hexdigest()[:8]
+    
+    def _sanitize_video_id(self, video_id: str) -> str:
+        """Sanitize video_id to alphanumeric only for sticky session"""
+        return re.sub(r'[^a-zA-Z0-9]', '', video_id)
+    
+    def _build_proxy_url(self) -> str:
+        """Build Oxylabs sticky session proxy URL with proper encoding"""
+        if not self.proxy_config:
+            return ""
+        
+        # Get base username from config
+        base_username = self.proxy_config.get('username', '')
+        password = self.proxy_config.get('password', '')
+        host = self.proxy_config.get('host', '')
+        port = self.proxy_config.get('port', '')
+        
+        # Sanitize video_id for session
+        sanitized_video_id = self._sanitize_video_id(self.video_id)
+        
+        # Build sticky session username: customer-<base_username>-cc-us-sessid-<video_id>
+        sticky_username = f"customer-{base_username}-cc-us-sessid-{sanitized_video_id}"
+        
+        # URL encode username and password
+        encoded_username = quote(sticky_username, safe="")
+        encoded_password = quote(password, safe="")
+        
+        # Build proxy URL
+        proxy_url = f"http://{encoded_username}:{encoded_password}@{host}:{port}"
+        
+        logging.debug(f"Built sticky proxy URL for video {self.video_id}: {sticky_username}@{host}:{port}")
+        return proxy_url
+    
+    def _calculate_expires_at(self) -> datetime:
+        """Calculate expiration time based on configurable TTL"""
+        # Get TTL from environment variable or config, with fallback to 10 minutes
+        ttl_seconds = int(os.getenv("PROXY_SESSION_TTL_SECONDS", 
+                                   self.proxy_config.get("session_ttl_minutes", 10) * 60))
+        return self.created_at + timedelta(seconds=ttl_seconds)
     
     def is_expired(self, ttl_minutes: int = 10) -> bool:
         """Check if session has expired based on TTL"""
@@ -149,15 +194,18 @@ class ProxyManager:
     
     def get_proxy_dict(self, session: ProxySession) -> Dict[str, str]:
         """Get proxy configuration in format suitable for requests library"""
-        if not session or not self.proxy_config:
+        if not session:
             return {}
         
-        proxy_url = f"http://{self.proxy_config['username']}:{self.proxy_config['password']}@{self.proxy_config['host']}:{self.proxy_config['port']}"
-        
+        # Use the sticky session proxy URL
         return {
-            'http': proxy_url,
-            'https': proxy_url
+            'http': session.proxy_url,
+            'https': session.proxy_url
         }
+    
+    def get_session(self, key: str) -> Optional[ProxySession]:
+        """Future-proof alias for get_session_for_video"""
+        return self.get_session_for_video(key)
     
     def _cleanup_expired_sessions(self) -> None:
         """Remove expired sessions from memory"""

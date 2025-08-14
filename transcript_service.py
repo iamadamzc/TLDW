@@ -149,8 +149,8 @@ class TranscriptService:
         except Exception as e:
             error_msg = str(e).lower()
             
-            # Check if this looks like YouTube blocking
-            if any(indicator in error_msg for indicator in ['blocked', 'captcha', 'unusual traffic', 'not available']):
+            # Check if this looks like YouTube blocking (including 407 proxy auth errors)
+            if any(indicator in error_msg for indicator in ['blocked', 'captcha', 'unusual traffic', 'not available', '407', 'proxy authentication', 'sign in to confirm']):
                 # Mark session as blocked and try rotation
                 if session:
                     self.proxy_manager.mark_session_blocked(video_id)
@@ -222,10 +222,13 @@ class TranscriptService:
             else:
                 logging.debug(f"UserAgentManager not available, proceeding without User-Agent for yt-dlp download of {video_id}")
             
-            # Add proxy to yt-dlp if available
-            if proxy_dict and 'https' in proxy_dict:
+            # Add proxy to yt-dlp if available - use sticky session URL directly
+            if session and session.proxy_url:
+                ydl_opts['proxy'] = session.proxy_url
+                logging.info(f"Using sticky proxy for yt-dlp download of video {video_id}: {session.session_id}")
+            elif proxy_dict and 'https' in proxy_dict:
                 ydl_opts['proxy'] = proxy_dict['https']
-                logging.info(f"Using proxy for yt-dlp download of video {video_id}")
+                logging.info(f"Using fallback proxy for yt-dlp download of video {video_id}")
 
             video_url = f"https://www.youtube.com/watch?v={video_id}"
             
