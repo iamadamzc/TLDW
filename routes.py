@@ -1,7 +1,7 @@
 import logging
 from flask import Blueprint, render_template, request, jsonify, redirect, url_for, flash
 from flask_login import login_required, current_user
-from youtube_service import YouTubeService
+from youtube_service import YouTubeService, AuthenticationError
 from transcript_service import TranscriptService
 from summarizer import VideoSummarizer
 from email_service import EmailService
@@ -24,7 +24,7 @@ def dashboard():
         logging.info(f"Loading dashboard for user {current_user.email}")
         logging.info(f"Access token exists: {bool(current_user.access_token)}")
         
-        youtube_service = YouTubeService(current_user.access_token)
+        youtube_service = YouTubeService(current_user)
         playlists = youtube_service.get_user_playlists()
         
         logging.info(f"Retrieved {len(playlists)} playlists")
@@ -51,6 +51,10 @@ def dashboard():
                              videos=videos,
                              selected_playlist_id=selected_playlist_id)
                              
+    except AuthenticationError as e:
+        logging.error(f"Authentication error loading dashboard for user {current_user.email}: {e}")
+        flash("Your session has expired. Please sign in again to continue.", "error")
+        return redirect(url_for("google_auth.login"))
     except Exception as e:
         logging.error(f"Error loading dashboard: {e}")
         flash("The YouTube API requires additional permissions. Please sign out and sign in again to grant YouTube access.", "error")
@@ -84,7 +88,7 @@ def select_playlist():
         logging.info(f"Saved playlist selection: {playlist_id}")
         
         # Get videos from the selected playlist
-        youtube_service = YouTubeService(current_user.access_token)
+        youtube_service = YouTubeService(current_user)
         videos = youtube_service.get_playlist_videos(playlist_id)
         
         logging.info(f"Retrieved {len(videos)} videos from playlist {playlist_id}")
@@ -95,6 +99,13 @@ def select_playlist():
         
         return jsonify({"videos": videos})
         
+    except AuthenticationError as e:
+        logging.error(f"Authentication error selecting playlist for user {current_user.email}: {e}")
+        return jsonify({
+            "error": "Authentication failed",
+            "message": "Your session has expired. Please refresh the page and sign in again.",
+            "code": "AUTH_EXPIRED"
+        }), 401
     except Exception as e:
         playlist_id_str = locals().get('playlist_id', 'unknown')
         logging.error(f"Error selecting playlist {playlist_id_str}: {e}")
@@ -107,7 +118,7 @@ def select_playlist():
 def test_watch_later():
     """Test route to verify Watch Later fix"""
     try:
-        youtube_service = YouTubeService(current_user.access_token)
+        youtube_service = YouTubeService(current_user)
         playlists = youtube_service.get_user_playlists()
         
         watch_later = next((p for p in playlists if p['id'] == 'WL'), None)
@@ -126,6 +137,13 @@ def test_watch_later():
             
         return jsonify(result)
         
+    except AuthenticationError as e:
+        logging.error(f"Authentication error testing Watch Later for user {current_user.email}: {e}")
+        return jsonify({
+            "status": "error",
+            "message": "Authentication failed. Please refresh the page and sign in again.",
+            "code": "AUTH_EXPIRED"
+        })
     except Exception as e:
         return jsonify({
             "status": "error", 
@@ -157,11 +175,18 @@ def summarize_videos():
 
         # Initialize services
         try:
-            youtube_service = YouTubeService(current_user.access_token)
+            youtube_service = YouTubeService(current_user)
             transcript_service = TranscriptService()
             summarizer = VideoSummarizer()
             email_service = EmailService()
             logging.info("All services initialized successfully")
+        except AuthenticationError as e:
+            logging.error(f"Authentication error initializing services for user {current_user.email}: {e}")
+            return jsonify({
+                "error": "Authentication failed",
+                "message": "Your session has expired. Please refresh the page and sign in again.",
+                "code": "AUTH_EXPIRED"
+            }), 401
         except ValueError as e:
             logging.error(f"Service initialization failed - missing API key: {e}")
             return jsonify({
