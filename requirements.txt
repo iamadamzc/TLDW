@@ -6,7 +6,7 @@ google-auth-oauthlib==1.2.2
 google-auth-httplib2==0.2.0
 google-auth==2.40.3
 youtube-transcript-api==1.2.2
-yt-dlp==2025.07.29
+yt-dlp==2024.8.6
 openai==1.99.7
 requests==2.32.4
 oauthlib==3.3.1
