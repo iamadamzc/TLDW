@@ -8,6 +8,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from proxy_manager import ProxyManager
 from proxy_http import ProxyHTTPClient, YouTubeBlockingError
 from transcript_cache import TranscriptCache
+from user_agent_manager import UserAgentManager
 
 class TranscriptService:
     def __init__(self):
@@ -15,6 +16,15 @@ class TranscriptService:
         self.proxy_manager = ProxyManager()
         self.http_client = ProxyHTTPClient(self.proxy_manager)
         self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
+        
+        # Initialize UserAgentManager with error handling
+        try:
+            self.user_agent_manager = UserAgentManager()
+            logging.info("UserAgentManager initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize UserAgentManager: {e}")
+            # Create a fallback manager that returns empty headers
+            self.user_agent_manager = None
 
     def get_transcript(self, video_id, has_captions=None, language="en"):
         """
@@ -30,7 +40,7 @@ class TranscriptService:
         cached_transcript = self.cache.get(video_id, language)
         if cached_transcript:
             logging.info(f"Cache hit for video {video_id} (lang: {language})")
-            self._log_structured("transcript", video_id, "ok", 1, 0, "cache_hit")
+            self._log_structured("transcript", video_id, "ok", 1, 0, "cache_hit", "not_applicable")
             return cached_transcript
         
         start_time = time.time()
@@ -39,7 +49,7 @@ class TranscriptService:
         # MVP: If we know video has no captions, skip directly to ASR
         if has_captions is False:
             logging.info(f"Video {video_id} has no captions, skipping to ASR")
-            self._log_structured("transcript", video_id, "skip_no_captions", attempt, 0, "no_captions")
+            self._log_structured("transcript", video_id, "skip_no_captions", attempt, 0, "no_captions", "not_applicable")
             transcript = self._transcribe_audio(video_id)
             if transcript:
                 self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
@@ -51,7 +61,7 @@ class TranscriptService:
             if transcript_text:
                 latency_ms = int((time.time() - start_time) * 1000)
                 logging.info(f"Got existing transcript for video {video_id}")
-                self._log_structured("transcript", video_id, "ok", attempt, latency_ms, "transcript_api")
+                self._log_structured("transcript", video_id, "ok", attempt, latency_ms, "transcript_api", "applied")
                 
                 # Cache successful transcript
                 self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
@@ -60,7 +70,7 @@ class TranscriptService:
         except YouTubeBlockingError as e:
             latency_ms = int((time.time() - start_time) * 1000)
             logging.warning(f"YouTube blocking detected for transcript {video_id}: {e}")
-            self._log_structured("transcript", video_id, "blocked", attempt, latency_ms, "transcript_api")
+            self._log_structured("transcript", video_id, "blocked", attempt, latency_ms, "transcript_api", "applied_but_blocked")
             
             # Fallback to ASR after blocking
             logging.info(f"Falling back to ASR for video {video_id} due to blocking")
@@ -76,20 +86,57 @@ class TranscriptService:
             self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
         return transcript
 
-    def _get_existing_transcript_with_proxy(self, video_id, language="en"):
-        """Try to get existing transcript using youtube-transcript-api with proxy support"""
+    def _get_transcript_with_headers(self, video_id, headers=None, **kwargs):
+        """
+        Wrapper around YouTubeTranscriptApi.fetch that lets you pass headers.
+        Uses temporary monkey-patching to inject User-Agent headers.
+        """
+        original_get = requests.sessions.Session.get
+        
+        def custom_get(self, url, **req_kwargs):
+            req_headers = req_kwargs.pop("headers", {})
+            if headers:
+                req_headers.update(headers)
+            return original_get(self, url, headers=req_headers, **req_kwargs)
+        
+        # Patch requests.get temporarily
+        requests.sessions.Session.get = custom_get
+        
         try:
-            # The youtube-transcript-api doesn't directly support proxies,
-            # but we can monkey-patch requests or use a custom approach
-            # For MVP, we'll use the existing API and let proxy manager handle session tracking
+            api = YouTubeTranscriptApi()
+            transcript = api.fetch(video_id, **kwargs)
+            return transcript
+        finally:
+            # Restore original method to avoid side effects
+            requests.sessions.Session.get = original_get
+
+    def _get_existing_transcript_with_proxy(self, video_id, language="en"):
+        """Try to get existing transcript using youtube-transcript-api with proxy support and User-Agent headers"""
+        try:
+            # Get User-Agent headers for anti-bot protection with error handling
+            headers = {}
+            if self.user_agent_manager is not None:
+                try:
+                    headers = self.user_agent_manager.get_headers()
+                    logging.debug(f"User-Agent headers generated successfully for {video_id}")
+                except Exception as e:
+                    logging.warning(f"Failed to generate User-Agent headers for {video_id}: {e}")
+                    # Continue without User-Agent headers - graceful degradation
+                    headers = {}
+            else:
+                logging.debug(f"UserAgentManager not available, proceeding without User-Agent for {video_id}")
             
             # Log the attempt
             session = self.proxy_manager.get_session_for_video(video_id)
             if session:
-                logging.info(f"Attempting transcript fetch for {video_id} with session {session.session_id}")
+                ua_status = "with User-Agent" if headers and 'User-Agent' in headers else "without User-Agent"
+                logging.info(f"Attempting transcript fetch for {video_id} with session {session.session_id} {ua_status}")
+            else:
+                ua_status = "with User-Agent" if headers and 'User-Agent' in headers else "without User-Agent"
+                logging.info(f"Attempting transcript fetch for {video_id} {ua_status} (no proxy session)")
             
-            api = YouTubeTranscriptApi()
-            transcript = api.fetch(video_id)
+            # Use wrapper method to pass headers (with or without User-Agent)
+            transcript = self._get_transcript_with_headers(video_id, headers=headers)
             transcript_text = ' '.join([snippet.text for snippet in transcript])
             
             # Mark session as successful if we have one
@@ -113,8 +160,8 @@ class TranscriptService:
                 if rotated_session:
                     logging.info(f"Retrying transcript fetch for {video_id} with rotated session {rotated_session.session_id}")
                     try:
-                        api = YouTubeTranscriptApi()
-                        transcript = api.fetch(video_id)
+                        # Use User-Agent headers for retry as well
+                        transcript = self._get_transcript_with_headers(video_id, headers=headers)
                         transcript_text = ' '.join([snippet.text for snippet in transcript])
                         rotated_session.mark_used()
                         logging.info(f"Transcript fetch successful after rotation for {video_id}")
@@ -137,7 +184,7 @@ class TranscriptService:
         """Fallback: Download audio and transcribe with Deepgram using proxy"""
         if not self.deepgram_api_key:
             logging.error("Deepgram API key not provided")
-            self._log_structured("ytdlp", video_id, "neterr", 1, 0, "no_deepgram_key")
+            self._log_structured("ytdlp", video_id, "neterr", 1, 0, "no_deepgram_key", "not_applicable")
             return None
 
         start_time = time.time()
@@ -162,6 +209,19 @@ class TranscriptService:
                 }],
             }
             
+            # Add User-Agent to yt-dlp for anti-bot protection
+            user_agent_applied = False
+            if self.user_agent_manager is not None:
+                try:
+                    user_agent = self.user_agent_manager.get_yt_dlp_user_agent()
+                    ydl_opts['user_agent'] = user_agent
+                    user_agent_applied = True
+                    logging.info(f"Using User-Agent for yt-dlp download of video {video_id}")
+                except Exception as e:
+                    logging.warning(f"Failed to set User-Agent for yt-dlp: {e}")
+            else:
+                logging.debug(f"UserAgentManager not available, proceeding without User-Agent for yt-dlp download of {video_id}")
+            
             # Add proxy to yt-dlp if available
             if proxy_dict and 'https' in proxy_dict:
                 ydl_opts['proxy'] = proxy_dict['https']
@@ -185,10 +245,12 @@ class TranscriptService:
                 if session:
                     session.mark_used()
                 logging.info(f"ASR transcription successful for {video_id}")
-                self._log_structured("ytdlp", video_id, "ok", attempt, latency_ms, "asr")
+                ua_status = "applied" if user_agent_applied else "failed"
+                self._log_structured("ytdlp", video_id, "ok", attempt, latency_ms, "asr", ua_status)
             else:
                 latency_ms = int((time.time() - start_time) * 1000)
-                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_failed")
+                ua_status = "applied" if user_agent_applied else "failed"
+                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_failed", ua_status)
             
             return transcript_text
 
@@ -205,7 +267,8 @@ class TranscriptService:
                 status = "neterr"
             
             logging.error(f"Error transcribing audio for {video_id}: {e}")
-            self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error")
+            ua_status = "applied" if user_agent_applied else "failed"
+            self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", ua_status)
             
             if session:
                 session.mark_failed()
@@ -255,7 +318,8 @@ class TranscriptService:
         """Clean up expired cache entries"""
         return self.cache.cleanup_expired()
     
-    def _log_structured(self, step, video_id, status, attempt, latency_ms, source=""):
-        """Structured logging for MVP observability"""
+    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", user_agent_status="unknown"):
+        """Structured logging for MVP observability with User-Agent information"""
         logging.info(f"STRUCTURED_LOG: step={step}, video_id={video_id}, status={status}, "
-                    f"attempt={attempt}, latency_ms={latency_ms}, source={source}")
+                    f"attempt={attempt}, latency_ms={latency_ms}, source={source}, "
+                    f"user_agent_status={user_agent_status}")
