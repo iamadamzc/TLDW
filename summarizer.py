@@ -2,21 +2,33 @@ import os
 import re
 import logging
 from openai import OpenAI
+from openai import AuthenticationError, RateLimitError, APIError
 
 class VideoSummarizer:
     def __init__(self):
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-        self.client = OpenAI(api_key=self.openai_api_key)
+        if not self.openai_api_key:
+            logging.error("OPENAI_API_KEY environment variable is required but not set")
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        
+        try:
+            self.client = OpenAI(api_key=self.openai_api_key)
+            logging.info("OpenAI client initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize OpenAI client: {e}")
+            raise
 
     def summarize_video(self, transcript_text, video_id):
         """
         Generate AI summary using OpenAI GPT-4o with specific formatting
         """
-        if not self.openai_api_key:
-            logging.error("OpenAI API key not provided")
-            return None
+        if not transcript_text or not transcript_text.strip():
+            logging.error("Empty or invalid transcript provided")
+            raise ValueError("Transcript text is required for summarization")
 
         try:
+            logging.info(f"Starting summarization for video {video_id}")
+            logging.debug(f"Transcript length: {len(transcript_text)} characters")
             # The prompt for the AI
             prompt_text = f"""
 Summarize the following YouTube video transcript. Your goal is to create an engaging and easily digestible summary for a busy professional. Adopt a tone that is clear, insightful, and slightly informal.
@@ -42,16 +54,30 @@ Transcript to summarize:
                 temperature=0.7
             )
             
+            if not response.choices or not response.choices[0].message.content:
+                logging.error("OpenAI API returned empty response")
+                raise APIError("OpenAI API returned empty response")
+            
             summary = response.choices[0].message.content
+            logging.info(f"Successfully generated summary for video {video_id}")
             
             # Add timestamp links
             summary_with_links = self._add_timestamp_links(summary, video_id)
             
             return summary_with_links
 
+        except AuthenticationError as e:
+            logging.error(f"OpenAI authentication failed - check API key: {e}")
+            raise AuthenticationError("OpenAI API authentication failed. Please check your API key.")
+        except RateLimitError as e:
+            logging.error(f"OpenAI rate limit exceeded: {e}")
+            raise RateLimitError("OpenAI API rate limit exceeded. Please try again later.")
+        except APIError as e:
+            logging.error(f"OpenAI API error: {e}")
+            raise APIError(f"OpenAI API error: {str(e)}")
         except Exception as e:
-            logging.error(f"Error generating summary: {e}")
-            return None
+            logging.error(f"Unexpected error during summarization: {e}")
+            raise Exception(f"Unexpected error during video summarization: {str(e)}")
 
     def _add_timestamp_links(self, summary_text, video_id):
         """

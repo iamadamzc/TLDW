@@ -1,22 +1,35 @@
 import os
 import logging
 import requests
+from requests.exceptions import RequestException, Timeout, ConnectionError
 
 class EmailService:
     def __init__(self):
         self.resend_api_key = os.environ.get("RESEND_API_KEY", "")
         self.api_url = "https://api.resend.com/emails"
+        
+        if not self.resend_api_key:
+            logging.error("RESEND_API_KEY environment variable is required but not set")
+            raise ValueError("RESEND_API_KEY environment variable is required")
+        
+        logging.info("Email service initialized successfully")
 
     def send_digest_email(self, user_email, summaries_data):
         """
         Send HTML email digest with video summaries
         summaries_data: list of dicts with video info and summaries
         """
-        if not self.resend_api_key:
-            logging.error("Resend API key not provided")
-            return False
+        if not user_email or not user_email.strip():
+            logging.error("User email is required for sending digest")
+            raise ValueError("User email is required")
+        
+        if not summaries_data or len(summaries_data) == 0:
+            logging.error("No summaries data provided for email digest")
+            raise ValueError("Summaries data is required")
 
         try:
+            logging.info(f"Preparing to send digest email to {user_email}")
+            logging.debug(f"Number of summaries to include: {len(summaries_data)}")
             html_content = self._generate_email_html(summaries_data)
             
             payload = {
@@ -31,18 +44,33 @@ class EmailService:
                 "Content-Type": "application/json"
             }
 
-            response = requests.post(self.api_url, json=payload, headers=headers)
+            response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
             
             if response.status_code == 200:
                 logging.info(f"Email sent successfully to {user_email}")
                 return True
+            elif response.status_code == 401:
+                logging.error(f"Resend API authentication failed - check API key: {response.text}")
+                raise requests.exceptions.HTTPError("Resend API authentication failed. Please check your API key.")
+            elif response.status_code == 429:
+                logging.error(f"Resend API rate limit exceeded: {response.text}")
+                raise requests.exceptions.HTTPError("Resend API rate limit exceeded. Please try again later.")
             else:
                 logging.error(f"Failed to send email: {response.status_code} - {response.text}")
-                return False
+                raise requests.exceptions.HTTPError(f"Failed to send email: {response.status_code} - {response.text}")
 
+        except Timeout as e:
+            logging.error(f"Timeout while sending email: {e}")
+            raise Timeout("Email service timeout. Please try again later.")
+        except ConnectionError as e:
+            logging.error(f"Connection error while sending email: {e}")
+            raise ConnectionError("Unable to connect to email service. Please check your internet connection.")
+        except RequestException as e:
+            logging.error(f"Request error while sending email: {e}")
+            raise RequestException(f"Email service request failed: {str(e)}")
         except Exception as e:
-            logging.error(f"Error sending email: {e}")
-            return False
+            logging.error(f"Unexpected error sending email: {e}")
+            raise Exception(f"Unexpected error while sending email: {str(e)}")
 
     def _generate_email_html(self, summaries_data):
         """Generate HTML content for the email digest"""

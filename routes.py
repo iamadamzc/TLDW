@@ -156,12 +156,26 @@ def summarize_videos():
             return jsonify({"error": "Authentication required. Please sign in again."}), 401
 
         # Initialize services
-        youtube_service = YouTubeService(current_user.access_token)
-        transcript_service = TranscriptService()
-        summarizer = VideoSummarizer()
-        email_service = EmailService()
-        
-        logging.info("Services initialized successfully")
+        try:
+            youtube_service = YouTubeService(current_user.access_token)
+            transcript_service = TranscriptService()
+            summarizer = VideoSummarizer()
+            email_service = EmailService()
+            logging.info("All services initialized successfully")
+        except ValueError as e:
+            logging.error(f"Service initialization failed - missing API key: {e}")
+            return jsonify({
+                "error": "Service configuration error", 
+                "message": "Required API keys are not configured. Please contact support.",
+                "code": "CONFIG_ERROR"
+            }), 500
+        except Exception as e:
+            logging.error(f"Unexpected error during service initialization: {e}")
+            return jsonify({
+                "error": "Service initialization failed",
+                "message": "Unable to initialize required services. Please try again later.",
+                "code": "INIT_ERROR"
+            }), 500
         
         summaries_data = []
         
@@ -180,9 +194,19 @@ def summarize_videos():
                     continue
                 
                 # Generate summary
-                summary = summarizer.summarize_video(transcript, video_id)
-                if not summary:
-                    logging.warning(f"Could not generate summary for video {video_id}")
+                try:
+                    summary = summarizer.summarize_video(transcript, video_id)
+                    if not summary:
+                        logging.warning(f"Could not generate summary for video {video_id}")
+                        continue
+                except Exception as e:
+                    logging.error(f"Summarization failed for video {video_id}: {e}")
+                    if "authentication" in str(e).lower() or "api key" in str(e).lower():
+                        return jsonify({
+                            "error": "OpenAI API authentication failed",
+                            "message": "Unable to access AI summarization service. Please contact support.",
+                            "code": "AUTH_ERROR"
+                        }), 500
                     continue
                 
                 summaries_data.append({
@@ -201,20 +225,43 @@ def summarize_videos():
             return jsonify({"error": "No videos could be processed"}), 500
         
         # Send email digest
-        success = email_service.send_digest_email(current_user.email, summaries_data)
-        
-        if success:
+        try:
+            success = email_service.send_digest_email(current_user.email, summaries_data)
             return jsonify({
                 "message": f"TL;DW digest sent to {current_user.email}!",
                 "processed_count": len(summaries_data),
                 "total_count": len(video_ids)
             })
-        else:
-            return jsonify({"error": "Failed to send email digest"}), 500
+        except Exception as e:
+            logging.error(f"Email service failed: {e}")
+            if "authentication" in str(e).lower() or "api key" in str(e).lower():
+                return jsonify({
+                    "error": "Email service authentication failed",
+                    "message": "Unable to send email digest. Please contact support.",
+                    "code": "EMAIL_AUTH_ERROR"
+                }), 500
+            elif "timeout" in str(e).lower():
+                return jsonify({
+                    "error": "Email service timeout",
+                    "message": "Email service is temporarily unavailable. Please try again later.",
+                    "code": "EMAIL_TIMEOUT"
+                }), 503
+            else:
+                return jsonify({
+                    "error": "Email delivery failed",
+                    "message": "Unable to send email digest. Please try again later.",
+                    "code": "EMAIL_ERROR"
+                }), 500
             
     except Exception as e:
-        logging.error(f"Error in summarize_videos endpoint: {e}")
+        logging.error(f"Unexpected error in summarize_videos endpoint: {e}")
         logging.error(f"Error type: {type(e).__name__}")
         import traceback
         logging.error(f"Full traceback: {traceback.format_exc()}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        
+        # Return structured error response
+        return jsonify({
+            "error": "Internal server error",
+            "message": "An unexpected error occurred while processing your request. Please try again later.",
+            "code": "INTERNAL_ERROR"
+        }), 500
