@@ -1,0 +1,45 @@
+{
+  "ServiceName": "tldw-container-app",
+  "SourceConfiguration": {
+    "AutoDeploymentsEnabled": true,
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "arn:aws:iam::528131355234:role/AppRunnerECRAccessRole"
+    },
+    "ImageRepository": {
+      "ImageIdentifier": "528131355234.dkr.ecr.us-west-2.amazonaws.com/tldw-app:58dd88e",
+      "ImageRepositoryType": "ECR",
+      "ImageConfiguration": {
+        "Port": "8080",
+        "RuntimeEnvironmentVariables": {
+          "PORT": "8080",
+          "FFMPEG_LOCATION": "/usr/bin",
+          "USE_PROXIES": "true",
+          "PROXY_COUNTRY": "us",
+          "ALLOW_MISSING_DEPS": "true"
+        },
+        "RuntimeEnvironmentSecrets": {
+          "OXYLABS_PROXY_CONFIG": "arn:aws:secretsmanager:us-west-2:528131355234:secret:tldw-oxylabs-proxy-config-mkbzlM",
+          "RESEND_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-RESEND-API-KEY-5O5Kdx",
+          "OPENAI_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-OPENAI-API-KEY-5rNo6a",
+          "GOOGLE_CLIENT_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI",
+          "GOOGLE_CLIENT_ID": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN",
+          "SESSION_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-SESSION-SECRET-hJDTQ1",
+          "DEEPGRAM_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv"
+        }
+      }
+    }
+  },
+  "InstanceConfiguration": {
+    "Cpu": "1 vCPU",
+    "Memory": "2 GB",
+    "InstanceRoleArn": "arn:aws:iam::528131355234:role/AppRunnerInstanceRole"
+  },
+  "HealthCheckConfiguration": {
+    "Protocol": "HTTP",
+    "Path": "/healthz",
+    "Interval": 20,
+    "Timeout": 10,
+    "HealthyThreshold": 1,
+    "UnhealthyThreshold": 5
+  }
+}

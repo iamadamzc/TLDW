@@ -9,6 +9,7 @@ from proxy_manager import ProxyManager
 from proxy_http import ProxyHTTPClient, YouTubeBlockingError
 from transcript_cache import TranscriptCache
 from user_agent_manager import UserAgentManager
+from yt_download_helper import download_audio_with_fallback
 
 class TranscriptService:
     def __init__(self):
@@ -246,133 +247,94 @@ class TranscriptService:
     
     def _attempt_ytdlp_download(self, video_id, session, attempt=1):
         """
-        Single attempt at yt-dlp download with bot-check detection
+        Single attempt at yt-dlp download using helper with bot-check detection
         Returns dict with status, transcript_text, and attempt info
         """
         start_time = time.time()
         session_id = session.session_id if session else "none"
         
-        try:
-            # Check for environment proxy collision
-            self._handle_env_proxy_collision()
-            
-            # Download audio using yt-dlp with proxy
-            with tempfile.NamedTemporaryFile(suffix='', delete=False) as temp_file:
-                base_filename = temp_file.name  # no extension
-
-            # Configure yt-dlp with sticky proxy and matching User-Agent
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': base_filename,  # no extension
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'noplaylist': True,  # Prevent playlist downloads
-                'socket_timeout': 15,  # Hard timeout to prevent hung jobs
-                'quiet': False,  # Enable output capture for bot detection
-                'no_warnings': False,
-                'ffmpeg_location': os.environ.get('FFMPEG_LOCATION', '/usr/bin')  # Explicit ffmpeg path
-            }
-            
-            # Add extractor args for retry attempts to help bypass bot detection
-            if attempt > 1:
-                ydl_opts['extractor_args'] = {
-                    'youtube': {
-                        'player_client': ['ios', 'web', 'android']
-                    }
-                }
-            
-            # Add User-Agent to yt-dlp (same as transcript)
-            user_agent_applied = False
-            if self.user_agent_manager is not None:
-                try:
-                    user_agent = self.user_agent_manager.get_yt_dlp_user_agent()
-                    ydl_opts['user_agent'] = user_agent
-                    user_agent_applied = True
-                    logging.info(f"Using User-Agent for yt-dlp download of video {video_id} (attempt {attempt})")
-                except Exception as e:
-                    logging.warning(f"Failed to set User-Agent for yt-dlp: {e}")
-            else:
-                logging.debug(f"UserAgentManager not available for yt-dlp download of {video_id}")
-            
-            # Add sticky proxy to yt-dlp
-            if session and session.proxy_url:
-                ydl_opts['proxy'] = session.proxy_url
-                logging.info(f"Using sticky proxy for yt-dlp download of video {video_id}: {session_id} (attempt {attempt})")
-            
-            # Log structured attempt
-            self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id)
-
-            # Log yt-dlp configuration for debugging
-            logging.info(f"yt-dlp config: session={session_id} ua_applied={user_agent_applied} ffmpeg_location={ydl_opts.get('ffmpeg_location')}")
-
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            
-            # Capture yt-dlp output to detect bot-check
-            import io
-            import sys
-            from contextlib import redirect_stderr, redirect_stdout
-            
-            captured_output = io.StringIO()
-            captured_error = io.StringIO()
-            
+        # Check for environment proxy collision
+        self._handle_env_proxy_collision()
+        
+        # Extract parameters for helper
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Get User-Agent
+        user_agent_applied = False
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"  # fallback
+        if self.user_agent_manager is not None:
             try:
-                with redirect_stdout(captured_output), redirect_stderr(captured_error):
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([video_url])
-                
-                # Check captured output for bot detection
-                output_text = captured_output.getvalue() + captured_error.getvalue()
-                if self._detect_bot_check(output_text):
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    self._log_structured("ytdlp", video_id, "bot_check", attempt, latency_ms, "asr", user_agent_applied, session_id)
-                    if session:
-                        session.mark_blocked()
-                    return {
-                        'status': 'bot_check',
-                        'attempt': attempt,
-                        'transcript_text': None
-                    }
-                
-            except Exception as yt_error:
-                # Check exception message for bot detection
-                error_text = str(yt_error)
-                if self._detect_bot_check(error_text):
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    self._log_structured("ytdlp", video_id, "bot_check", attempt, latency_ms, "asr", user_agent_applied, session_id)
-                    if session:
-                        session.mark_blocked()
-                    return {
-                        'status': 'bot_check',
-                        'attempt': attempt,
-                        'transcript_text': None
-                    }
-                else:
-                    # Re-raise if not bot-check related
-                    raise yt_error
-
-            # After download, the actual file is base + ".mp3"
-            mp3_path = f"{base_filename}.mp3"
+                ua = self.user_agent_manager.get_yt_dlp_user_agent()
+                user_agent_applied = True
+                logging.info(f"Using User-Agent for yt-dlp download of video {video_id} (attempt {attempt})")
+            except Exception as e:
+                logging.warning(f"Failed to set User-Agent for yt-dlp: {e}")
+        else:
+            logging.debug(f"UserAgentManager not available for yt-dlp download of {video_id}")
+        
+        # Get proxy URL
+        proxy_url = session.proxy_url if session and session.proxy_url else ""
+        if proxy_url:
+            logging.info(f"Using sticky proxy for yt-dlp download of video {video_id}: {session_id} (attempt {attempt})")
+        
+        # Get ffmpeg path
+        ffmpeg_path = os.environ.get('FFMPEG_LOCATION', '/usr/bin')
+        
+        # Status tracking for logging integration
+        last_status = {"status": "unknown", "attempt": attempt}
+        
+        def _log_adapter(status_msg: str):
+            """Adapt helper log messages to existing structured logging"""
+            if status_msg.startswith("yt_step1_ok"):
+                last_status.update(status="ok", attempt=1)
+                # Extract path and size from message for additional logging
+                if "path=" in status_msg and "size=" in status_msg:
+                    path_part = status_msg.split("path=")[1].split(" ")[0]
+                    size_part = status_msg.split("size=")[1].split(" ")[0]
+                    logging.info(f"ASR input ready: file={path_part} size={size_part}")
+            elif status_msg.startswith("yt_step1_fail_step2_ok"):
+                last_status.update(status="ok", attempt=2)
+                # Extract path and size from message for additional logging
+                if "path=" in status_msg and "size=" in status_msg:
+                    path_part = status_msg.split("path=")[1].split(" ")[0]
+                    size_part = status_msg.split("size=")[1].split(" ")[0]
+                    logging.info(f"ASR input ready: file={path_part} size={size_part}")
+            elif status_msg.startswith("yt_step1_download_error") or status_msg.startswith("yt_step2_download_error"):
+                last_status.update(status="ytdlp_error", attempt=max(1, last_status["attempt"]))
+            else:
+                last_status.update(status="ytdlp_info", attempt=max(1, last_status["attempt"]))
+            
+            # Log structured attempt/result
+            latency_ms = int((time.time() - start_time) * 1000)
+            self._log_structured("ytdlp", video_id, last_status["status"], 
+                               last_status["attempt"], latency_ms, "asr", 
+                               user_agent_applied, session_id)
+        
+        # Log initial attempt
+        self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id)
+        logging.info(f"yt-dlp config: session={session_id} ua_applied={user_agent_applied} ffmpeg_location={ffmpeg_path}")
+        
+        try:
+            # Call the helper function
+            audio_path = download_audio_with_fallback(video_url, ua, proxy_url, ffmpeg_path, _log_adapter)
             
             # Send to Deepgram for transcription
-            transcript_text = self._send_to_deepgram(mp3_path)
+            transcript_text = self._send_to_deepgram(audio_path)
             
             # Clean up temp file
-            if os.path.exists(mp3_path):
-                os.unlink(mp3_path)
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
             
             if transcript_text:
-                latency_ms = int((time.time() - start_time) * 1000)
                 # Mark session as successful
                 if session:
                     session.mark_used()
                 logging.info(f"ASR transcription successful for {video_id} (attempt {attempt})")
-                self._log_structured("ytdlp", video_id, "ok", attempt, latency_ms, "asr", user_agent_applied, session_id)
                 return {
-                    'status': 'ok',
-                    'attempt': attempt,
+                    'status': last_status['status'],
+                    'attempt': last_status['attempt'],
                     'transcript_text': transcript_text
                 }
             else:
@@ -383,12 +345,12 @@ class TranscriptService:
                     'attempt': attempt,
                     'transcript_text': None
                 }
-
-        except Exception as e:
-            latency_ms = int((time.time() - start_time) * 1000)
+                
+        except RuntimeError as e:
+            # Helper failed - check for bot detection in error message
             error_msg = str(e).lower()
+            latency_ms = int((time.time() - start_time) * 1000)
             
-            # Check if this is bot-check related
             if self._detect_bot_check(error_msg):
                 status = "bot_check"
                 if session:
@@ -398,7 +360,7 @@ class TranscriptService:
                 if session:
                     session.mark_failed()
             else:
-                status = "neterr"
+                status = "yt_both_steps_fail"
                 if session:
                     session.mark_failed()
             
@@ -407,6 +369,21 @@ class TranscriptService:
             
             return {
                 'status': status,
+                'attempt': attempt,
+                'transcript_text': None
+            }
+        
+        except Exception as e:
+            # Unexpected error
+            latency_ms = int((time.time() - start_time) * 1000)
+            logging.error(f"Unexpected error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
+            self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_error", user_agent_applied, session_id)
+            
+            if session:
+                session.mark_failed()
+            
+            return {
+                'status': 'neterr',
                 'attempt': attempt,
                 'transcript_text': None
             }
