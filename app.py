@@ -165,14 +165,27 @@ app.register_blueprint(main_routes)
 @app.route('/healthz')
 def health_check():
     """Enhanced health check with proxy status and dependency verification"""
+    allow_missing_deps = os.getenv('ALLOW_MISSING_DEPS', 'false').lower() == 'true'
+    
     health_info = {
         'status': 'healthy', 
         'message': 'TL;DW API is running',
-        'proxy_enabled': os.getenv('USE_PROXIES', 'false').lower() == 'true'
+        'proxy_enabled': os.getenv('USE_PROXIES', 'false').lower() == 'true',
+        'allow_missing_deps': allow_missing_deps
     }
     
     # Check critical dependencies
     health_info['dependencies'] = _check_dependencies()
+    
+    # Add ffmpeg_location and yt_dlp_version fields
+    health_info['ffmpeg_location'] = os.environ.get('FFMPEG_LOCATION')
+    
+    # Extract yt-dlp version from dependencies
+    yt_dlp_dep = health_info['dependencies'].get('yt_dlp', {})
+    if yt_dlp_dep.get('available'):
+        health_info['yt_dlp_version'] = yt_dlp_dep.get('version', 'unknown')
+    else:
+        health_info['yt_dlp_version'] = None
     
     # Add proxy status if enabled
     if health_info['proxy_enabled']:
@@ -184,9 +197,27 @@ def health_check():
         except Exception as e:
             health_info['proxy_status'] = {'error': str(e)}
     
-    # Set overall status based on critical dependencies
-    if not health_info['dependencies']['ffmpeg']['available'] or not health_info['dependencies']['yt_dlp']['available']:
-        health_info['status'] = 'degraded'
-        health_info['message'] = 'Some dependencies missing - ASR functionality may be impaired'
+    # Determine status and HTTP code based on critical dependencies
+    critical_missing = []
+    if not health_info['dependencies']['ffmpeg']['available']:
+        critical_missing.append('ffmpeg')
+    if not health_info['dependencies']['yt_dlp']['available']:
+        critical_missing.append('yt-dlp')
     
+    if critical_missing:
+        if allow_missing_deps:
+            # Return 200 with degraded status when ALLOW_MISSING_DEPS=true
+            health_info['status'] = 'degraded'
+            health_info['degraded'] = True
+            health_info['message'] = f'Critical dependencies missing: {", ".join(critical_missing)} (ALLOW_MISSING_DEPS=true)'
+            return health_info, 200
+        else:
+            # Return 503 when critical deps missing in production
+            health_info['status'] = 'unhealthy'
+            health_info['message'] = f'Critical dependencies missing: {", ".join(critical_missing)}'
+            return health_info, 503
+    
+    # All dependencies available
+    health_info['status'] = 'healthy'
+    health_info['message'] = 'All dependencies available - ASR functionality ready'
     return health_info, 200

@@ -2,9 +2,10 @@
 WSGI entrypoint for TL;DW application
 """
 
-import logging
+import os
 import shutil
 import subprocess
+import logging
 import sys
 
 # Configure logging for container startup
@@ -13,56 +14,84 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-def verify_startup_dependencies():
-    """Verify critical dependencies on startup and fail fast if missing"""
-    logging.info("=== TL;DW Container Startup Verification ===")
+# Align with gunicorn handlers if present
+_guni = logging.getLogger('gunicorn.error')
+if _guni.handlers:
+    logging.root.handlers = _guni.handlers
+    logging.root.setLevel(_guni.level)
+
+ALLOW_MISSING = os.getenv("ALLOW_MISSING_DEPS", "false").lower() == "true"
+
+def _check_binary(name: str):
+    """Check if binary is available and return path or None with appropriate logging"""
+    path = shutil.which(name)
+    if not path:
+        msg = f"{name} missing from PATH"
+        if ALLOW_MISSING:
+            logging.warning("STARTUP: %s (ALLOW_MISSING_DEPS=true, continuing)", msg)
+            return None
+        logging.error("STARTUP: %s", msg)
+        raise RuntimeError(msg)
     
-    # Check critical binaries
-    dependencies = {
-        'yt-dlp': shutil.which('yt-dlp'),
-        'ffmpeg': shutil.which('ffmpeg'),
-        'ffprobe': shutil.which('ffprobe')
-    }
-    
-    missing = []
-    for name, path in dependencies.items():
-        if path:
-            try:
-                if name in ['ffmpeg', 'ffprobe']:
-                    result = subprocess.run([name, '-version'], 
-                                          capture_output=True, text=True, timeout=5)
-                    version = result.stdout.split('\n')[0] if result.stdout else 'unknown'
-                    logging.info(f"✅ {name}: {version} (at {path})")
-                else:
-                    logging.info(f"✅ {name}: available at {path}")
-            except Exception as e:
-                logging.error(f"❌ {name}: execution failed - {e}")
-                missing.append(name)
-        else:
-            logging.error(f"❌ {name}: not found in PATH")
-            missing.append(name)
-    
-    # Check yt-dlp import
+    # Print version to logs with timeout to prevent hangs
     try:
-        import yt_dlp
-        logging.info(f"✅ yt-dlp module: {yt_dlp.version.__version__}")
+        subprocess.run([name, "-version"], check=True, 
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
     except Exception as e:
-        logging.error(f"❌ yt-dlp import failed: {e}")
-        missing.append('yt-dlp-module')
+        if ALLOW_MISSING:
+            logging.warning("STARTUP: %s present but version check failed: %s (continuing)", name, e)
+            return path
+        logging.error("STARTUP: %s present but version check failed: %s", name, e)
+        raise
     
-    if missing:
-        logging.error(f"🚨 CRITICAL: Missing dependencies {missing}")
-        logging.error("Container cannot start - fix dependencies and rebuild")
-        sys.exit(1)
+    logging.info("STARTUP: %s at %s", name, path)
+    return path
+
+def log_startup_dependencies():
+    """Enhanced dependency verification with dev override support"""
+    logging.info("TL;DW Startup Dependency Check")
     
-    logging.info("✅ All critical dependencies verified - starting application")
-    logging.info("=== End Startup Verification ===")
+    ffmpeg = _check_binary("ffmpeg")
+    ffprobe = _check_binary("ffprobe")
+    
+    # yt-dlp may be installed as a python module and/or a script
+    ytdlp_path = shutil.which("yt-dlp")
+    if ytdlp_path:
+        logging.info("STARTUP: yt-dlp at %s", ytdlp_path)
+    else:
+        try:
+            import yt_dlp
+            logging.info("STARTUP: yt-dlp module OK (version=%s)", getattr(yt_dlp, "__version__", "unknown"))
+        except Exception as e:
+            msg = f"yt-dlp missing or import failed: {e}"
+            if ALLOW_MISSING:
+                logging.warning("STARTUP: %s (continuing)", msg)
+            else:
+                logging.error("STARTUP: %s", msg)
+                raise
+    
+    # Export explicit ffmpeg location for the app to use in yt-dlp calls
+    if ffmpeg:
+        os.environ.setdefault("FFMPEG_LOCATION", "/usr/bin")
+        logging.info("STARTUP: FFMPEG_LOCATION=%s", os.environ["FFMPEG_LOCATION"])
+    else:
+        if ALLOW_MISSING:
+            logging.warning("STARTUP: FFMPEG_LOCATION not set (ffmpeg missing, ALLOW_MISSING_DEPS=true)")
+    
+    # Log environment configuration for debugging
+    logging.info("STARTUP: ALLOW_MISSING_DEPS=%s", ALLOW_MISSING)
+    logging.info("STARTUP: Environment ready for application startup")
 
 # Verify dependencies before importing app
-verify_startup_dependencies()
+log_startup_dependencies()
 
-# Import app after dependency verification
-from app import app
+# Robust app import with fallback
+try:
+    from app import app
+except ImportError:
+    from main import app  # fallback if the app lives in main.py
+
+# Health endpoints already exist in app.py - no need to duplicate
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

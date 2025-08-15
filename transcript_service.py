@@ -25,9 +25,6 @@ class TranscriptService:
             logging.error(f"Failed to initialize UserAgentManager: {e}")
             # Create a fallback manager that returns empty headers
             self.user_agent_manager = None
-
-    def __init__(self):
-        self.deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
         self.proxy_manager = ProxyManager()
         self.http_client = ProxyHTTPClient(self.proxy_manager)
         self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
@@ -116,31 +113,7 @@ class TranscriptService:
             # Clean up idempotency lock
             self._video_locks.pop(video_id, None)
 
-    def _get_transcript_with_headers_and_timeout(self, video_id, headers=None, timeout=15, **kwargs):
-        """
-        Wrapper around YouTubeTranscriptApi.fetch with headers and timeout support.
-        Uses temporary monkey-patching to inject User-Agent headers and timeout.
-        """
-        original_get = requests.sessions.Session.get
-        
-        def custom_get(self, url, **req_kwargs):
-            req_headers = req_kwargs.pop("headers", {})
-            if headers:
-                req_headers.update(headers)
-            # Add timeout to all requests
-            req_kwargs.setdefault('timeout', timeout)
-            return original_get(self, url, headers=req_headers, **req_kwargs)
-        
-        # Patch requests.get temporarily
-        requests.sessions.Session.get = custom_get
-        
-        try:
-            api = YouTubeTranscriptApi()
-            transcript = api.fetch(video_id, **kwargs)
-            return transcript
-        finally:
-            # Restore original method to avoid side effects
-            requests.sessions.Session.get = original_get
+
 
     def _fetch_transcript_with_session(self, video_id, session, language, start_time):
         """
@@ -161,13 +134,18 @@ class TranscriptService:
             else:
                 logging.debug(f"UserAgentManager not available for {video_id}")
             
+            # Apply sticky proxy
+            proxies = {}
+            if session and session.proxy_url:
+                proxies = {"http": session.proxy_url, "https": session.proxy_url}
+            
             # Log structured attempt
             session_id = session.session_id if session else "none"
             self._log_structured("transcript", video_id, "attempt", 1, 0, "transcript_api", ua_applied, session_id)
             
-            # Use wrapper method with 15-second timeout
-            transcript = self._get_transcript_with_headers_and_timeout(video_id, headers, timeout=15)
-            transcript_text = ' '.join([snippet.text for snippet in transcript])
+            # Use YouTubeTranscriptApi directly with proxies and headers
+            chunks = YouTubeTranscriptApi.get_transcript(video_id, languages=[language], proxies=proxies, headers=headers)
+            transcript_text = " ".join(item["text"] for item in chunks if item.get("text"))
             
             # Mark session as successful
             if session:
@@ -279,21 +257,23 @@ class TranscriptService:
             self._handle_env_proxy_collision()
             
             # Download audio using yt-dlp with proxy
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
-                temp_filename = temp_file.name
+            with tempfile.NamedTemporaryFile(suffix='', delete=False) as temp_file:
+                base_filename = temp_file.name  # no extension
 
             # Configure yt-dlp with sticky proxy and matching User-Agent
             ydl_opts = {
                 'format': 'bestaudio/best',
-                'outtmpl': temp_filename,
+                'outtmpl': base_filename,  # no extension
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
+                'noplaylist': True,  # Prevent playlist downloads
                 'socket_timeout': 15,  # Hard timeout to prevent hung jobs
                 'quiet': False,  # Enable output capture for bot detection
-                'no_warnings': False
+                'no_warnings': False,
+                'ffmpeg_location': os.environ.get('FFMPEG_LOCATION', '/usr/bin')  # Explicit ffmpeg path
             }
             
             # Add extractor args for retry attempts to help bypass bot detection
@@ -324,6 +304,9 @@ class TranscriptService:
             
             # Log structured attempt
             self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id)
+
+            # Log yt-dlp configuration for debugging
+            logging.info(f"yt-dlp config: session={session_id} ua_applied={user_agent_applied} ffmpeg_location={ydl_opts.get('ffmpeg_location')}")
 
             video_url = f"https://www.youtube.com/watch?v={video_id}"
             
@@ -370,12 +353,15 @@ class TranscriptService:
                     # Re-raise if not bot-check related
                     raise yt_error
 
+            # After download, the actual file is base + ".mp3"
+            mp3_path = f"{base_filename}.mp3"
+            
             # Send to Deepgram for transcription
-            transcript_text = self._send_to_deepgram(temp_filename)
+            transcript_text = self._send_to_deepgram(mp3_path)
             
             # Clean up temp file
-            if os.path.exists(temp_filename):
-                os.unlink(temp_filename)
+            if os.path.exists(mp3_path):
+                os.unlink(mp3_path)
             
             if transcript_text:
                 latency_ms = int((time.time() - start_time) * 1000)
