@@ -16,7 +16,7 @@ class TestProxySession(unittest.TestCase):
         self.base_config = {
             'username': 'tldw__BwTQx',
             'password': 'b6AXONDdSBHA3U_',
-            'geo_enabled': False,
+            'geo_enabled': True,  # Now enabled by default for MVP reliability
             'country': 'us'
         }
     
@@ -53,11 +53,8 @@ class TestProxySession(unittest.TestCase):
     
     def test_sticky_username_with_geo_enabled(self):
         """Test sticky username builder with geo-enabled (includes -cc-<country>)"""
-        config = self.base_config.copy()
-        config['geo_enabled'] = True
-        config['country'] = 'us'
-        
-        session = ProxySession('testVideo123', config)
+        # base_config now has geo_enabled=True by default
+        session = ProxySession('testVideo123', self.base_config)
         expected_username = f"customer-tldw__BwTQx-cc-us-sessid-{session.session_id}"
         
         self.assertEqual(session.sticky_username, expected_username)

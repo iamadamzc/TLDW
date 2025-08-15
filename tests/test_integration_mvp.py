@@ -42,7 +42,8 @@ class TestStickySessionIntegration(unittest.TestCase):
         mock_config = {
             'username': 'test_user',
             'password': 'test_pass',
-            'geo_enabled': False,
+            'geo_enabled': True,  # Now enabled by default
+            'country': 'us',
             'session_ttl_minutes': 30
         }
         
@@ -50,7 +51,7 @@ class TestStickySessionIntegration(unittest.TestCase):
         with patch('proxy_manager.boto3.Session') as mock_boto_session:
             mock_client = Mock()
             mock_client.get_secret_value.return_value = {
-                'SecretString': '{"username": "test_user", "password": "test_pass", "geo_enabled": false}'
+                'SecretString': '{"username": "test_user", "password": "test_pass"}'
             }
             mock_boto_session.return_value.client.return_value = mock_client
             
@@ -67,12 +68,12 @@ class TestStickySessionIntegration(unittest.TestCase):
             self.assertEqual(session1.session_id, session2.session_id)
             self.assertEqual(session1.proxy_url, session2.proxy_url)
             
-            # Verify sticky username format (no geo)
-            expected_username = f"customer-test_user-sessid-{session1.session_id}"
+            # Verify sticky username format (with geo enabled by default)
+            expected_username = f"customer-test_user-cc-us-sessid-{session1.session_id}"
             self.assertEqual(session1.sticky_username, expected_username)
             
             # Verify proxy URL contains encoded credentials
-            self.assertIn('customer-test_user-sessid-', session1.proxy_url)
+            self.assertIn('customer-test_user-cc-us-sessid-', session1.proxy_url)
             self.assertIn('pr.oxylabs.io:7777', session1.proxy_url)
     
     def test_user_agent_consistency_transcript_ytdlp(self):
@@ -100,13 +101,14 @@ class TestStickySessionIntegration(unittest.TestCase):
         mock_config = {
             'username': 'test_user',
             'password': 'test_pass',
-            'geo_enabled': False
+            'geo_enabled': True,
+            'country': 'us'
         }
         
         with patch('proxy_manager.boto3.Session') as mock_boto_session:
             mock_client = Mock()
             mock_client.get_secret_value.return_value = {
-                'SecretString': '{"username": "test_user", "password": "test_pass", "geo_enabled": false}'
+                'SecretString': '{"username": "test_user", "password": "test_pass"}'
             }
             mock_boto_session.return_value.client.return_value = mock_client
             
@@ -168,7 +170,8 @@ class TestStickySessionIntegration(unittest.TestCase):
         mock_config = {
             'username': 'test_user',
             'password': 'secret_password',
-            'geo_enabled': False
+            'geo_enabled': True,
+            'country': 'us'
         }
         
         session = ProxySession('testVideo123', mock_config)
@@ -226,8 +229,8 @@ class TestStickySessionIntegration(unittest.TestCase):
             # Should have different session ID due to timestamp
             self.assertNotEqual(session2.session_id, original_id)
             
-            # But both should have same base username format
-            base_username = "customer-test_user-sessid-"
+            # But both should have same base username format (with geo)
+            base_username = "customer-test_user-cc-us-sessid-"
             self.assertTrue(session1.sticky_username.startswith(base_username))
             self.assertTrue(session2.sticky_username.startswith(base_username))
             

@@ -151,16 +151,27 @@ class ProxyManager:
                     raise ValueError(f"Missing required field '{field}' in proxy configuration")
             
             # Set defaults for optional fields
-            self.proxy_config.setdefault('geo_enabled', False)
-            self.proxy_config.setdefault('country', 'us')
             self.proxy_config.setdefault('session_ttl_minutes', 30)
             self.proxy_config.setdefault('timeout_seconds', 15)
+            
+            # Configure geo settings - enable by default for MVP reliability
+            # Check environment variable first, then config, then default to enabled with 'us'
+            env_country = os.getenv('PROXY_COUNTRY')
+            if env_country:
+                self.proxy_config['geo_enabled'] = True
+                self.proxy_config['country'] = env_country
+                logging.info(f"Using geo country from environment: {env_country}")
+            else:
+                # Enable geo by default for MVP reliability (avoid "hot" random IPs)
+                self.proxy_config.setdefault('geo_enabled', True)
+                self.proxy_config.setdefault('country', 'us')
             
             # Store SUBUSER for easy access
             self.subuser = self.proxy_config['username']
             self.geo_enabled = self.proxy_config['geo_enabled']
+            self.country = self.proxy_config.get('country', 'us')
             
-            logging.info(f"Loaded proxy config with SUBUSER: {self.subuser}, geo_enabled: {self.geo_enabled}")
+            logging.info(f"Loaded proxy config with SUBUSER: {self.subuser}, geo_enabled: {self.geo_enabled}, country: {self.country}")
             
         except ClientError as e:
             logging.error(f"Failed to load proxy configuration from AWS Secrets Manager: {e}")
