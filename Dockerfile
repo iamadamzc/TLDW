@@ -2,10 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install system dependencies including ffmpeg for yt-dlp audio processing
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Verify ffmpeg and ffprobe are installed and accessible
+RUN ffmpeg -version && ffprobe -version
+
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install dependencies
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
