@@ -49,7 +49,7 @@ class UserAgentManager:
     
     def get_user_agent(self, request_type: str = "default") -> str:
         """
-        Get User-Agent string for specific request types.
+        Get User-Agent string for specific request types with error handling.
         
         Args:
             request_type (str): Type of request ("default", "fallback", "firefox", "edge")
@@ -59,10 +59,18 @@ class UserAgentManager:
         """
         try:
             user_agent = self.USER_AGENT_CONFIG.get(request_type, self.default_user_agent)
+            
+            # Validate the User-Agent before returning
+            if not self.validate_user_agent(user_agent):
+                logging.warning(f"Invalid User-Agent for type '{request_type}', using default")
+                user_agent = self.default_user_agent
+            
             logging.debug(f"Retrieved User-Agent for type '{request_type}': {user_agent[:50]}...")
             return user_agent
+            
         except Exception as e:
-            logging.warning(f"Error getting User-Agent for type '{request_type}': {e}")
+            logging.error(f"Error getting User-Agent for type '{request_type}': {e}")
+            # Graceful degradation to default
             return self.default_user_agent
     
     def get_headers(self, additional_headers: Optional[Dict[str, str]] = None, 
@@ -94,17 +102,46 @@ class UserAgentManager:
             # Return minimal headers with default User-Agent
             return {'User-Agent': self.default_user_agent}
     
-    def get_yt_dlp_user_agent(self, request_type: str = "default") -> str:
+    def get_transcript_headers(self, request_type: str = "default") -> Dict[str, str]:
         """
-        Get User-Agent string specifically formatted for yt-dlp usage.
+        Get headers for transcript requests with User-Agent and Accept-Language.
         
         Args:
             request_type (str): Type of User-Agent to use
             
         Returns:
-            str: User-Agent string suitable for yt-dlp configuration
+            dict: Headers dictionary with User-Agent and Accept-Language for transcript requests
         """
-        return self.get_user_agent(request_type)
+        try:
+            user_agent = self.get_user_agent(request_type)  # Same UA string for both paths
+            headers = {
+                'User-Agent': user_agent,
+                'Accept-Language': 'en-US,en;q=0.9'  # Only for transcript HTTP
+            }
+            
+            logging.debug(f"Generated transcript headers with User-Agent: {user_agent[:50]}...")
+            return headers
+            
+        except Exception as e:
+            logging.error(f"Error generating transcript headers: {e}")
+            # Return minimal headers with default User-Agent and Accept-Language
+            return {
+                'User-Agent': self.default_user_agent,
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
+    
+    def get_yt_dlp_user_agent(self, request_type: str = "default") -> str:
+        """
+        Get identical User-Agent string for yt-dlp --user-agent parameter.
+        Ensures UA parity between transcript and yt-dlp operations.
+        
+        Args:
+            request_type (str): Type of User-Agent to use
+            
+        Returns:
+            str: User-Agent string suitable for yt-dlp configuration (identical to transcript)
+        """
+        return self.get_user_agent(request_type)  # Ensures UA parity between transcript and yt-dlp
     
     def rotate_user_agent(self, current_type: str = "default") -> str:
         """

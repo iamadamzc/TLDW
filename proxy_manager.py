@@ -27,41 +27,50 @@ class ProxySession:
         self.expires_at = self._calculate_expires_at()
         
     def _generate_session_id(self) -> str:
-        """Generate a unique session ID based on video_id and timestamp"""
-        import time
-        # Include microseconds to ensure uniqueness on rotation
-        data = f"{self.video_id}_{self.created_at.isoformat()}_{time.time()}"
-        return hashlib.md5(data.encode()).hexdigest()[:8]
+        """Generate deterministic session ID from sanitized video_id (capped at 16 chars)"""
+        # Sanitize to alphanumeric only and cap at 16 chars for proxy compatibility
+        sanitized = re.sub(r'[^a-zA-Z0-9]', '', self.video_id)
+        session_id = sanitized[:16]
+        
+        # Log the final session ID (never log password/URL)
+        logging.debug(f"Generated session ID for video {self.video_id}: {session_id}")
+        return session_id
     
     def _sanitize_video_id(self, video_id: str) -> str:
         """Sanitize video_id to alphanumeric only for sticky session"""
         return re.sub(r'[^a-zA-Z0-9]', '', video_id)
     
     def _build_proxy_url(self) -> str:
-        """Build Oxylabs sticky session proxy URL with proper encoding"""
+        """
+        Build Oxylabs sticky session proxy URL with proper encoding
+        Format: customer-<SUBUSER>-cc-<country>-sessid-<SESSION_ID>
+        Note: -cc-<country> is omitted entirely when geo_enabled is False or country unspecified
+        Hardcoded to residential entrypoint pr.oxylabs.io:7777
+        """
         if not self.proxy_config:
             return ""
         
-        # Get base username from config
-        base_username = self.proxy_config.get('username', '')
+        # Get credentials from config
+        subuser = self.proxy_config.get('username', '')  # SUBUSER from AWS Secrets Manager
         password = self.proxy_config.get('password', '')
-        host = self.proxy_config.get('host', '')
-        port = self.proxy_config.get('port', '')
+        geo_enabled = self.proxy_config.get('geo_enabled', False)
+        country = self.proxy_config.get('country', 'us')
         
-        # Sanitize video_id for session
-        sanitized_video_id = self._sanitize_video_id(self.video_id)
+        # Build sticky username - omit -cc-<country> segment entirely if not geo-enabled
+        if geo_enabled:
+            sticky_username = f"customer-{subuser}-cc-{country}-sessid-{self.session_id}"
+        else:
+            sticky_username = f"customer-{subuser}-sessid-{self.session_id}"
         
-        # Build sticky session username: customer-<base_username>-cc-us-sessid-<video_id>
-        sticky_username = f"customer-{base_username}-cc-us-sessid-{sanitized_video_id}"
-        
-        # URL encode username and password
+        # URL encode credentials (NEVER log password or full URL)
         encoded_username = quote(sticky_username, safe="")
         encoded_password = quote(password, safe="")
         
-        # Build proxy URL
-        proxy_url = f"http://{encoded_username}:{encoded_password}@{host}:{port}"
+        # Build proxy URL with hardcoded residential entrypoint
+        proxy_url = f"http://{encoded_username}:{encoded_password}@pr.oxylabs.io:7777"
         
-        logging.debug(f"Built sticky proxy URL for video {self.video_id}: {sticky_username}@{host}:{port}")
+        # Log only the sticky username (no password/full URL)
+        logging.debug(f"Built sticky proxy for video {self.video_id}: {sticky_username}@pr.oxylabs.io:7777")
         return proxy_url
     
     def _calculate_expires_at(self) -> datetime:
@@ -90,6 +99,22 @@ class ProxySession:
         self.is_blocked = True
         self.failed_count += 1
         logging.warning(f"Session {self.session_id} for video {self.video_id} marked as blocked")
+    
+    @property
+    def sticky_username(self) -> str:
+        """Returns the sticky username without password for logging"""
+        if not self.proxy_config:
+            return ""
+        
+        subuser = self.proxy_config.get('username', '')
+        geo_enabled = self.proxy_config.get('geo_enabled', False)
+        country = self.proxy_config.get('country', '')
+        
+        # Build sticky username - omit -cc-<country> segment entirely if not geo-enabled
+        if geo_enabled:
+            return f"customer-{subuser}-cc-{country}-sessid-{self.session_id}"
+        else:
+            return f"customer-{subuser}-sessid-{self.session_id}"
 
 class ProxyManager:
     """Manages sticky proxy sessions for YouTube transcript fetching"""
@@ -119,7 +144,23 @@ class ProxyManager:
             # Parse the JSON configuration
             self.proxy_config = json.loads(secret_string)
             
-            logging.info(f"Loaded proxy config: {self.proxy_config['host']}:{self.proxy_config['port']}")
+            # Validate required fields
+            required_fields = ['username', 'password']
+            for field in required_fields:
+                if field not in self.proxy_config:
+                    raise ValueError(f"Missing required field '{field}' in proxy configuration")
+            
+            # Set defaults for optional fields
+            self.proxy_config.setdefault('geo_enabled', False)
+            self.proxy_config.setdefault('country', 'us')
+            self.proxy_config.setdefault('session_ttl_minutes', 30)
+            self.proxy_config.setdefault('timeout_seconds', 15)
+            
+            # Store SUBUSER for easy access
+            self.subuser = self.proxy_config['username']
+            self.geo_enabled = self.proxy_config['geo_enabled']
+            
+            logging.info(f"Loaded proxy config with SUBUSER: {self.subuser}, geo_enabled: {self.geo_enabled}")
             
         except ClientError as e:
             logging.error(f"Failed to load proxy configuration from AWS Secrets Manager: {e}")
@@ -127,6 +168,10 @@ class ProxyManager:
             raise
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse proxy configuration JSON: {e}")
+            self.enabled = False
+            raise
+        except ValueError as e:
+            logging.error(f"Invalid proxy configuration: {e}")
             self.enabled = False
             raise
         except Exception as e:
@@ -165,7 +210,10 @@ class ProxyManager:
         return session
     
     def rotate_session(self, video_id: str) -> Optional[ProxySession]:
-        """Rotate (recreate) the session for a video_id after blocking"""
+        """
+        Rotate (recreate) the session for a video_id after blocking
+        Note: With deterministic session IDs, rotation creates a new session with timestamp suffix
+        """
         if not self.enabled or not self.proxy_config:
             return None
         
@@ -175,8 +223,13 @@ class ProxyManager:
             logging.info(f"Rotating session {old_session.session_id} for video {video_id}")
             del self.sessions[video_id]
         
-        # Create new session (this will be the one retry allowed)
-        session = ProxySession(video_id, self.proxy_config)
+        # For rotation, append timestamp to video_id to create different session ID
+        rotation_video_id = f"{video_id}_{int(time.time())}"
+        
+        # Create new session with modified video_id for different session ID
+        session = ProxySession(rotation_video_id, self.proxy_config)
+        # But store it under original video_id
+        session.video_id = video_id  # Keep original video_id for reference
         self.sessions[video_id] = session
         
         logging.info(f"Created rotated session {session.session_id} for video {video_id}")
@@ -246,3 +299,50 @@ class ProxyManager:
             logging.info(f"Proxy stats: {stats['active_sessions']} active sessions, "
                         f"{stats['success_rate']:.1f}% success rate, "
                         f"{stats['blocked_sessions']} blocked sessions")
+    
+    def handle_407_error(self, video_id: str) -> bool:
+        """
+        Handle 407 Proxy Authentication Required error
+        Returns True if secrets were refreshed and retry should be attempted
+        """
+        logging.error(f"407 Proxy Authentication Required for video {video_id} - "
+                     f"hint='check URL-encoding or secret password'")
+        
+        # Attempt one-time secrets refresh for resilience
+        try:
+            logging.info("Attempting to refresh proxy credentials from AWS Secrets Manager")
+            old_config = self.proxy_config.copy() if self.proxy_config else {}
+            
+            # Reload configuration
+            self._load_proxy_config()
+            
+            # Check if credentials actually changed
+            if (old_config.get('username') != self.proxy_config.get('username') or 
+                old_config.get('password') != self.proxy_config.get('password')):
+                logging.info("Proxy credentials refreshed - retry may succeed")
+                return True
+            else:
+                logging.warning("Proxy credentials unchanged after refresh - likely encoding issue")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Failed to refresh proxy credentials: {e}")
+            return False
+    
+    def validate_proxy_config(self) -> bool:
+        """Validate proxy configuration and credentials"""
+        if not self.proxy_config:
+            return False
+        
+        required_fields = ['username', 'password']
+        for field in required_fields:
+            if not self.proxy_config.get(field):
+                logging.error(f"Proxy configuration missing required field: {field}")
+                return False
+        
+        # Validate username format (should not contain spaces or invalid chars)
+        username = self.proxy_config['username']
+        if ' ' in username or '@' in username:
+            logging.warning(f"Proxy username may need URL encoding: {username}")
+        
+        return True
