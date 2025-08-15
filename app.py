@@ -40,51 +40,6 @@ def load_user(user_id):
     from models import User
     return User.query.get(int(user_id))
 
-with app.app_context():
-    # Import models to ensure tables are created
-    import models  # noqa: F401
-    db.create_all()
-    
-    # Log dependency status on startup
-    _log_startup_dependencies()
-
-# Import and register blueprints
-from google_auth import google_auth
-from routes import main_routes
-
-app.register_blueprint(google_auth)
-app.register_blueprint(main_routes)
-
-# Add health check endpoint for App Runner
-@app.route('/health')
-def health_check():
-    """Enhanced health check with proxy status and dependency verification"""
-    health_info = {
-        'status': 'healthy', 
-        'message': 'TL;DW API is running',
-        'proxy_enabled': os.getenv('USE_PROXIES', 'false').lower() == 'true'
-    }
-    
-    # Check critical dependencies
-    health_info['dependencies'] = _check_dependencies()
-    
-    # Add proxy status if enabled
-    if health_info['proxy_enabled']:
-        try:
-            from proxy_manager import ProxyManager
-            proxy_manager = ProxyManager()
-            proxy_stats = proxy_manager.get_session_stats()
-            health_info['proxy_status'] = proxy_stats
-        except Exception as e:
-            health_info['proxy_status'] = {'error': str(e)}
-    
-    # Set overall status based on critical dependencies
-    if not health_info['dependencies']['ffmpeg']['available'] or not health_info['dependencies']['yt_dlp']['available']:
-        health_info['status'] = 'degraded'
-        health_info['message'] = 'Some dependencies missing - ASR functionality may be impaired'
-    
-    return health_info, 200
-
 def _check_dependencies():
     """Check availability of critical dependencies for ASR functionality"""
     import subprocess
@@ -136,7 +91,27 @@ def _check_dependencies():
 
 def _log_startup_dependencies():
     """Log dependency status on application startup for fast failure detection"""
+    import shutil
+    import subprocess
+    
     logging.info("=== TL;DW Startup Dependency Check ===")
+    
+    # Log basic system info
+    logging.info(f"Python executable: {shutil.which('python3')}")
+    logging.info(f"Working directory: {os.getcwd()}")
+    
+    # Quick PATH check for critical binaries
+    logging.info(f"yt-dlp: {shutil.which('yt-dlp')}")
+    logging.info(f"ffmpeg: {shutil.which('ffmpeg')}")
+    logging.info(f"ffprobe: {shutil.which('ffprobe')}")
+    
+    # Test ffmpeg/ffprobe execution
+    try:
+        subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        subprocess.run(["ffprobe", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        logging.info("✅ ffmpeg/ffprobe execution test passed")
+    except Exception as e:
+        logging.error(f"❌ FFMPEG_NOT_AVAILABLE: {e}")
     
     dependencies = _check_dependencies()
     
@@ -161,9 +136,57 @@ def _log_startup_dependencies():
     if critical_missing:
         logging.error(f"🚨 CRITICAL: Missing dependencies {critical_missing} - ASR functionality will fail!")
         logging.error("🔧 Install missing dependencies or check container build process")
+        # Don't fail startup for missing dependencies - let health check handle it
+        # This allows the service to start and report issues via /health endpoint
     else:
         logging.info("✅ All critical dependencies available - ASR functionality ready")
     
     logging.info("=== End Dependency Check ===")
     
     return len(critical_missing) == 0
+
+with app.app_context():
+    # Import models to ensure tables are created
+    import models  # noqa: F401
+    db.create_all()
+    
+    # Log dependency status on startup
+    _log_startup_dependencies()
+
+# Import and register blueprints
+from google_auth import google_auth
+from routes import main_routes
+
+app.register_blueprint(google_auth)
+app.register_blueprint(main_routes)
+
+# Add health check endpoints for App Runner
+@app.route('/health')
+@app.route('/healthz')
+def health_check():
+    """Enhanced health check with proxy status and dependency verification"""
+    health_info = {
+        'status': 'healthy', 
+        'message': 'TL;DW API is running',
+        'proxy_enabled': os.getenv('USE_PROXIES', 'false').lower() == 'true'
+    }
+    
+    # Check critical dependencies
+    health_info['dependencies'] = _check_dependencies()
+    
+    # Add proxy status if enabled
+    if health_info['proxy_enabled']:
+        try:
+            from proxy_manager import ProxyManager
+            proxy_manager = ProxyManager()
+            proxy_stats = proxy_manager.get_session_stats()
+            health_info['proxy_status'] = proxy_stats
+        except Exception as e:
+            health_info['proxy_status'] = {'error': str(e)}
+    
+    # Set overall status based on critical dependencies
+    if not health_info['dependencies']['ffmpeg']['available'] or not health_info['dependencies']['yt_dlp']['available']:
+        health_info['status'] = 'degraded'
+        health_info['message'] = 'Some dependencies missing - ASR functionality may be impaired'
+    
+    return health_info, 200

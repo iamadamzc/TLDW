@@ -1,112 +1,115 @@
 #!/usr/bin/env python3
 """
-Test script to verify ffmpeg, ffprobe, and yt-dlp dependencies are available
-Run this in the container to verify the build is correct
+Test script to verify all dependencies are working correctly
+Run this to test the container setup before deployment
 """
 
-import subprocess
 import sys
+import subprocess
 import shutil
+import logging
 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 def test_ffmpeg():
-    """Test ffmpeg availability and version"""
-    print("Testing ffmpeg...")
+    """Test ffmpeg installation and functionality"""
+    logging.info("Testing ffmpeg...")
+    
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        logging.error("❌ ffmpeg not found in PATH")
+        return False
+    
     try:
-        ffmpeg_path = shutil.which('ffmpeg')
-        if not ffmpeg_path:
-            print("❌ ffmpeg not found in PATH")
-            return False
-        
         result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             version_line = result.stdout.split('\n')[0]
-            print(f"✅ ffmpeg: {version_line}")
-            print(f"   Path: {ffmpeg_path}")
+            logging.info(f"✅ ffmpeg available: {version_line}")
             return True
         else:
-            print(f"❌ ffmpeg version check failed: {result.stderr}")
+            logging.error(f"❌ ffmpeg execution failed: {result.stderr}")
             return False
     except Exception as e:
-        print(f"❌ ffmpeg test failed: {e}")
+        logging.error(f"❌ ffmpeg test failed: {e}")
         return False
 
-
 def test_ffprobe():
-    """Test ffprobe availability and version"""
-    print("\nTesting ffprobe...")
+    """Test ffprobe installation and functionality"""
+    logging.info("Testing ffprobe...")
+    
+    ffprobe_path = shutil.which('ffprobe')
+    if not ffprobe_path:
+        logging.error("❌ ffprobe not found in PATH")
+        return False
+    
     try:
-        ffprobe_path = shutil.which('ffprobe')
-        if not ffprobe_path:
-            print("❌ ffprobe not found in PATH")
-            return False
-        
         result = subprocess.run(['ffprobe', '-version'], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             version_line = result.stdout.split('\n')[0]
-            print(f"✅ ffprobe: {version_line}")
-            print(f"   Path: {ffprobe_path}")
+            logging.info(f"✅ ffprobe available: {version_line}")
             return True
         else:
-            print(f"❌ ffprobe version check failed: {result.stderr}")
+            logging.error(f"❌ ffprobe execution failed: {result.stderr}")
             return False
     except Exception as e:
-        print(f"❌ ffprobe test failed: {e}")
+        logging.error(f"❌ ffprobe test failed: {e}")
         return False
-
 
 def test_yt_dlp():
-    """Test yt-dlp availability and version"""
-    print("\nTesting yt-dlp...")
+    """Test yt-dlp installation"""
+    logging.info("Testing yt-dlp...")
+    
     try:
         import yt_dlp
-        version = yt_dlp.version.__version__
-        print(f"✅ yt-dlp: {version}")
-        
-        # Test basic functionality
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            # Just test that we can create the object
-            print("   yt-dlp object creation: OK")
-        
+        logging.info(f"✅ yt-dlp available: {yt_dlp.version.__version__}")
         return True
-    except Exception as e:
-        print(f"❌ yt-dlp test failed: {e}")
+    except ImportError as e:
+        logging.error(f"❌ yt-dlp import failed: {e}")
         return False
 
+def test_flask_app():
+    """Test Flask app can be imported"""
+    logging.info("Testing Flask app import...")
+    
+    try:
+        from app import app
+        logging.info("✅ Flask app imported successfully")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Flask app import failed: {e}")
+        return False
 
 def main():
     """Run all dependency tests"""
-    print("🔍 Testing TL;DW Dependencies")
-    print("=" * 40)
+    logging.info("=== TL;DW Dependency Test Suite ===")
     
     tests = [
         ("ffmpeg", test_ffmpeg),
         ("ffprobe", test_ffprobe),
-        ("yt-dlp", test_yt_dlp)
+        ("yt-dlp", test_yt_dlp),
+        ("Flask app", test_flask_app)
     ]
     
     results = {}
-    for name, test_func in tests:
-        results[name] = test_func()
+    for test_name, test_func in tests:
+        results[test_name] = test_func()
     
-    print("\n" + "=" * 40)
-    print("📊 Test Results:")
+    logging.info("=== Test Results ===")
+    passed = 0
+    for test_name, result in results.items():
+        status = "✅ PASS" if result else "❌ FAIL"
+        logging.info(f"{test_name}: {status}")
+        if result:
+            passed += 1
     
-    all_passed = True
-    for name, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"   {name}: {status}")
-        if not passed:
-            all_passed = False
+    logging.info(f"=== Summary: {passed}/{len(tests)} tests passed ===")
     
-    if all_passed:
-        print("\n🎉 All dependencies available - ASR functionality ready!")
-        sys.exit(0)
+    if passed == len(tests):
+        logging.info("🎉 All tests passed! Container is ready for deployment.")
+        return 0
     else:
-        print("\n🚨 Some dependencies missing - ASR functionality will fail!")
-        print("🔧 Check container build process and install missing dependencies")
-        sys.exit(1)
-
+        logging.error("💥 Some tests failed! Fix issues before deployment.")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
