@@ -66,6 +66,9 @@
 
 - [x] 5. Create deployment configuration and security hardening
 
+
+
+
   - Add boto3 to requirements.txt for S3 cookie support
   - Create least-privilege IAM policy restricting access to s3:GetObject/PutObject/DeleteObject on cookies/{user_id}.txt paths only
   - Block S3 bucket listing permissions unless specifically needed

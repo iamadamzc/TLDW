@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import tempfile
-import yt_dlp
 import requests
 import mimetypes
 from typing import Optional
@@ -268,14 +267,44 @@ class TranscriptService:
         else:
             logging.debug(f"UserAgentManager not available for yt-dlp download of {video_id}")
         
-        # Get proxy URL
+        # Get proxy URL and validate credentials
         proxy_url = session.proxy_url if session and session.proxy_url else ""
         if proxy_url:
+            # Log sanitized proxy info for debugging
+            if '@' in proxy_url:
+                # Extract host:port for logging (mask credentials)
+                proxy_parts = proxy_url.split('@')
+                if len(proxy_parts) == 2:
+                    creds_part = proxy_parts[0].split('//')[-1]  # Extract user:pass
+                    host_part = proxy_parts[1]
+                    user_part = creds_part.split(':')[0] if ':' in creds_part else creds_part
+                    logging.info(f"Using sticky proxy for yt-dlp download of video {video_id}: {session_id} (attempt {attempt}) - http://{user_part}:***@{host_part}")
+                else:
+                    logging.warning(f"Proxy URL format unexpected for video {video_id}: missing credentials")
+            else:
+                logging.warning(f"Proxy URL for video {video_id} missing authentication credentials - this may cause 407 errors")
             logging.info(f"Using sticky proxy for yt-dlp download of video {video_id}: {session_id} (attempt {attempt})")
         
         # Get ffmpeg path
         ffmpeg_path = os.environ.get('FFMPEG_LOCATION', '/usr/bin')
         
+        # Resolve per-user cookiefile (optional) - respect kill-switch
+        cookiefile, tmp_cookie = None, None
+        if os.getenv("DISABLE_COOKIES", "false").lower() != "true":
+            try:
+                user_id = self._resolve_current_user_id()
+                if user_id:
+                    cookiefile, tmp_cookie = self._get_user_cookiefile(user_id)
+                    if cookiefile:
+                        logging.info(f"Using user cookiefile for yt-dlp (user={user_id})")
+            except Exception as e:
+                logging.warning(f"Cookiefile unavailable: {e}")
+        else:
+            logging.debug("Cookie functionality disabled via DISABLE_COOKIES environment variable")
+
+        # Compute cookies flag for logging closure
+        cookies_used_flag = bool(cookiefile)
+
         # Status tracking for logging integration
         last_status = {"status": "unknown", "attempt": attempt}
         
@@ -304,24 +333,10 @@ class TranscriptService:
             latency_ms = int((time.time() - start_time) * 1000)
             self._log_structured("ytdlp", video_id, last_status["status"], 
                                last_status["attempt"], latency_ms, "asr", 
-                               user_agent_applied, session_id, bool(cookiefile))
-        
-        # Resolve per-user cookiefile (optional) - respect kill-switch
-        cookiefile, tmp_cookie = None, None
-        if os.getenv("DISABLE_COOKIES", "false").lower() != "true":
-            try:
-                user_id = self._resolve_current_user_id()
-                if user_id:
-                    cookiefile, tmp_cookie = self._get_user_cookiefile(user_id)
-                    if cookiefile:
-                        logging.info(f"Using user cookiefile for yt-dlp (user={user_id})")
-            except Exception as e:
-                logging.warning(f"Cookiefile unavailable: {e}")
-        else:
-            logging.debug("Cookie functionality disabled via DISABLE_COOKIES environment variable")
+                               user_agent_applied, session_id, cookies_used_flag)
 
         # Log initial attempt
-        self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id, bool(cookiefile))
+        self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id, cookies_used_flag)
         logging.info(f"yt-dlp config: session={session_id} ua_applied={user_agent_applied} ffmpeg_location={ffmpeg_path}")
         
         try:
@@ -351,7 +366,7 @@ class TranscriptService:
                 }
             else:
                 latency_ms = int((time.time() - start_time) * 1000)
-                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_failed", user_agent_applied, session_id, bool(cookiefile))
+                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_failed", user_agent_applied, session_id, cookies_used_flag)
                 return {
                     'status': 'neterr',
                     'attempt': attempt,
@@ -384,7 +399,7 @@ class TranscriptService:
                     session.mark_failed()
             
             logging.error(f"Error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
-            self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", user_agent_applied, session_id, bool(cookiefile))
+            self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", user_agent_applied, session_id, cookies_used_flag)
             
             return {
                 'status': status,
@@ -396,7 +411,7 @@ class TranscriptService:
             # Unexpected error
             latency_ms = int((time.time() - start_time) * 1000)
             logging.error(f"Unexpected error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
-            self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_error", user_agent_applied, session_id, bool(cookiefile))
+            self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_error", user_agent_applied, session_id, cookies_used_flag)
             
             if session:
                 session.mark_failed()
@@ -536,6 +551,7 @@ class TranscriptService:
         if bucket:
             try:
                 import boto3  # optional dependency
+                from botocore.exceptions import ClientError
                 s3 = boto3.client("s3")
                 key = f"cookies/{user_id}.txt"
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".cookies.txt")
@@ -543,14 +559,22 @@ class TranscriptService:
                 tmp.close()
                 s3.download_file(bucket, key, tmp_path)
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    logging.debug(f"Cookie source: s3 for user {user_id}")
                     return tmp_path, tmp_path  # tmp file to cleanup later
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                if error_code in ['403', 'AccessDenied']:
+                    logging.warning(f"S3 cookie download failed for user {user_id} from {bucket}/cookies/{user_id}.txt: {e}. Check s3:GetObject and (if SSE-KMS) kms:Decrypt on the instance role.")
+                else:
+                    logging.warning(f"S3 cookie download failed for user {user_id} from {bucket}/cookies/{user_id}.txt: {e}")
             except Exception as e:
-                logging.warning(f"S3 cookie download failed for user {user_id}: {e}")
+                logging.warning(f"S3 cookie download failed for user {user_id} from {bucket}/cookies/{user_id}.txt: {e}")
 
         # Local path
         local_dir = os.getenv("COOKIE_LOCAL_DIR", "/app/cookies")
         local_path = os.path.join(local_dir, f"{user_id}.txt")
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            logging.debug(f"Cookie source: local for user {user_id}")
             return local_path, None  # persistent file; don't delete
         return None, None
 

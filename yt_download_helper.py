@@ -55,14 +55,17 @@ def download_audio_with_fallback(
         "socket_timeout": 15,
         "geo_bypass": False,  # Avoid suspicious behavior patterns
         "ffmpeg_location": ffmpeg_path,
-        "extractor_args": {"youtube": {"player_client": ["ios", "web_creator", "android"]}},
+        "forceipv4": True,  # Some pools/targets behave better over IPv4
+        "http_chunk_size": 10485760,  # 10 MB chunks
+        "ratelimit": 100000,  # ~100 KB/s intentional rate limiting
+        "extractor_args": {"youtube": {"player_client": ["ios", "web_creator"]}},  # Remove android for now
         # Let service logs show details; don't silence warnings entirely
         "quiet": False,
         "no_warnings": False,
     }
     
-    # Add cookiefile if provided
-    if cookiefile:
+    # Add cookiefile if provided and valid
+    if cookiefile and os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0:
         base_opts["cookiefile"] = cookiefile
 
     # ---------- STEP 1: direct audio (m4a preferred) ----------

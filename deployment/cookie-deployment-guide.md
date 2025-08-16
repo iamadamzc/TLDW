@@ -58,6 +58,8 @@ aws s3api put-public-access-block \
 
 Add the cookie access policy to your App Runner instance role:
 
+**Note:** The `deployment/cookie-iam-policy.json` file contains template variables (`${COOKIE_S3_BUCKET}`) that must be replaced with actual values before use. Do not upload this file directly to AWS Console/API.
+
 ```bash
 # Get your App Runner service ARN and extract the role name
 export SERVICE_ARN="your-app-runner-service-arn"
@@ -179,10 +181,12 @@ rm -rf /app/cookies/*
 
 ### Common Issues
 
-**S3 Access Denied**
-- Check IAM policy is correctly attached
-- Verify bucket name in environment variable
+**S3 Access Denied (403 Forbidden)**
+- Check IAM policy includes both s3:GetObject AND kms:Decrypt permissions
+- Verify bucket name in environment variable matches exactly
 - Ensure bucket exists and has correct permissions
+- If using SSE-KMS encryption, verify KMS key policy allows the instance role
+- Check logs for specific error: "Check s3:GetObject and (if SSE-KMS) kms:Decrypt on the instance role"
 
 **Cookie Upload Fails**
 - Check local directory permissions
@@ -193,6 +197,12 @@ rm -rf /app/cookies/*
 - Cookies may be expired/stale
 - User needs to re-export fresh cookies
 - Check cookie file format validation
+
+**Proxy Authentication Errors (407)**
+- Verify proxy URL includes credentials: http://user:pass@host:port
+- Check for HTTP_PROXY/HTTPS_PROXY environment variables overriding settings
+- Ensure proxy credentials are not expired or rate-limited
+- Look for "missing authentication credentials" warnings in logs
 
 ## Testing
 

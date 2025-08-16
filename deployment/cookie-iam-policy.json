@@ -12,6 +12,19 @@
       "Resource": [
         "arn:aws:s3:::${COOKIE_S3_BUCKET}/cookies/*"
       ]
+    },
+    {
+      "Sid": "AllowKMSDecryption",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.*.amazonaws.com"
+        }
+      }
     }
   ]
 }

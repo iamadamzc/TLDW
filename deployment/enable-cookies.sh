@@ -85,6 +85,19 @@ if [ -n "$COOKIE_BUCKET_NAME" ]; then
       "Resource": [
         "arn:aws:s3:::$COOKIE_BUCKET_NAME/cookies/*"
       ]
+    },
+    {
+      "Sid": "AllowKMSDecryption",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.*.amazonaws.com"
+        }
+      }
     }
   ]
 }
