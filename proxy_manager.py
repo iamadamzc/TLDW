@@ -6,12 +6,37 @@ import hashlib
 import re
 from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import boto3
 from botocore.exceptions import ClientError
 
 # Regex pattern for AWS ARN validation
 ARN_PATTERN = re.compile(r"^arn:aws:secretsmanager:[\w-]+:\d{12}:secret:[\w+=,.@/-]+$")
+
+def _normalize_credential(value: str) -> str:
+    """
+    Normalize potentially URL-encoded credentials by decoding once if needed.
+    
+    Heuristic: if the value contains any %XX sequence, try one decode pass.
+    Safety: only decode if the result contains printable ASCII characters.
+    
+    This handles cases where credentials were mistakenly stored URL-encoded
+    in AWS Secrets Manager, preventing double-encoding in proxy URLs.
+    """
+    if not value or '%' not in value:
+        return value
+    
+    try:
+        decoded = unquote(value)
+        # Safety check: ensure decoded result contains only printable ASCII
+        # Allow common whitespace chars (tab, newline, carriage return)
+        if all(31 < ord(c) < 127 or c in '\t\n\r' for c in decoded):
+            return decoded
+    except Exception:
+        # If decoding fails for any reason, return original value
+        pass
+    
+    return value
 
 class ProxySession:
     """Represents a sticky proxy session for a specific video_id"""
@@ -205,6 +230,26 @@ class ProxyManager:
             for field in required_fields:
                 if field not in self.proxy_config:
                     raise ValueError(f"Missing required field '{field}' in proxy configuration")
+            
+            # Normalize credentials if they appear to be URL-encoded
+            raw_user = self.proxy_config.get('username', '')
+            raw_pass = self.proxy_config.get('password', '')
+            
+            # Apply normalization to detect and fix URL-encoded credentials
+            normalized_user = _normalize_credential(raw_user)
+            normalized_pass = _normalize_credential(raw_pass)
+            
+            # Log if normalization changed values (mask sensitive data)
+            if normalized_user != raw_user:
+                user_prefix = normalized_user[:3] + "***" if len(normalized_user) > 3 else "***"
+                logging.info(f"Detected percent-encoded proxy username; applied single decode pass: {user_prefix}")
+            
+            if normalized_pass != raw_pass:
+                logging.info("Detected percent-encoded proxy password; applied single decode pass before URL-encoding")
+            
+            # Update config with normalized credentials
+            self.proxy_config['username'] = normalized_user
+            self.proxy_config['password'] = normalized_pass
             
             # Set defaults for optional fields
             self.proxy_config.setdefault('session_ttl_minutes', 30)
@@ -403,7 +448,7 @@ class ProxyManager:
                 logging.info("Proxy credentials refreshed - retry may succeed")
                 return True
             else:
-                logging.warning("Proxy credentials unchanged after refresh - likely encoding issue")
+                logging.warning("Proxy credentials unchanged after refresh - likely secret is misformatted (e.g., already URL-encoded). See runbook: store RAW creds in secret JSON.")
                 return False
                 
         except Exception as e:
@@ -452,13 +497,28 @@ class ProxyManager:
         if hasattr(self, 'subuser') and self.subuser:
             health_info["username_prefix"] = self.subuser[:4] + "***" if len(self.subuser) > 4 else "***"
         
+        # Add diagnostic field for credential encoding detection
+        if self.proxy_config.get('username') and self.proxy_config.get('password'):
+            # Check if original credentials (before normalization) looked percent-encoded
+            # This is purely for diagnostics - we don't store the original values
+            raw_user = self.proxy_config.get('username', '')
+            raw_pass = self.proxy_config.get('password', '')
+            
+            # Heuristic: if credentials contain common URL-encoded sequences, flag for diagnostics
+            looks_encoded = (
+                '%' in raw_user or '%' in raw_pass or
+                any(seq in raw_user + raw_pass for seq in ['%40', '%3A', '%2B', '%5F', '%21'])
+            )
+            health_info["looks_percent_encoded_password"] = looks_encoded
+        
         # Handle URL-only configuration
         if "url" in self.proxy_config and len(self.proxy_config) == 1:
             health_info.update({
                 "has_username": True,  # URL contains credentials
                 "has_password": True,
                 "geo_enabled": False,
-                "country": "unknown"
+                "country": "unknown",
+                "looks_percent_encoded_password": False  # URL format doesn't apply
             })
         
         return health_info
