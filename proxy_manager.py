@@ -462,3 +462,43 @@ class ProxyManager:
             })
         
         return health_info
+    
+    def test_proxy_connectivity(self) -> Dict[str, Any]:
+        """Test proxy connectivity without exposing credentials"""
+        if not self.enabled or not self.proxy_config:
+            return {"test_performed": False, "reason": "proxy_disabled_or_not_configured"}
+        
+        try:
+            # Create a test session
+            test_session = ProxySession("test_connectivity", self.proxy_config)
+            
+            # Test with a simple HTTP request (not YouTube to avoid blocking)
+            import requests
+            test_url = "http://httpbin.org/ip"
+            
+            response = requests.get(
+                test_url,
+                proxies={"http": test_session.proxy_url, "https": test_session.proxy_url},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return {
+                    "test_performed": True,
+                    "status": "success",
+                    "response_code": response.status_code,
+                    "proxy_ip": response.json().get("origin", "unknown")
+                }
+            else:
+                return {
+                    "test_performed": True,
+                    "status": "failed",
+                    "response_code": response.status_code
+                }
+                
+        except Exception as e:
+            return {
+                "test_performed": True,
+                "status": "error",
+                "error": str(e)
+            }

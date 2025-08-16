@@ -204,6 +204,20 @@ def health_check():
             
             health_info['proxy_status'] = proxy_stats
             health_info['proxy_config'] = proxy_health
+            
+            # Test proxy connectivity if configuration is readable
+            if proxy_config_readable:
+                proxy_test = proxy_manager.test_proxy_connectivity()
+                health_info['proxy_connectivity'] = proxy_test
+                
+                # Update proxy_config_readable based on actual connectivity
+                if proxy_test.get('status') == 'success':
+                    proxy_config_readable = True
+                elif proxy_test.get('status') in ['failed', 'error']:
+                    proxy_config_readable = False
+                    # Log the connectivity issue for debugging
+                    logging.warning(f"Proxy connectivity test failed: {proxy_test}")
+            
             health_info['secrets'] = {
                 'proxy_config_readable': proxy_config_readable
             }
