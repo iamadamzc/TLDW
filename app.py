@@ -195,9 +195,50 @@ def health_check():
             from proxy_manager import ProxyManager
             proxy_manager = ProxyManager()
             proxy_stats = proxy_manager.get_session_stats()
+            proxy_health = proxy_manager.get_proxy_health_info()
+            
+            # Set proxy_config_readable boolean for deployment validation
+            proxy_config_readable = (proxy_health.get('status') == 'configured' and 
+                                    proxy_health.get('has_username') and 
+                                    proxy_health.get('has_password'))
+            
             health_info['proxy_status'] = proxy_stats
+            health_info['proxy_config'] = proxy_health
+            health_info['secrets'] = {
+                'proxy_config_readable': proxy_config_readable
+            }
+            
+            # Add detailed error info only in debug mode
+            debug_health = os.getenv('DEBUG_HEALTHZ', 'false').lower() == 'true'
+            if not debug_health and 'error' in str(proxy_health):
+                # Redact detailed error in production, keep boolean status
+                health_info['proxy_config'] = {
+                    'status': proxy_health.get('status', 'error'),
+                    'source': proxy_health.get('source', 'unknown'),
+                    'readable': proxy_config_readable
+                }
+                
         except Exception as e:
-            health_info['proxy_status'] = {'error': str(e)}
+            # Set proxy_config_readable to false on any error
+            health_info['secrets'] = {'proxy_config_readable': False}
+            health_info['proxy_status'] = {'error': 'proxy_manager_init_failed'}
+            
+            # Show detailed error only in debug mode
+            debug_health = os.getenv('DEBUG_HEALTHZ', 'false').lower() == 'true'
+            if debug_health:
+                health_info['proxy_config'] = {'error': str(e)}
+            else:
+                health_info['proxy_config'] = {'status': 'error', 'readable': False}
+    
+    # Add diagnostic information if enabled
+    if os.getenv('EXPOSE_HEALTH_DIAGNOSTICS', 'false').lower() == 'true':
+        try:
+            from transcript_service import TranscriptService
+            service = TranscriptService()
+            diagnostics = service.get_health_diagnostics()
+            health_info['diagnostics'] = diagnostics
+        except Exception as e:
+            health_info['diagnostics'] = {'error': str(e)}
     
     # Determine status and HTTP code based on critical dependencies
     critical_missing = []

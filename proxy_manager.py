@@ -10,6 +10,9 @@ from urllib.parse import quote
 import boto3
 from botocore.exceptions import ClientError
 
+# Regex pattern for AWS ARN validation
+ARN_PATTERN = re.compile(r"^arn:aws:secretsmanager:[\w-]+:\d{12}:secret:[\w+=,.@/-]+$")
+
 class ProxySession:
     """Represents a sticky proxy session for a specific video_id"""
     
@@ -123,6 +126,7 @@ class ProxyManager:
         self.sessions: Dict[str, ProxySession] = {}
         self.proxy_config = None
         self.enabled = os.getenv('USE_PROXIES', 'true').lower() == 'true'
+        self.config_source = "unknown"  # Track how config was loaded for diagnostics
         
         if self.enabled:
             self._load_proxy_config()
@@ -130,21 +134,73 @@ class ProxyManager:
         else:
             logging.info("ProxyManager initialized but proxies disabled")
     
+    def _is_json(self, value: str) -> bool:
+        """Check if a string looks like JSON"""
+        return value and value.strip().startswith(("{", "["))
+    
+    def _is_arn(self, value: str) -> bool:
+        """Check if a string is a valid AWS ARN"""
+        return bool(ARN_PATTERN.match(value))
+    
     def _load_proxy_config(self) -> None:
-        """Load proxy configuration from AWS Secrets Manager"""
+        """Load proxy configuration with App Runner RuntimeEnvironmentSecrets support"""
         try:
-            # Initialize AWS Secrets Manager client
-            session = boto3.Session()
-            client = session.client('secretsmanager', region_name='us-west-2')
+            # Get the raw value from environment variable
+            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
             
-            # Get the secret value
-            response = client.get_secret_value(SecretId='tldw-oxylabs-proxy-config')
-            secret_string = response['SecretString']
+            if not raw_config:
+                raise ValueError("OXYLABS_PROXY_CONFIG environment variable is empty")
             
-            # Parse the JSON configuration
-            self.proxy_config = json.loads(secret_string)
+            # Normalize accidental quotes that might wrap the value
+            if raw_config.startswith(("'", '"')) and raw_config.endswith(("'", '"')):
+                raw_config = raw_config[1:-1].strip()
             
-            # Validate required fields
+            # Detect the type of configuration we received
+            if self._is_json(raw_config):
+                # App Runner RuntimeEnvironmentSecrets case: env var contains the secret value (JSON)
+                logging.info("ProxyManager: using inline JSON from App Runner RuntimeEnvironmentSecrets")
+                self.proxy_config = json.loads(raw_config)
+                
+            elif self._is_arn(raw_config):
+                # Manual ARN case: fetch from Secrets Manager
+                logging.info("ProxyManager: fetching proxy config via ARN from Secrets Manager")
+                region = os.getenv('AWS_REGION', 'us-west-2')
+                client = boto3.Session().client('secretsmanager', region_name=region)
+                response = client.get_secret_value(SecretId=raw_config)
+                self.proxy_config = json.loads(response['SecretString'])
+                
+            elif raw_config and all(c.isalnum() or c in "-/_+=.@!" for c in raw_config):
+                # Secret name case: fetch from Secrets Manager by name
+                logging.info("ProxyManager: fetching proxy config by name from Secrets Manager")
+                region = os.getenv('AWS_REGION', 'us-west-2')
+                client = boto3.Session().client('secretsmanager', region_name=region)
+                response = client.get_secret_value(SecretId=raw_config)
+                self.proxy_config = json.loads(response['SecretString'])
+                
+            elif raw_config.startswith(("http://", "https://")):
+                # Direct URL case: use as proxy URL
+                logging.info("ProxyManager: using direct proxy URL from environment")
+                self.proxy_config = {"url": raw_config}
+                
+            else:
+                raise ValueError(f"OXYLABS_PROXY_CONFIG format not recognized. Provide JSON, ARN, secret name, or URL. Got: {raw_config[:50]}...")
+            
+            # Set config source for diagnostics
+            if self._is_json(raw_config):
+                self.config_source = "env_json"
+            elif self._is_arn(raw_config):
+                self.config_source = "arn"
+            elif raw_config.startswith(("http://", "https://")):
+                self.config_source = "url"
+            else:
+                self.config_source = "name"
+            
+            # Handle URL-only configuration
+            if "url" in self.proxy_config and len(self.proxy_config) == 1:
+                logging.info(f"Using direct proxy URL configuration (source: {self.config_source})")
+                return
+            
+            # Validate required fields for credential-based configuration
             required_fields = ['username', 'password']
             for field in required_fields:
                 if field not in self.proxy_config:
@@ -171,14 +227,27 @@ class ProxyManager:
             self.geo_enabled = self.proxy_config['geo_enabled']
             self.country = self.proxy_config.get('country', 'us')
             
-            logging.info(f"Loaded proxy config with SUBUSER: {self.subuser}, geo_enabled: {self.geo_enabled}, country: {self.country}")
+            # Log with masked username for troubleshooting (show first 4 chars)
+            masked_username = self.subuser[:4] + "***" if len(self.subuser) > 4 else "***"
+            logging.info(f"Loaded proxy config - source: {self.config_source}, username: {masked_username}, geo_enabled: {self.geo_enabled}, country: {self.country}")
             
         except ClientError as e:
-            logging.error(f"Failed to load proxy configuration from AWS Secrets Manager: {e}")
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'ResourceNotFoundException':
+                logging.error(f"Proxy secret not found: {raw_config[:50]}... (detected as {self.config_source})")
+            elif error_code in ['AccessDenied', 'UnauthorizedOperation']:
+                logging.error(f"IAM access denied for proxy secret - check instance role permissions")
+            elif error_code == 'ValidationException':
+                logging.error(f"Secret name validation failed - this suggests the env var contains secret value, not ARN/name")
+                logging.error(f"Raw config (first 50 chars): {raw_config[:50]}...")
+                logging.error("If using App Runner RuntimeEnvironmentSecrets, the env var should contain JSON, not ARN")
+            else:
+                logging.error(f"AWS Secrets Manager error ({error_code}): {e}")
             self.enabled = False
             raise
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse proxy configuration JSON: {e}")
+            logging.error(f"Raw config (first 50 chars): {raw_config[:50]}...")
             self.enabled = False
             raise
         except ValueError as e:
@@ -187,6 +256,7 @@ class ProxyManager:
             raise
         except Exception as e:
             logging.error(f"Unexpected error loading proxy configuration: {e}")
+            logging.error(f"Raw config (first 50 chars): {raw_config[:50]}...")
             self.enabled = False
             raise
     
@@ -357,3 +427,38 @@ class ProxyManager:
             logging.warning(f"Proxy username may need URL encoding: {username}")
         
         return True
+    
+    def get_proxy_health_info(self) -> Dict[str, Any]:
+        """Get proxy configuration health info for diagnostics (no sensitive data)"""
+        if not self.enabled:
+            return {"enabled": False, "status": "disabled", "source": "disabled"}
+        
+        if not self.proxy_config:
+            return {"enabled": True, "status": "not_configured", "source": "unknown"}
+        
+        # Basic health info without exposing credentials
+        health_info = {
+            "enabled": True,
+            "status": "configured",
+            "source": getattr(self, 'config_source', 'unknown'),
+            "has_username": bool(self.proxy_config.get('username')),
+            "has_password": bool(self.proxy_config.get('password')),
+            "geo_enabled": getattr(self, 'geo_enabled', False),
+            "country": getattr(self, 'country', 'unknown'),
+            "session_ttl_minutes": self.proxy_config.get('session_ttl_minutes', 30)
+        }
+        
+        # Add masked username for troubleshooting
+        if hasattr(self, 'subuser') and self.subuser:
+            health_info["username_prefix"] = self.subuser[:4] + "***" if len(self.subuser) > 4 else "***"
+        
+        # Handle URL-only configuration
+        if "url" in self.proxy_config and len(self.proxy_config) == 1:
+            health_info.update({
+                "has_username": True,  # URL contains credentials
+                "has_password": True,
+                "geo_enabled": False,
+                "country": "unknown"
+            })
+        
+        return health_info
