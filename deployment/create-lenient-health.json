@@ -21,8 +21,8 @@
           "OXYLABS_PROXY_CONFIG": "arn:aws:secretsmanager:us-west-2:528131355234:secret:tldw-oxylabs-proxy-config-mkbzlM",
           "RESEND_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-RESEND-API-KEY-5O5Kdx",
           "OPENAI_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-OPENAI-API-KEY-5rNo6a",
-          "GOOGLE_CLIENT_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI",
-          "GOOGLE_CLIENT_ID": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN",
+          "GOOGLE_OAUTH_CLIENT_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI",
+          "GOOGLE_OAUTH_CLIENT_ID": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN",
           "SESSION_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-SESSION-SECRET-hJDTQ1",
           "DEEPGRAM_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv"
         }

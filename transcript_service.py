@@ -34,6 +34,10 @@ class TranscriptService:
         
         # Track cookie failures for staleness detection
         self._cookie_failures = {}  # user_id -> failure_count
+        
+        # Track last download attempt for health diagnostics
+        self._last_download_used_cookies = False
+        self._last_download_client = "unknown"
 
     def get_transcript(self, video_id, has_captions=None, language="en"):
         """
@@ -139,8 +143,8 @@ class TranscriptService:
             session_id = session.session_id if session else "none"
             self._log_structured("transcript", video_id, "attempt", 1, 0, "transcript_api", ua_applied, session_id)
             
-            # Use YouTubeTranscriptApi directly with proxies and headers
-            chunks = YouTubeTranscriptApi.get_transcript(video_id, languages=[language], proxies=proxies, headers=headers)
+            # Use YouTubeTranscriptApi directly with proxies (headers not supported in 0.6.2)
+            chunks = YouTubeTranscriptApi.get_transcript(video_id, languages=[language], proxies=proxies)
             transcript_text = " ".join(item["text"] for item in chunks if item.get("text"))
             
             # Mark session as successful
@@ -304,6 +308,10 @@ class TranscriptService:
 
         # Compute cookies flag for logging closure
         cookies_used_flag = bool(cookiefile)
+        
+        # Update health diagnostics tracking
+        self._last_download_used_cookies = cookies_used_flag
+        self._last_download_client = "web"  # We use stable web client only
 
         # Status tracking for logging integration
         last_status = {"status": "unknown", "attempt": attempt}
@@ -378,7 +386,19 @@ class TranscriptService:
             error_msg = str(e).lower()
             latency_ms = int((time.time() - start_time) * 1000)
             
-            if self._detect_bot_check(error_msg):
+            if '407' in error_msg or 'proxy authentication' in error_msg:
+                # 407 errors: fail fast and rotate proxy
+                status = "proxy_407"
+                if session:
+                    session.mark_failed()
+                
+                # Try to handle 407 error with secrets refresh
+                if self.proxy_manager.handle_407_error(video_id):
+                    logging.info(f"Proxy credentials refreshed for yt-dlp {video_id}, but not retrying (fail fast)")
+                
+                logging.warning(f"407 Proxy Authentication Required in yt-dlp for {video_id}")
+                
+            elif self._detect_bot_check(error_msg):
                 status = "bot_check"
                 if session:
                     session.mark_blocked()
@@ -461,6 +481,19 @@ class TranscriptService:
         if env_proxies:
             logging.warning(f"Ignoring environment proxy variables {env_proxies} - using sticky proxy configuration")
 
+    def _handle_407_error(self, video_id: str, session) -> bool:
+        """Handle 407 errors with fast rotation and optional no-proxy fallback"""
+        logging.warning(f"407 Proxy Authentication Required for {video_id}, rotating proxy")
+        if session:
+            session.mark_failed()
+        
+        # Optional no-proxy fallback (disabled by default for security)
+        if os.getenv("ALLOW_NO_PROXY_ON_407", "false").lower() == "true":
+            logging.warning(f"ALLOW_NO_PROXY_ON_407 enabled - attempting no-proxy fallback for {video_id}")
+            return True
+        
+        return False
+
     def _send_to_deepgram(self, audio_file_path):
         """Send audio file to Deepgram for transcription with correct Content-Type"""
         try:
@@ -522,6 +555,13 @@ class TranscriptService:
     def cleanup_cache(self):
         """Clean up expired cache entries"""
         return self.cache.cleanup_expired()
+    
+    def get_health_diagnostics(self):
+        """Get health diagnostic information for monitoring"""
+        return {
+            'last_download_used_cookies': self._last_download_used_cookies,
+            'last_download_client': self._last_download_client
+        }
     
     def _resolve_current_user_id(self) -> Optional[int]:
         """

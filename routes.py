@@ -1,4 +1,6 @@
 import logging
+import os
+from datetime import datetime
 from flask import Blueprint, render_template, request, jsonify, redirect, url_for, flash
 from flask_login import login_required, current_user
 from youtube_service import YouTubeService, AuthenticationError
@@ -8,6 +10,58 @@ from email_service import EmailService
 from models import update_user_session, get_user_session
 
 main_routes = Blueprint("main_routes", __name__)
+
+def _cookies_dir() -> str:
+    """Get the cookie storage directory path"""
+    return os.getenv("COOKIE_LOCAL_DIR", "/app/cookies")
+
+def _local_cookie_path(user_id: int) -> str:
+    """Get the local cookie file path for a user"""
+    return os.path.join(_cookies_dir(), f"{user_id}.txt")
+
+def get_user_cookie_status(user_id: int) -> dict:
+    """Get comprehensive cookie status for a user"""
+    try:
+        cookie_path = _local_cookie_path(user_id)
+        
+        if not os.path.exists(cookie_path):
+            return {
+                'has_cookies': False,
+                'upload_date': None,
+                'file_size_kb': None,
+                'is_valid': False,
+                'status_text': 'Not Configured',
+                'status_class': 'warning'
+            }
+        
+        # Get file stats
+        stat = os.stat(cookie_path)
+        file_size_bytes = stat.st_size
+        file_size_kb = round(file_size_bytes / 1024, 1)
+        upload_date = datetime.fromtimestamp(stat.st_mtime)
+        
+        # Check if file has content
+        is_valid = file_size_bytes > 0
+        
+        return {
+            'has_cookies': True,
+            'upload_date': upload_date.isoformat(),
+            'file_size_kb': file_size_kb,
+            'is_valid': is_valid,
+            'status_text': 'Active' if is_valid else 'Invalid',
+            'status_class': 'success' if is_valid else 'danger'
+        }
+        
+    except Exception as e:
+        logging.warning(f"Error checking cookie status for user {user_id}: {e}")
+        return {
+            'has_cookies': False,
+            'upload_date': None,
+            'file_size_kb': None,
+            'is_valid': False,
+            'status_text': 'Unavailable',
+            'status_class': 'secondary'
+        }
 
 @main_routes.route("/")
 def index():
@@ -23,6 +77,9 @@ def dashboard():
     try:
         logging.info(f"Loading dashboard for user {current_user.email}")
         logging.info(f"Access token exists: {bool(current_user.access_token)}")
+        
+        # Get cookie status for the user
+        cookie_status = get_user_cookie_status(current_user.id)
         
         youtube_service = YouTubeService(current_user)
         playlists = youtube_service.get_user_playlists()
@@ -49,7 +106,8 @@ def dashboard():
                              authenticated=True,
                              playlists=playlists, 
                              videos=videos,
-                             selected_playlist_id=selected_playlist_id)
+                             selected_playlist_id=selected_playlist_id,
+                             cookie_status=cookie_status)
                              
     except AuthenticationError as e:
         logging.error(f"Authentication error loading dashboard for user {current_user.email}: {e}")
@@ -58,11 +116,16 @@ def dashboard():
     except Exception as e:
         logging.error(f"Error loading dashboard: {e}")
         flash("The YouTube API requires additional permissions. Please sign out and sign in again to grant YouTube access.", "error")
+        
+        # Still get cookie status even if YouTube API fails
+        cookie_status = get_user_cookie_status(current_user.id)
+        
         return render_template("index.html", 
                              authenticated=True,
                              playlists=[], 
                              videos=[],
-                             selected_playlist_id=None)
+                             selected_playlist_id=None,
+                             cookie_status=cookie_status)
 
 @main_routes.route("/api/select-playlist", methods=["POST"])
 @login_required

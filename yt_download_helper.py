@@ -11,6 +11,11 @@ def _file_ok(path: Optional[str]) -> bool:
     return bool(path and os.path.exists(path) and os.path.getsize(path) > 0)
 
 
+def _maybe_cookie(cookiefile: Optional[str]) -> Optional[str]:
+    """Validate cookie file exists and has content before use"""
+    return cookiefile if (cookiefile and os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0) else None
+
+
 def _mk_base_tmp() -> str:
     # No extension – lets us append .%(ext)s cleanly in step 1
     with tempfile.NamedTemporaryFile(suffix="", delete=True) as tf:
@@ -41,6 +46,11 @@ def download_audio_with_fallback(
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.youtube.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
     
     # Base configuration with hardening options
@@ -58,15 +68,16 @@ def download_audio_with_fallback(
         "forceipv4": True,  # Some pools/targets behave better over IPv4
         "http_chunk_size": 10485760,  # 10 MB chunks
         "ratelimit": 100000,  # ~100 KB/s intentional rate limiting
-        "extractor_args": {"youtube": {"player_client": ["ios", "web_creator"]}},  # Remove android for now
+        "extractor_args": {"youtube": {"player_client": ["web"]}},  # Stable web client only
         # Let service logs show details; don't silence warnings entirely
         "quiet": False,
         "no_warnings": False,
     }
     
     # Add cookiefile if provided and valid
-    if cookiefile and os.path.exists(cookiefile) and os.path.getsize(cookiefile) > 0:
-        base_opts["cookiefile"] = cookiefile
+    validated_cookiefile = _maybe_cookie(cookiefile)
+    if validated_cookiefile:
+        base_opts["cookiefile"] = validated_cookiefile
 
     # ---------- STEP 1: direct audio (m4a preferred) ----------
     base = _mk_base_tmp()

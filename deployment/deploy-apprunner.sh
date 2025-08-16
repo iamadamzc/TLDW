@@ -153,8 +153,8 @@ cat > create.json <<JSON
           "OXYLABS_PROXY_CONFIG": "${ARN_OXY}",
           "RESEND_API_KEY": "${ARN_RESEND}",
           "OPENAI_API_KEY": "${ARN_OPENAI}",
-          "GOOGLE_CLIENT_SECRET": "${ARN_GCSEC}",
-          "GOOGLE_CLIENT_ID": "${ARN_GCID}",
+          "GOOGLE_OAUTH_CLIENT_SECRET": "${ARN_GCSEC}",
+          "GOOGLE_OAUTH_CLIENT_ID": "${ARN_GCID}",
           "SESSION_SECRET": "${ARN_SESSION}",
           "DEEPGRAM_API_KEY": "${ARN_DEEPGRAM}"
         }
