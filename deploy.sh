@@ -35,6 +35,8 @@ ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}
 DRY_RUN=false
 FORCE_RESTART=false
 WAIT_FOR_COMPLETION=true
+TAIL_LOGS=false
+DEPLOY_TIMEOUT=600
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -51,11 +53,16 @@ while [[ $# -gt 0 ]]; do
             WAIT_FOR_COMPLETION=false
             shift
             ;;
+        --tail)
+            TAIL_LOGS=true
+            shift
+            ;;
         --help)
-            echo "Usage: $0 [--dry-run] [--force-restart] [--no-wait] [--help]"
+            echo "Usage: $0 [--dry-run] [--force-restart] [--no-wait] [--tail] [--help]"
             echo "  --dry-run       Show what would be done without executing"
             echo "  --force-restart Force App Runner service restart"
             echo "  --no-wait       Don't wait for deployment completion"
+            echo "  --tail          Stream App Runner logs during deployment"
             echo "  --help          Show this help message"
             exit 0
             ;;
@@ -67,7 +74,147 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Unified TL;DW App Runner Deployment (Fixed) ==="
+# ============================================================================
+# DEPLOYMENT VERIFICATION AND MONITORING FUNCTIONS
+# ============================================================================
+
+# Stream App Runner logs for monitoring
+stream_apprunner_logs() {
+    local service_name="$1"
+    local duration_seconds="${2:-300}"  # Default 5 minutes
+    
+    echo "📋 Streaming App Runner logs (last ${duration_seconds}s)..."
+    
+    # App Runner logs are in CloudWatch with a specific log group pattern
+    local log_group="/aws/apprunner/${service_name}"
+    
+    if aws logs describe-log-groups --log-group-name-prefix "$log_group" --region "$AWS_REGION" > /dev/null 2>&1; then
+        aws logs tail "$log_group" \
+            --since "${duration_seconds}s" \
+            --follow \
+            --format short \
+            --region "$AWS_REGION" 2>/dev/null || {
+            echo "⚠️  Unable to stream logs - log group may not exist yet"
+            echo "   Logs will be available at: $log_group"
+        }
+    else
+        echo "⚠️  Log group not found: $log_group"
+        echo "   Logs may not be available yet for new services"
+    fi
+}
+
+# Verify deployment by comparing image digests
+verify_deployment_digest() {
+    local service_arn="$1"
+    local expected_image_uri="$2"
+    
+    # Get the deployed image digest from App Runner
+    local service_info=$(aws apprunner describe-service --service-arn "$service_arn" --region "$AWS_REGION")
+    local deployed_digest=$(echo "$service_info" | jq -r '.Service.DeployedImageDigest // "unknown"')
+    
+    if [[ "$deployed_digest" == "unknown" || "$deployed_digest" == "null" ]]; then
+        echo "⚠️  Unable to verify deployment digest - App Runner may still be updating"
+        return 1
+    fi
+    
+    # Extract image tag from URI to get ECR digest
+    local image_tag=$(echo "$expected_image_uri" | cut -d':' -f2)
+    local ecr_digest=$(aws ecr describe-images \
+        --repository-name "$ECR_REPOSITORY" \
+        --image-ids imageTag="$image_tag" \
+        --region "$AWS_REGION" \
+        --query 'imageDetails[0].imageDigest' \
+        --output text 2>/dev/null)
+    
+    if [[ "$ecr_digest" == "$deployed_digest" ]]; then
+        echo "✅ Deployment digest verified: $deployed_digest"
+        return 0
+    else
+        echo "⚠️  Deployment digest mismatch:"
+        echo "   ECR digest: $ecr_digest"
+        echo "   Deployed digest: $deployed_digest"
+        return 1
+    fi
+}
+
+# Wait for deployment to complete with comprehensive verification
+wait_for_deployment_complete() {
+    local service_arn="$1"
+    local expected_image_uri="$2"
+    local timeout="${3:-600}"
+    
+    echo "⏳ Waiting for deployment to complete..."
+    echo "   Expected image: $expected_image_uri"
+    echo "   Timeout: ${timeout}s"
+    
+    local elapsed=0
+    local poll_interval=15
+    local last_status=""
+    
+    # Start log streaming in background if requested
+    if [[ "$TAIL_LOGS" == "true" ]]; then
+        echo "📋 Starting log stream..."
+        stream_apprunner_logs "$SERVICE_NAME" 300 &
+        local log_pid=$!
+        trap "kill $log_pid 2>/dev/null" EXIT
+    fi
+    
+    while [ $elapsed -lt $timeout ]; do
+        local service_info=$(aws apprunner describe-service --service-arn "$service_arn" --region "$AWS_REGION")
+        local status=$(echo "$service_info" | jq -r '.Service.Status')
+        local current_image=$(echo "$service_info" | jq -r '.Service.SourceConfiguration.ImageRepository.ImageIdentifier')
+        
+        # Only print status if it changed
+        if [[ "$status" != "$last_status" ]]; then
+            echo "   Status: $status (${elapsed}s elapsed)"
+            last_status="$status"
+        fi
+        
+        case $status in
+            "RUNNING")
+                if [[ "$current_image" == "$expected_image_uri" ]]; then
+                    echo "✅ Service is running with correct image"
+                    
+                    # Verify by digest for extra confidence
+                    if verify_deployment_digest "$service_arn" "$expected_image_uri"; then
+                        echo "✅ Deployment completed and verified!"
+                        return 0
+                    else
+                        echo "⚠️  Image URI matches but digest verification failed"
+                        echo "   Continuing to wait for digest sync..."
+                    fi
+                else
+                    echo "⚠️  Service running but with wrong image:"
+                    echo "   Current: $current_image"
+                    echo "   Expected: $expected_image_uri"
+                fi
+                ;;
+            "OPERATION_IN_PROGRESS")
+                # Just wait, status already printed
+                ;;
+            "CREATE_FAILED"|"UPDATE_FAILED"|"DELETE_FAILED")
+                echo "❌ Deployment failed with status: $status"
+                return 1
+                ;;
+            "PAUSED")
+                echo "⚠️  Service is paused - may need manual resume"
+                return 1
+                ;;
+        esac
+        
+        sleep $poll_interval
+        elapsed=$((elapsed + poll_interval))
+    done
+    
+    echo "⚠️  Deployment timeout after ${timeout} seconds"
+    return 1
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+echo "=== Unified TL;DW App Runner Deployment (Enhanced) ==="
 echo "AWS Region: ${AWS_REGION}"
 echo "ECR Repository: ${ECR_URI}"
 echo "Image Tag: ${IMAGE_TAG}"
@@ -161,9 +308,9 @@ if [[ "$SERVICE_EXISTS" == "true" ]]; then
         echo "📋 Getting current service configuration..."
         CURRENT_CONFIG=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region ${AWS_REGION})
         
-        # Extract current environment variables as arrays (App Runner update requires arrays of {Name,Value} objects)
-        ENV_VARS=$(echo "$CURRENT_CONFIG" | jq -c '[.Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentVariables | to_entries[]? | {Name: .key, Value: .value}] // []')
-        SECRETS=$(echo "$CURRENT_CONFIG" | jq -c '[.Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentSecrets | to_entries[]? | {Name: .key, Value: .value}] // []')
+        # Extract current environment variables as objects (App Runner update requires key-value objects)
+        ENV_VARS=$(echo "$CURRENT_CONFIG" | jq -c '.Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentVariables // {}')
+        SECRETS=$(echo "$CURRENT_CONFIG" | jq -c '.Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentSecrets // {}')
         
         # Update the service with new image URI
         echo "🔄 Updating service with new image: ${IMAGE_URI}"
@@ -219,58 +366,10 @@ EOF
         
         # Wait for deployment to complete (unless --no-wait is specified)
         if [[ "$WAIT_FOR_COMPLETION" == "true" ]]; then
-            echo "⏳ Waiting for deployment to complete..."
-            echo "   This may take 3-5 minutes... (use --no-wait to skip)"
-            
-            TIMEOUT=600  # 10 minutes timeout
-            ELAPSED=0
-            POLL_INTERVAL=15
-        
-        while [ $ELAPSED -lt $TIMEOUT ]; do
-            SERVICE_INFO=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region ${AWS_REGION})
-            STATUS=$(echo "$SERVICE_INFO" | jq -r '.Service.Status')
-            CURRENT_IMAGE=$(echo "$SERVICE_INFO" | jq -r '.Service.SourceConfiguration.ImageRepository.ImageIdentifier')
-            
-            echo "   Status: ${STATUS}, Image: ${CURRENT_IMAGE} (${ELAPSED}s elapsed)"
-            
-            case $STATUS in
-                "RUNNING")
-                    if [ "$CURRENT_IMAGE" = "$IMAGE_URI" ]; then
-                        echo "✅ Deployment completed successfully!"
-                        echo "   Service is running with new image: $IMAGE_URI"
-                        break
-                    else
-                        echo "⚠️  Service is running but with old image: $CURRENT_IMAGE"
-                        echo "   Expected: $IMAGE_URI"
-                        sleep $POLL_INTERVAL
-                        ELAPSED=$((ELAPSED + POLL_INTERVAL))
-                    fi
-                    ;;
-                "OPERATION_IN_PROGRESS")
-                    sleep $POLL_INTERVAL
-                    ELAPSED=$((ELAPSED + POLL_INTERVAL))
-                    ;;
-                "CREATE_FAILED"|"UPDATE_FAILED"|"DELETE_FAILED")
-                    echo "❌ Deployment failed with status: ${STATUS}"
-                    echo "Check AWS App Runner console for details"
-                    exit 1
-                    ;;
-                *)
-                    sleep $POLL_INTERVAL
-                    ELAPSED=$((ELAPSED + POLL_INTERVAL))
-                    ;;
-            esac
-        done
-        
-            if [ $ELAPSED -ge $TIMEOUT ]; then
-                echo "⚠️  Deployment timeout after ${TIMEOUT} seconds"
-                FINAL_STATUS=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region ${AWS_REGION} --query 'Service.Status' --output text)
-                FINAL_IMAGE=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region ${AWS_REGION} --query 'Service.SourceConfiguration.ImageRepository.ImageIdentifier' --output text)
-                echo "   Final Status: $FINAL_STATUS"
-                echo "   Final Image: $FINAL_IMAGE"
-                echo "   Expected Image: $IMAGE_URI"
-                echo "Check AWS App Runner console for current status"
-                exit 1
+            if ! wait_for_deployment_complete "$SERVICE_ARN" "$IMAGE_URI" "$DEPLOY_TIMEOUT"; then
+                echo "❌ Deployment failed or timed out"
+                echo "Check AWS App Runner console for details: https://console.aws.amazon.com/apprunner/"
+                exit 14  # Deployment timeout exit code
             fi
         else
             echo "⏭️  Skipping deployment wait (--no-wait specified)"
