@@ -23,6 +23,7 @@ def download_audio_with_fallback(
     proxy_url: str,
     ffmpeg_path: str = "/usr/bin",
     logger: Optional[Callable[[str], None]] = None,
+    cookiefile: Optional[str] = None,
 ) -> str:
     """
     Downloads audio from a YouTube (or other) video URL using yt-dlp with a two-step strategy.
@@ -32,6 +33,37 @@ def download_audio_with_fallback(
     Returns: Path to the downloaded audio file, or raises RuntimeError if both attempts fail.
     """
     log = (logger or (lambda m: None))
+
+    # Enhanced headers for better bot detection avoidance
+    common_headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.youtube.com/",
+    }
+    
+    # Base configuration with hardening options
+    base_opts = {
+        "proxy": proxy_url or None,
+        "http_headers": common_headers,
+        "noplaylist": True,
+        "retries": 2,
+        "fragment_retries": 2,
+        "concurrent_fragment_downloads": 1,  # Reduce detection risk
+        "nopart": True,  # avoid leaving .part files around
+        "socket_timeout": 15,
+        "geo_bypass": False,  # Avoid suspicious behavior patterns
+        "ffmpeg_location": ffmpeg_path,
+        "extractor_args": {"youtube": {"player_client": ["ios", "web_creator", "android"]}},
+        # Let service logs show details; don't silence warnings entirely
+        "quiet": False,
+        "no_warnings": False,
+    }
+    
+    # Add cookiefile if provided
+    if cookiefile:
+        base_opts["cookiefile"] = cookiefile
 
     # ---------- STEP 1: direct audio (m4a preferred) ----------
     base = _mk_base_tmp()
@@ -46,22 +78,15 @@ def download_audio_with_fallback(
                 final_path_holder["path"] = fp
 
     ydl_opts_step1 = {
+        **base_opts,
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": base + ".%(ext)s",
-        "proxy": proxy_url or None,
-        "http_headers": {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
-        "noplaylist": True,
-        "retries": 2,
-        "fragment_retries": 2,
-        "nopart": True,  # avoid leaving .part files around
-        "socket_timeout": 15,
-        "ffmpeg_location": ffmpeg_path,
         "progress_hooks": [_hook_step1],
-        # Verbose=False keeps logs quieter; your service handles structured logs
-        "quiet": False,
-        "no_warnings": False,
     }
 
+    # Track Step 1 error for potential combination with Step 2
+    err_step1: Optional[str] = None
+    
     try:
         with YoutubeDL(ydl_opts_step1) as ydl:
             ydl.download([video_url])
@@ -73,6 +98,8 @@ def download_audio_with_fallback(
             log(f"yt_step1_no_file path={path1}")
     except DownloadError as e:
         log(f"yt_step1_download_error err={e}")
+        # Record but DO NOT raise yet; allow fallback to run
+        err_step1 = str(e)
 
     # ---------- STEP 2: fallback – re-encode to mp3 ----------
     # Use a fresh base (in case step1 created an .m4a with same stem)
@@ -90,26 +117,13 @@ def download_audio_with_fallback(
                 final_path_holder2["path"] = fp
 
     ydl_opts_step2 = {
+        **base_opts,
         "format": "bestaudio/best",
         "outtmpl": base2,  # no ext; postprocessor will output .mp3
-        "proxy": proxy_url or None,
-        "http_headers": {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
-        "noplaylist": True,
-        "retries": 1,
-        "fragment_retries": 1,
-        "nopart": True,
-        "socket_timeout": 15,
-        "ffmpeg_location": ffmpeg_path,
         "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ],
         "progress_hooks": [_hook_step2],
-        "quiet": False,
-        "no_warnings": False,
     }
 
     try:
@@ -125,5 +139,11 @@ def download_audio_with_fallback(
             log(f"yt_step2_no_file path={path2}")
     except DownloadError as e:
         log(f"yt_step2_download_error err={e}")
+        # Both attempts failed — raise with both messages for upstream detection
+        combined = (err_step1 or "").strip()
+        if combined:
+            combined += " || "
+        combined += str(e)
+        raise RuntimeError(combined)
 
     raise RuntimeError(f"Audio download failed for {video_url}")

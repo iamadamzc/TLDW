@@ -4,6 +4,8 @@ import logging
 import tempfile
 import yt_dlp
 import requests
+import mimetypes
+from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
 from proxy_manager import ProxyManager
 from proxy_http import ProxyHTTPClient, YouTubeBlockingError
@@ -17,18 +19,6 @@ class TranscriptService:
         self.proxy_manager = ProxyManager()
         self.http_client = ProxyHTTPClient(self.proxy_manager)
         self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
-        
-        # Initialize UserAgentManager with error handling
-        try:
-            self.user_agent_manager = UserAgentManager()
-            logging.info("UserAgentManager initialized successfully")
-        except Exception as e:
-            logging.error(f"Failed to initialize UserAgentManager: {e}")
-            # Create a fallback manager that returns empty headers
-            self.user_agent_manager = None
-        self.proxy_manager = ProxyManager()
-        self.http_client = ProxyHTTPClient(self.proxy_manager)
-        self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
         self._video_locks = {}  # Idempotency guard: in-memory lock per video_id
         
         # Initialize UserAgentManager with error handling
@@ -39,6 +29,12 @@ class TranscriptService:
             logging.error(f"Failed to initialize UserAgentManager: {e}")
             # Create a fallback manager that returns empty headers
             self.user_agent_manager = None
+        
+        # Allow route layer to set current user id directly if desired
+        self.current_user_id: Optional[int] = None
+        
+        # Track cookie failures for staleness detection
+        self._cookie_failures = {}  # user_id -> failure_count
 
     def get_transcript(self, video_id, has_captions=None, language="en"):
         """
@@ -308,15 +304,31 @@ class TranscriptService:
             latency_ms = int((time.time() - start_time) * 1000)
             self._log_structured("ytdlp", video_id, last_status["status"], 
                                last_status["attempt"], latency_ms, "asr", 
-                               user_agent_applied, session_id)
+                               user_agent_applied, session_id, bool(cookiefile))
         
+        # Resolve per-user cookiefile (optional) - respect kill-switch
+        cookiefile, tmp_cookie = None, None
+        if os.getenv("DISABLE_COOKIES", "false").lower() != "true":
+            try:
+                user_id = self._resolve_current_user_id()
+                if user_id:
+                    cookiefile, tmp_cookie = self._get_user_cookiefile(user_id)
+                    if cookiefile:
+                        logging.info(f"Using user cookiefile for yt-dlp (user={user_id})")
+            except Exception as e:
+                logging.warning(f"Cookiefile unavailable: {e}")
+        else:
+            logging.debug("Cookie functionality disabled via DISABLE_COOKIES environment variable")
+
         # Log initial attempt
-        self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id)
+        self._log_structured("ytdlp", video_id, "attempt", attempt, 0, "asr", user_agent_applied, session_id, bool(cookiefile))
         logging.info(f"yt-dlp config: session={session_id} ua_applied={user_agent_applied} ffmpeg_location={ffmpeg_path}")
         
         try:
             # Call the helper function
-            audio_path = download_audio_with_fallback(video_url, ua, proxy_url, ffmpeg_path, _log_adapter)
+            audio_path = download_audio_with_fallback(
+                video_url, ua, proxy_url, ffmpeg_path, _log_adapter, cookiefile=cookiefile
+            )
             
             # Send to Deepgram for transcription
             transcript_text = self._send_to_deepgram(audio_path)
@@ -339,7 +351,7 @@ class TranscriptService:
                 }
             else:
                 latency_ms = int((time.time() - start_time) * 1000)
-                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_failed", user_agent_applied, session_id)
+                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_failed", user_agent_applied, session_id, bool(cookiefile))
                 return {
                     'status': 'neterr',
                     'attempt': attempt,
@@ -355,6 +367,13 @@ class TranscriptService:
                 status = "bot_check"
                 if session:
                     session.mark_blocked()
+                
+                # Track cookie staleness if cookies were used
+                if cookiefile:
+                    user_id = self._resolve_current_user_id()
+                    if user_id:
+                        self._track_cookie_failure(user_id, "bot_check")
+                        
             elif any(indicator in error_msg for indicator in ['timeout', 'connection', 'network']):
                 status = "timeout"
                 if session:
@@ -365,7 +384,7 @@ class TranscriptService:
                     session.mark_failed()
             
             logging.error(f"Error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
-            self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", user_agent_applied, session_id)
+            self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", user_agent_applied, session_id, bool(cookiefile))
             
             return {
                 'status': status,
@@ -377,7 +396,7 @@ class TranscriptService:
             # Unexpected error
             latency_ms = int((time.time() - start_time) * 1000)
             logging.error(f"Unexpected error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
-            self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_error", user_agent_applied, session_id)
+            self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_error", user_agent_applied, session_id, bool(cookiefile))
             
             if session:
                 session.mark_failed()
@@ -387,6 +406,13 @@ class TranscriptService:
                 'attempt': attempt,
                 'transcript_text': None
             }
+        finally:
+            # If we downloaded a temp cookiefile copy (e.g., from S3), remove it
+            if tmp_cookie:
+                try:
+                    os.unlink(tmp_cookie)
+                except Exception:
+                    pass
     
     def _detect_bot_check(self, text):
         """
@@ -421,12 +447,30 @@ class TranscriptService:
             logging.warning(f"Ignoring environment proxy variables {env_proxies} - using sticky proxy configuration")
 
     def _send_to_deepgram(self, audio_file_path):
-        """Send audio file to Deepgram for transcription"""
+        """Send audio file to Deepgram for transcription with correct Content-Type"""
         try:
+            # Explicit MIME type mapping for common audio formats
+            EXT_MIME_MAP = {
+                ".m4a": "audio/mp4",
+                ".mp4": "audio/mp4", 
+                ".mp3": "audio/mpeg"
+            }
+            
+            # Get file extension and use explicit mapping first
+            _, ext = os.path.splitext(audio_file_path.lower())
+            content_type = EXT_MIME_MAP.get(ext)
+            
+            # Fallback to mimetypes.guess_type() if not in explicit map
+            if not content_type:
+                mime, _ = mimetypes.guess_type(audio_file_path)
+                content_type = mime or "application/octet-stream"
+            
             headers = {
                 'Authorization': f'Token {self.deepgram_api_key}',
-                'Content-Type': 'audio/mp3'
+                'Content-Type': content_type
             }
+            
+            logging.debug(f"Sending to Deepgram with Content-Type: {content_type} for file: {audio_file_path}")
             
             with open(audio_file_path, 'rb') as audio_file:
                 response = requests.post(
@@ -464,14 +508,88 @@ class TranscriptService:
         """Clean up expired cache entries"""
         return self.cache.cleanup_expired()
     
-    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", ua_applied=False, session_id="none"):
+    def _resolve_current_user_id(self) -> Optional[int]:
+        """
+        Prefer an explicitly set self.current_user_id.
+        Otherwise, try Flask-Login's current_user if available.
+        """
+        if getattr(self, "current_user_id", None):
+            return self.current_user_id  # set by route layer
+        try:
+            from flask_login import current_user  # lazy import to avoid circulars
+            if getattr(current_user, "is_authenticated", False):
+                return getattr(current_user, "id", None)
+        except Exception:
+            pass
+        return None
+
+    def _get_user_cookiefile(self, user_id: int) -> tuple[Optional[str], Optional[str]]:
+        """
+        Returns (cookiefile_path, tmp_path_for_cleanup).
+        Strategy:
+          1) If COOKIE_S3_BUCKET is set and boto3 available: download s3://<bucket>/cookies/<user_id>.txt to a temp file.
+          2) Else check local COOKIE_LOCAL_DIR or /app/cookies for <user_id>.txt.
+        If not found, returns (None, None).
+        """
+        # S3 path
+        bucket = os.getenv("COOKIE_S3_BUCKET")
+        if bucket:
+            try:
+                import boto3  # optional dependency
+                s3 = boto3.client("s3")
+                key = f"cookies/{user_id}.txt"
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".cookies.txt")
+                tmp_path = tmp.name
+                tmp.close()
+                s3.download_file(bucket, key, tmp_path)
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    return tmp_path, tmp_path  # tmp file to cleanup later
+            except Exception as e:
+                logging.warning(f"S3 cookie download failed for user {user_id}: {e}")
+
+        # Local path
+        local_dir = os.getenv("COOKIE_LOCAL_DIR", "/app/cookies")
+        local_path = os.path.join(local_dir, f"{user_id}.txt")
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return local_path, None  # persistent file; don't delete
+        return None, None
+
+    def _track_cookie_failure(self, user_id: int, failure_type: str):
+        """Track cookie failures for staleness detection"""
+        if user_id not in self._cookie_failures:
+            self._cookie_failures[user_id] = 0
+        
+        self._cookie_failures[user_id] += 1
+        failure_count = self._cookie_failures[user_id]
+        
+        logging.warning(f"Cookie failure for user {user_id}: {failure_type} (count: {failure_count})")
+        
+        # Suggest re-upload after multiple failures
+        if failure_count >= 3:
+            logging.warning(f"User {user_id} cookies may be stale - suggest re-upload (failures: {failure_count})")
+            # Reset counter to avoid spam
+            self._cookie_failures[user_id] = 0
+
+    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", ua_applied=False, session_id="none", cookies_used=False):
         """
         Structured logging with credential redaction and session tracking
         Never logs password or full proxy URL; only logs session ID
+        Enhanced with cookie usage tracking for monitoring
         """
-        # Convert ua_applied boolean to string for consistency
+        # Convert boolean flags to strings for consistency
         ua_status = "true" if ua_applied else "false"
+        cookie_status = "true" if cookies_used else "false"
+        
+        # Determine download step for granular tracking
+        download_step = "unknown"
+        if step == "ytdlp" and status == "ok":
+            if attempt == 1:
+                download_step = "step1_success"
+            elif attempt == 2:
+                download_step = "step2_success"
+        elif step == "ytdlp" and status in ["bot_check", "timeout", "yt_both_steps_fail"]:
+            download_step = f"step{attempt}_fail"
         
         logging.info(f"STRUCTURED_LOG step={step} video_id={video_id} session={session_id} "
-                    f"ua_applied={ua_status} latency_ms={latency_ms} status={status} "
-                    f"attempt={attempt} source={source}")
+                    f"ua_applied={ua_status} cookies_used={cookie_status} latency_ms={latency_ms} "
+                    f"status={status} attempt={attempt} source={source} download_step={download_step}")

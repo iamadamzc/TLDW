@@ -156,9 +156,11 @@ with app.app_context():
 # Import and register blueprints
 from google_auth import google_auth
 from routes import main_routes
+from cookies_routes import bp_cookies
 
 app.register_blueprint(google_auth)
 app.register_blueprint(main_routes)
+app.register_blueprint(bp_cookies)
 
 # Add health check endpoints for App Runner
 @app.route('/health')
