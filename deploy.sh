@@ -328,7 +328,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
 else
     # Build Docker image
     echo "🔨 Building Docker image..."
-    docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
+    docker build --build-arg YT_DLP_AUTO_UPDATE=true -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
 
     # Tag image for ECR (both unique tag and latest)
     echo "🏷️  Tagging image for ECR..."
@@ -409,10 +409,6 @@ EOF
             OPERATION_ID=$(echo "$UPDATE_RESULT" | jq -r '.OperationId // "unknown"')
             echo "   Operation ID: $OPERATION_ID"
             
-            # Force a deployment to ensure the new image is actually used
-            echo "🚀 Triggering new deployment for App Runner service: ${SERVICE_ARN}"
-            aws apprunner start-deployment --service-arn "${SERVICE_ARN}" --region ${AWS_REGION}
-            
             # Wait a moment for the deployment to register
             sleep 10
             
@@ -489,7 +485,7 @@ else
           {"Name": "PORT", "Value": "8080"},
           {"Name": "FFMPEG_LOCATION", "Value": "/usr/bin"},
           {"Name": "USE_PROXIES", "Value": "true"},
-          {"Name": "PROXY_COUNTRY", "Value": "us"},
+          {"Name": "OXY_DISABLE_GEO", "Value": "true"},
           {"Name": "ALLOW_MISSING_DEPS", "Value": "true"},
           {"Name": "COOKIE_LOCAL_DIR", "Value": "/app/cookies"},
           {"Name": "COOKIE_S3_BUCKET", "Value": "tldw-cookies-bucket"}

@@ -340,7 +340,7 @@ class TranscriptService:
                 
                 if attempt == 1:
                     self._log_structured(
-                        component="ytdlp",
+                        "ytdlp",
                         video_id=video_id,
                         status="attempt",
                         attempt=attempt,
@@ -353,7 +353,7 @@ class TranscriptService:
                     )
                 elif attempt == 2:
                     self._log_structured(
-                        component="ytdlp",
+                        "ytdlp",
                         video_id=video_id,
                         status="attempt",
                         attempt=attempt,

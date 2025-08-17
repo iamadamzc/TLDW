@@ -216,8 +216,9 @@ def test_retry_logic_mock():
                 assert False, "Should have raised RuntimeError"
             except RuntimeError as e:
                 error_msg = str(e)
-                assert "Attempt 1 (with cookies)" in error_msg
-                assert "Attempt 2 (no cookies)" in error_msg
+                assert "Attempt 1:" in error_msg
+                assert "Attempt 2:" in error_msg
+                assert "consider updating yt-dlp" in error_msg
                 print("✅ Both attempts failed with combined error message")
         
         # Test 5: Stale cookies skipped automatically
