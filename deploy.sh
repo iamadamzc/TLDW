@@ -328,7 +328,10 @@ if [[ "$DRY_RUN" == "true" ]]; then
 else
     # Build Docker image
     echo "🔨 Building Docker image..."
-    docker build --build-arg YT_DLP_AUTO_UPDATE=true -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
+    docker build \
+        --build-arg YT_DLP_AUTO_UPDATE=true \
+        --build-arg CACHE_BUSTER=${IMAGE_TAG} \
+        -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
 
     # Tag image for ECR (both unique tag and latest)
     echo "🏷️  Tagging image for ECR..."

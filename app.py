@@ -221,6 +221,10 @@ def health_check():
                     proxy_config_readable = False
                     # Log the connectivity issue for debugging
                     logging.warning(f"Proxy connectivity test failed: {proxy_test}")
+                    # Fail health check when proxy connectivity fails
+                    health_info['status'] = 'unhealthy'
+                    health_info['message'] = f'Proxy connectivity failed: {proxy_test.get("error", "connectivity_failed")}'
+                    return health_info, 503
             else:
                 # Always include proxy_connectivity field for consistency
                 health_info['proxy_connectivity'] = {
@@ -253,6 +257,11 @@ def health_check():
                 health_info['proxy_config'] = {'error': str(e)}
             else:
                 health_info['proxy_config'] = {'status': 'error', 'readable': False}
+            
+            # Fail health check when proxy manager cannot be initialized and proxies are enabled
+            health_info['status'] = 'unhealthy'
+            health_info['message'] = f'Proxy connectivity failed: {str(e)}'
+            return health_info, 503
     
     # Add diagnostic information if enabled
     if os.getenv('EXPOSE_HEALTH_DIAGNOSTICS', 'false').lower() == 'true':

@@ -15,7 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Optional: Auto-update yt-dlp at build time for latest extractors
 # Set YT_DLP_AUTO_UPDATE=true during build to enable
 ARG YT_DLP_AUTO_UPDATE=false
+ARG CACHE_BUSTER
 RUN if [ "$YT_DLP_AUTO_UPDATE" = "true" ]; then \
+        echo "Cache Buster: $CACHE_BUSTER" && \
         echo "Auto-updating yt-dlp to latest version..." && \
         pip install --no-cache-dir -U yt-dlp; \
     else \
