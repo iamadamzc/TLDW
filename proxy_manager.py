@@ -38,6 +38,26 @@ def _normalize_credential(value: str) -> str:
     
     return value
 
+def _encode_password_once(password: str) -> str:
+    """
+    Safely encode password for proxy URL, avoiding double-encoding.
+    
+    Expert recommendation: Check for existing % sequences to avoid double encoding.
+    Ensures + becomes %2B exactly once, not %252B.
+    """
+    if not password:
+        return password
+    
+    # If password already contains % sequences, it might be pre-encoded
+    # Use a heuristic: if it looks like it's already encoded, return as-is
+    if '%' in password and any(f'%{hex(ord(c))[2:].upper().zfill(2)}' in password.upper() 
+                              for c in '+:@!#$&='):
+        # Looks like it's already percent-encoded, return as-is
+        return password
+    
+    # Safe to encode - no existing % sequences detected
+    return quote(password, safe="")
+
 class ProxySession:
     """Represents a sticky proxy session for a specific video_id"""
     
@@ -92,10 +112,13 @@ class ProxySession:
         
         # URL encode credentials (NEVER log password or full URL)
         encoded_username = quote(sticky_username, safe="")
-        encoded_password = quote(password, safe="")
+        encoded_password = _encode_password_once(password)
         
         # Build proxy URL with hardcoded residential entrypoint
         proxy_url = f"http://{encoded_username}:{encoded_password}@pr.oxylabs.io:7777"
+        
+        # Enhanced logging per expert recommendation - show proxy username and geo settings
+        logging.info(f"proxy_username={sticky_username} (no password, no host), geo_enabled={geo_enabled}, country={country if geo_enabled else None}")
         
         # Log only the sticky username (no password/full URL)
         logging.debug(f"Built sticky proxy for video {self.video_id}: {sticky_username}@pr.oxylabs.io:7777")
@@ -103,12 +126,12 @@ class ProxySession:
     
     def _calculate_expires_at(self) -> datetime:
         """Calculate expiration time based on configurable TTL"""
-        # Get TTL from environment variable or config, with fallback to 10 minutes
+        # Get TTL from environment variable or config, with fallback to 30 minutes
         ttl_seconds = int(os.getenv("PROXY_SESSION_TTL_SECONDS", 
-                                   self.proxy_config.get("session_ttl_minutes", 10) * 60))
+                                   self.proxy_config.get("session_ttl_minutes", 30) * 60))
         return self.created_at + timedelta(seconds=ttl_seconds)
     
-    def is_expired(self, ttl_minutes: int = 10) -> bool:
+    def is_expired(self, ttl_minutes: int = 30) -> bool:
         """Check if session has expired based on TTL"""
         expiry_time = self.created_at + timedelta(minutes=ttl_minutes)
         return datetime.now() > expiry_time
@@ -255,17 +278,27 @@ class ProxyManager:
             self.proxy_config.setdefault('session_ttl_minutes', 30)
             self.proxy_config.setdefault('timeout_seconds', 15)
             
-            # Configure geo settings - enable by default for MVP reliability
-            # Check environment variable first, then config, then default to enabled with 'us'
-            env_country = os.getenv('PROXY_COUNTRY')
-            if env_country:
-                self.proxy_config['geo_enabled'] = True
-                self.proxy_config['country'] = env_country
-                logging.info(f"Using geo country from environment: {env_country}")
+            # Configure geo settings - DISABLE by default (expert recommendation)
+            # Check for hotfix override first
+            disable_geo = os.getenv('OXY_DISABLE_GEO', 'false').lower() == 'true'
+            if disable_geo:
+                self.proxy_config['geo_enabled'] = False
+                logging.info("Geo targeting disabled via OXY_DISABLE_GEO environment variable (hotfix override)")
             else:
-                # Enable geo by default for MVP reliability (avoid "hot" random IPs)
-                self.proxy_config.setdefault('geo_enabled', True)
-                self.proxy_config.setdefault('country', 'us')
+                # Check environment variable for country, then config, then default to DISABLED
+                env_country = os.getenv('PROXY_COUNTRY')
+                if env_country:
+                    self.proxy_config['geo_enabled'] = True
+                    self.proxy_config['country'] = env_country
+                    logging.info(f"Using geo country from environment: {env_country}")
+                else:
+                    # DEFAULT TO DISABLED - expert identified geo targeting as likely 407 cause
+                    self.proxy_config.setdefault('geo_enabled', False)
+                    self.proxy_config.setdefault('country', 'us')  # Keep default country for when enabled
+                    
+                    # Log the default behavior for clarity
+                    if not self.proxy_config.get('geo_enabled'):
+                        logging.info("Geo targeting disabled by default (expert recommendation to avoid 407 errors)")
             
             # Store SUBUSER for easy access
             self.subuser = self.proxy_config['username']
@@ -310,6 +343,43 @@ class ProxyManager:
         if not self.enabled or not self.proxy_config:
             return None
         
+        # Check for direct URL override (expert recommendation for testing flexibility)
+        direct_url_override = os.getenv('PROXY_URL_OVERRIDE')
+        if direct_url_override:
+            logging.info(f"Using direct proxy URL override from PROXY_URL_OVERRIDE environment variable")
+            # Create a simple session with the override URL
+            class DirectProxySession:
+                def __init__(self, url: str):
+                    self.proxy_url = url
+                    self.video_id = video_id
+                    self.session_id = "override"
+                    self.created_at = datetime.now()
+                    self.last_used = datetime.now()
+                    self.request_count = 0
+                    self.failed_count = 0
+                    self.is_blocked = False
+                    self.expires_at = datetime.now() + timedelta(hours=1)  # 1 hour default
+                
+                def mark_used(self):
+                    self.last_used = datetime.now()
+                    self.request_count += 1
+                
+                def mark_failed(self):
+                    self.failed_count += 1
+                
+                def mark_blocked(self):
+                    self.is_blocked = True
+                    self.failed_count += 1
+                
+                def is_expired(self, ttl_minutes: int = 60) -> bool:
+                    return False  # Override sessions don't expire
+                
+                @property
+                def sticky_username(self) -> str:
+                    return "override-url"
+            
+            return DirectProxySession(direct_url_override)
+        
         # Clean up expired sessions
         self._cleanup_expired_sessions()
         
@@ -318,7 +388,7 @@ class ProxyManager:
             session = self.sessions[video_id]
             
             # Check if session is expired
-            ttl_minutes = self.proxy_config.get('session_ttl_minutes', 10)
+            ttl_minutes = self.proxy_config.get('session_ttl_minutes', 30)
             if session.is_expired(ttl_minutes):
                 logging.info(f"Session for video {video_id} expired, creating new session")
                 del self.sessions[video_id]
@@ -388,7 +458,7 @@ class ProxyManager:
     
     def _cleanup_expired_sessions(self) -> None:
         """Remove expired sessions from memory"""
-        ttl_minutes = self.proxy_config.get('session_ttl_minutes', 10) if self.proxy_config else 10
+        ttl_minutes = self.proxy_config.get('session_ttl_minutes', 30) if self.proxy_config else 30
         expired_videos = []
         
         for video_id, session in self.sessions.items():

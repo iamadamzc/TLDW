@@ -12,6 +12,16 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Optional: Auto-update yt-dlp at build time for latest extractors
+# Set YT_DLP_AUTO_UPDATE=true during build to enable
+ARG YT_DLP_AUTO_UPDATE=false
+RUN if [ "$YT_DLP_AUTO_UPDATE" = "true" ]; then \
+        echo "Auto-updating yt-dlp to latest version..." && \
+        pip install --no-cache-dir -U yt-dlp; \
+    else \
+        echo "Using yt-dlp version from requirements.txt"; \
+    fi
+
 # Copy application code
 COPY . .
 

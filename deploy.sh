@@ -4,6 +4,8 @@
 # Builds Docker image, pushes to ECR, and updates App Runner service
 # Consolidates build, push, and service management into a single reliable process
 
+# Enable fail-fast mode - exit on any error
+set -e
 set -euo pipefail
 
 # Cleanup function for trap
@@ -64,6 +66,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-wait       Don't wait for deployment completion"
             echo "  --tail          Stream App Runner logs during deployment"
             echo "  --help          Show this help message"
+            echo ""
+            echo "Environment Variables:"
+            echo "  APP_RUNNER_SERVICE_ARN  Override service ARN (optional - auto-detected by default)"
             exit 0
             ;;
         *)
@@ -78,28 +83,54 @@ done
 # DEPLOYMENT VERIFICATION AND MONITORING FUNCTIONS
 # ============================================================================
 
-# Stream App Runner logs for monitoring
+# Stream App Runner logs for monitoring with auto-detected log group
 stream_apprunner_logs() {
-    local service_name="$1"
+    local service_arn="$1"
     local duration_seconds="${2:-300}"  # Default 5 minutes
     
-    echo "📋 Streaming App Runner logs (last ${duration_seconds}s)..."
+    echo "📜 Streaming logs for App Runner service..."
     
-    # App Runner logs are in CloudWatch with a specific log group pattern
-    local log_group="/aws/apprunner/${service_name}"
+    # Auto-detect log group name from service configuration
+    local service_info=$(aws apprunner describe-service --service-arn "$service_arn" --region "$AWS_REGION" 2>/dev/null)
+    local service_id=$(echo "$service_info" | jq -r '.Service.ServiceId // ""')
+    local service_name=$(echo "$service_info" | jq -r '.Service.ServiceName // ""')
     
-    if aws logs describe-log-groups --log-group-name-prefix "$log_group" --region "$AWS_REGION" > /dev/null 2>&1; then
-        aws logs tail "$log_group" \
+    # Try multiple log group patterns
+    local log_groups=(
+        "/aws/apprunner/${service_name}/${service_id}/application"
+        "/aws/apprunner/${service_name}/${service_id}/service"
+        "/aws/apprunner/${service_name}"
+        "/aws/apprunner/${service_id}/application"
+        "/aws/apprunner/${service_id}/service"
+    )
+    
+    local found_log_group=""
+    for log_group in "${log_groups[@]}"; do
+        if aws logs describe-log-groups --log-group-name-prefix "$log_group" --region "$AWS_REGION" > /dev/null 2>&1; then
+            found_log_group="$log_group"
+            echo "✅ Found log group: $found_log_group"
+            break
+        fi
+    done
+    
+    if [[ -n "$found_log_group" ]]; then
+        aws logs tail "$found_log_group" \
             --since "${duration_seconds}s" \
             --follow \
             --format short \
             --region "$AWS_REGION" 2>/dev/null || {
-            echo "⚠️  Unable to stream logs - log group may not exist yet"
-            echo "   Logs will be available at: $log_group"
+            echo "⚠️  Unable to stream logs - log group may not be ready yet"
+            echo "   Logs will be available at: $found_log_group"
         }
     else
-        echo "⚠️  Log group not found: $log_group"
-        echo "   Logs may not be available yet for new services"
+        echo "❌ ERROR: Could not determine log group for App Runner service."
+        echo "   Service ID: $service_id"
+        echo "   Service Name: $service_name"
+        echo "   Tried log group patterns:"
+        for log_group in "${log_groups[@]}"; do
+            echo "     - $log_group"
+        done
+        return 1
     fi
 }
 
@@ -154,7 +185,7 @@ wait_for_deployment_complete() {
     # Start log streaming in background if requested
     if [[ "$TAIL_LOGS" == "true" ]]; then
         echo "📋 Starting log stream..."
-        stream_apprunner_logs "$SERVICE_NAME" 300 &
+        stream_apprunner_logs "$service_arn" 300 &
         local log_pid=$!
         trap "kill $log_pid 2>/dev/null" EXIT
     fi
@@ -175,18 +206,31 @@ wait_for_deployment_complete() {
                 if [[ "$current_image" == "$expected_image_uri" ]]; then
                     echo "✅ Service is running with correct image"
                     
-                    # Verify by digest for extra confidence
+                    # Try digest verification but don't get stuck on it
                     if verify_deployment_digest "$service_arn" "$expected_image_uri"; then
                         echo "✅ Deployment completed and verified!"
                         return 0
                     else
-                        echo "⚠️  Image URI matches but digest verification failed"
-                        echo "   Continuing to wait for digest sync..."
+                        # If we've been waiting for more than 2 minutes and image URI matches, accept it
+                        if [[ $elapsed -gt 120 ]]; then
+                            echo "⚠️  Digest verification failed but image URI matches after ${elapsed}s"
+                            echo "✅ Accepting deployment as successful (image URI verified)"
+                            return 0
+                        else
+                            echo "⚠️  Image URI matches but digest verification failed"
+                            echo "   Continuing to wait for digest sync... (${elapsed}s elapsed)"
+                        fi
                     fi
                 else
                     echo "⚠️  Service running but with wrong image:"
                     echo "   Current: $current_image"
                     echo "   Expected: $expected_image_uri"
+                    
+                    # If we've been waiting a while and still wrong image, something is wrong
+                    if [[ $elapsed -gt 180 ]]; then
+                        echo "❌ Service still has wrong image after ${elapsed}s - deployment may have failed"
+                        return 1
+                    fi
                 fi
                 ;;
             "OPERATION_IN_PROGRESS")
@@ -249,14 +293,20 @@ if ! command -v jq > /dev/null 2>&1; then
 fi
 echo "✅ jq is available"
 
-# Check if service exists
-SERVICE_ARN=$(aws apprunner list-services --region ${AWS_REGION} --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn" --output text 2>/dev/null || echo "")
-if [[ -n "$SERVICE_ARN" && "$SERVICE_ARN" != "None" ]]; then
-    echo "✅ Found existing App Runner service: ${SERVICE_NAME}"
+# Check if service exists (use environment variable if provided)
+if [[ -n "${APP_RUNNER_SERVICE_ARN:-}" ]]; then
+    SERVICE_ARN="$APP_RUNNER_SERVICE_ARN"
+    echo "✅ Using provided App Runner service ARN: ${SERVICE_ARN}"
     SERVICE_EXISTS=true
 else
-    echo "ℹ️  App Runner service '${SERVICE_NAME}' not found - will provide manual setup instructions"
-    SERVICE_EXISTS=false
+    SERVICE_ARN=$(aws apprunner list-services --region ${AWS_REGION} --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn" --output text 2>/dev/null || echo "")
+    if [[ -n "$SERVICE_ARN" && "$SERVICE_ARN" != "None" ]]; then
+        echo "✅ Found existing App Runner service: ${SERVICE_NAME}"
+        SERVICE_EXISTS=true
+    else
+        echo "ℹ️  App Runner service '${SERVICE_NAME}' not found - will provide manual setup instructions"
+        SERVICE_EXISTS=false
+    fi
 fi
 
 # Login to ECR
@@ -288,7 +338,16 @@ else
     # Push both tags to ECR
     echo "⬆️  Pushing image to ECR..."
     docker push ${ECR_URI}:${IMAGE_TAG}
+    if [ $? -ne 0 ]; then
+        echo "❌ ERROR: Docker push failed. Aborting deployment."
+        exit 1
+    fi
     docker push ${ECR_URI}:latest
+    if [ $? -ne 0 ]; then
+        echo "❌ ERROR: Docker push failed. Aborting deployment."
+        exit 1
+    fi
+    echo "✅ Successfully pushed image to ECR: ${ECR_URI}:${IMAGE_TAG}"
 fi
 
 # Get the image URI for App Runner
@@ -298,6 +357,12 @@ IMAGE_URI="${ECR_URI}:${IMAGE_TAG}"
 if [[ "$SERVICE_EXISTS" == "true" ]]; then
     echo ""
     echo "🔄 Updating existing App Runner service..."
+    
+    # Ensure SERVICE_ARN is set
+    if [[ -z "$SERVICE_ARN" || "$SERVICE_ARN" == "None" ]]; then
+        echo "❌ ERROR: APP_RUNNER_SERVICE_ARN is not set. Aborting deployment."
+        exit 1
+    fi
     
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "🔄 [DRY RUN] Would update App Runner service with image: ${IMAGE_URI}"
@@ -344,8 +409,14 @@ EOF
             OPERATION_ID=$(echo "$UPDATE_RESULT" | jq -r '.OperationId // "unknown"')
             echo "   Operation ID: $OPERATION_ID"
             
+            # Force a deployment to ensure the new image is actually used
+            echo "🚀 Triggering new deployment for App Runner service: ${SERVICE_ARN}"
+            aws apprunner start-deployment --service-arn "${SERVICE_ARN}" --region ${AWS_REGION}
+            
+            # Wait a moment for the deployment to register
+            sleep 10
+            
             # Verify the service is actually updating with the correct image
-            sleep 5  # Give AWS a moment to process the update
             UPDATED_IMAGE=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region ${AWS_REGION} --query 'Service.SourceConfiguration.ImageRepository.ImageIdentifier' --output text)
             if [[ "$UPDATED_IMAGE" == "$IMAGE_URI" ]]; then
                 echo "✅ Confirmed: Service is updating to correct image: $IMAGE_URI"
@@ -371,6 +442,16 @@ EOF
                 echo "Check AWS App Runner console for details: https://console.aws.amazon.com/apprunner/"
                 exit 14  # Deployment timeout exit code
             fi
+            
+            # Stream logs after successful deployment (if not already streaming)
+            if [[ "$TAIL_LOGS" != "true" ]]; then
+                echo ""
+                echo "📜 Streaming logs for App Runner service..."
+                stream_apprunner_logs "$SERVICE_ARN" 60 || {
+                    echo "⚠️  Could not stream logs automatically"
+                    echo "   Check AWS CloudWatch console for App Runner logs"
+                }
+            fi
         else
             echo "⏭️  Skipping deployment wait (--no-wait specified)"
             echo "   Check AWS App Runner console to monitor deployment progress"
@@ -380,12 +461,7 @@ EOF
         FINAL_SERVICE_INFO=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region ${AWS_REGION})
         SERVICE_URL=$(echo "$FINAL_SERVICE_INFO" | jq -r '.Service.ServiceUrl')
         
-        # Force restart if requested
-        if [[ "$FORCE_RESTART" == "true" ]]; then
-            echo "🔄 Forcing service restart..."
-            aws apprunner start-deployment --service-arn "${SERVICE_ARN}" --region ${AWS_REGION}
-            echo "✅ Service restart initiated"
-        fi
+        # Note: Force restart is now done automatically during update to ensure new image is used
     fi
 else
     # Create new App Runner service

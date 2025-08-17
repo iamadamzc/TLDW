@@ -80,12 +80,16 @@ def _check_dependencies():
     # Check yt-dlp
     try:
         import yt_dlp
+        version = yt_dlp.version.__version__
         dependencies['yt_dlp'] = {
             'available': True,
-            'version': yt_dlp.version.__version__
+            'version': version
         }
+        # Structured JSON logging for yt-dlp version
+        logging.info(f'{{"component": "yt_dlp", "version": "{version}", "status": "loaded"}}')
     except Exception as e:
         dependencies['yt_dlp'] = {'available': False, 'error': str(e)}
+        logging.error(f'{{"component": "yt_dlp", "version": null, "status": "failed", "error": "{str(e)}"}}')
     
     return dependencies
 
@@ -217,6 +221,12 @@ def health_check():
                     proxy_config_readable = False
                     # Log the connectivity issue for debugging
                     logging.warning(f"Proxy connectivity test failed: {proxy_test}")
+            else:
+                # Always include proxy_connectivity field for consistency
+                health_info['proxy_connectivity'] = {
+                    "test_performed": False, 
+                    "reason": "proxy_config_not_readable"
+                }
             
             health_info['secrets'] = {
                 'proxy_config_readable': proxy_config_readable

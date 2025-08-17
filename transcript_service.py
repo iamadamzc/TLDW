@@ -4,13 +4,14 @@ import logging
 import tempfile
 import requests
 import mimetypes
+import re
 from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
 from proxy_manager import ProxyManager
 from proxy_http import ProxyHTTPClient, YouTubeBlockingError
 from transcript_cache import TranscriptCache
 from user_agent_manager import UserAgentManager
-from yt_download_helper import download_audio_with_fallback
+from yt_download_helper import download_audio_with_retry
 
 class TranscriptService:
     def __init__(self):
@@ -318,6 +319,54 @@ class TranscriptService:
         
         def _log_adapter(status_msg: str):
             """Adapt helper log messages to existing structured logging"""
+            nonlocal cookies_used_flag  # Allow updating the actual cookie usage
+            
+            # Parse helper attempt lines for structured logging
+            import re
+            attempt_line_re = re.compile(
+                r"^yt_dlp_attempt=(\d+)\s+use_cookies=(true|false)(?:\s+(reason|retry_reason)=([a-z_0-9]+))?$",
+                re.I,
+            )
+            m = attempt_line_re.match(status_msg.strip())
+            if m:
+                attempt = int(m.group(1))
+                use_cookies = (m.group(2).lower() == "true")
+                key = (m.group(3) or "").lower()
+                val = (m.group(4) or "").lower() or None
+                latency_ms = int((time.time() - start_time) * 1000)
+                
+                # Keep cookies_used_flag in sync with the actual attempt
+                cookies_used_flag = use_cookies
+                
+                if attempt == 1:
+                    self._log_structured(
+                        component="ytdlp",
+                        video_id=video_id,
+                        status="attempt",
+                        attempt=attempt,
+                        latency_ms=latency_ms,
+                        source="asr",
+                        ua_applied=user_agent_applied,
+                        session_id=session_id,
+                        cookies_used=cookies_used_flag,
+                        reason=val if key == "reason" else None,
+                    )
+                elif attempt == 2:
+                    self._log_structured(
+                        component="ytdlp",
+                        video_id=video_id,
+                        status="attempt",
+                        attempt=attempt,
+                        latency_ms=latency_ms,
+                        source="asr",
+                        ua_applied=user_agent_applied,
+                        session_id=session_id,
+                        cookies_used=cookies_used_flag,  # should be False
+                        retry_reason=val if key == "retry_reason" else None,
+                    )
+                return
+            
+            # Existing step result parsing
             if status_msg.startswith("yt_step1_ok"):
                 last_status.update(status="ok", attempt=1)
                 # Extract path and size from message for additional logging
@@ -337,7 +386,7 @@ class TranscriptService:
             else:
                 last_status.update(status="ytdlp_info", attempt=max(1, last_status["attempt"]))
             
-            # Log structured attempt/result
+            # Log structured attempt/result for non-attempt lines
             latency_ms = int((time.time() - start_time) * 1000)
             self._log_structured("ytdlp", video_id, last_status["status"], 
                                last_status["attempt"], latency_ms, "asr", 
@@ -348,9 +397,12 @@ class TranscriptService:
         logging.info(f"yt-dlp config: session={session_id} ua_applied={user_agent_applied} ffmpeg_location={ffmpeg_path}")
         
         try:
-            # Call the helper function
-            audio_path = download_audio_with_fallback(
-                video_url, ua, proxy_url, ffmpeg_path, _log_adapter, cookiefile=cookiefile
+            # Get user_id for enhanced retry logic
+            user_id = self._resolve_current_user_id()
+            
+            # Call the enhanced helper function with retry logic
+            audio_path = download_audio_with_retry(
+                video_url, ua, proxy_url, ffmpeg_path, _log_adapter, cookiefile=cookiefile, user_id=user_id
             )
             
             # Send to Deepgram for transcription
@@ -634,17 +686,36 @@ class TranscriptService:
             # Reset counter to avoid spam
             self._cookie_failures[user_id] = 0
 
-    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", ua_applied=False, session_id="none", cookies_used=False):
+    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", ua_applied=False, session_id="none", cookies_used=False, reason=None, retry_reason=None):
         """
-        Structured logging with credential redaction and session tracking
+        Structured logging with standardized keys for extraction hardening
         Never logs password or full proxy URL; only logs session ID
-        Enhanced with cookie usage tracking for monitoring
+        Enhanced with unified attempt logging keys for consistent grep/alerting
         """
-        # Convert boolean flags to strings for consistency
+        # Convert boolean flags to lowercase strings for consistency
         ua_status = "true" if ua_applied else "false"
         cookie_status = "true" if cookies_used else "false"
         
-        # Determine download step for granular tracking
+        # Build base log data with standardized keys
+        log_data = {
+            "component": step,
+            "video_id": video_id,
+            "status": status,
+            "yt_dlp_attempt": attempt,
+            "use_cookies": cookie_status,
+            "latency_ms": latency_ms,
+            "method": source,
+            "ua_applied": ua_status,
+            "session_id": session_id
+        }
+        
+        # Add reason for attempt 1 or retry_reason for attempt 2
+        if attempt == 1 and reason:
+            log_data["reason"] = reason
+        elif attempt == 2 and retry_reason:
+            log_data["retry_reason"] = retry_reason
+        
+        # Legacy download step for backward compatibility
         download_step = "unknown"
         if step == "ytdlp" and status == "ok":
             if attempt == 1:
@@ -653,7 +724,8 @@ class TranscriptService:
                 download_step = "step2_success"
         elif step == "ytdlp" and status in ["bot_check", "timeout", "yt_both_steps_fail"]:
             download_step = f"step{attempt}_fail"
+        log_data["download_step"] = download_step
         
-        logging.info(f"STRUCTURED_LOG step={step} video_id={video_id} session={session_id} "
-                    f"ua_applied={ua_status} cookies_used={cookie_status} latency_ms={latency_ms} "
-                    f"status={status} attempt={attempt} source={source} download_step={download_step}")
+        # Log as structured JSON for easy parsing
+        import json
+        logging.info(json.dumps(log_data))
