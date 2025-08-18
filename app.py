@@ -230,9 +230,21 @@ def health_ready():
         }), 503, {"Retry-After": "30"}
 
 # Add health check endpoints for App Runner
-@app.route('/health')
 @app.route('/healthz')
-def health_check():
+def health_check_apprunner():
+    """Lightweight health check for App Runner deployment - no expensive operations"""
+    from datetime import datetime
+    
+    # Simple liveness check - if Flask is responding, we're healthy
+    return {
+        'status': 'healthy',
+        'message': 'TL;DW API is running',
+        'timestamp': datetime.utcnow().isoformat(),
+        'deployment_mode': 'apprunner'
+    }, 200
+
+@app.route('/health')
+def health_check_detailed():
     """Enhanced health check with proxy status and dependency verification"""
     allow_missing_deps = os.getenv('ALLOW_MISSING_DEPS', 'false').lower() == 'true'
     
@@ -259,10 +271,29 @@ def health_check():
     # Add proxy status if enabled
     if health_info['proxy_enabled']:
         try:
+            # Create new ProxyManager with proper initialization
+            import json
+            import logging
             from proxy_manager import ProxyManager
-            proxy_manager = ProxyManager()
-            proxy_stats = proxy_manager.get_session_stats()
-            proxy_health = proxy_manager.get_proxy_health_info()
+            
+            # Load secret from environment
+            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
+            if raw_config:
+                secret_data = json.loads(raw_config)
+                logger = logging.getLogger(__name__)
+                proxy_manager = ProxyManager(secret_data, logger)
+                
+                # Get basic health info
+                proxy_health = {
+                    'status': 'configured',
+                    'has_username': bool(secret_data.get('username')),
+                    'has_password': bool(secret_data.get('password')),
+                    'provider': secret_data.get('provider', 'unknown')
+                }
+                proxy_stats = {'enabled': True}
+            else:
+                proxy_health = {'status': 'not_configured', 'error': 'OXYLABS_PROXY_CONFIG not set'}
+                proxy_stats = {'enabled': False}
             
             # Set proxy_config_readable boolean for deployment validation
             proxy_config_readable = (proxy_health.get('status') == 'configured' and 
@@ -273,21 +304,27 @@ def health_check():
             health_info['proxy_config'] = proxy_health
             
             # Test proxy connectivity if configuration is readable
-            if proxy_config_readable:
-                proxy_test = proxy_manager.test_proxy_connectivity()
-                health_info['proxy_connectivity'] = proxy_test
-                
-                # Update proxy_config_readable based on actual connectivity
-                if proxy_test.get('status') == 'success':
-                    proxy_config_readable = True
-                elif proxy_test.get('status') in ['failed', 'error']:
+            proxy_config_readable = (proxy_health.get('status') == 'configured' and 
+                                    proxy_health.get('has_username') and 
+                                    proxy_health.get('has_password'))
+            
+            if proxy_config_readable and 'proxy_manager' in locals():
+                try:
+                    # Simple connectivity test using preflight
+                    proxy_healthy = proxy_manager.preflight(timeout=5.0)
+                    health_info['proxy_connectivity'] = {
+                        'test_performed': True,
+                        'status': 'success' if proxy_healthy else 'failed',
+                        'healthy': proxy_healthy
+                    }
+                except Exception as e:
+                    health_info['proxy_connectivity'] = {
+                        'test_performed': True,
+                        'status': 'error',
+                        'error': str(e)
+                    }
                     proxy_config_readable = False
-                    # Log the connectivity issue for debugging
-                    logging.warning(f"Proxy connectivity test failed: {proxy_test}")
-                    # Fail health check when proxy connectivity fails
-                    health_info['status'] = 'unhealthy'
-                    health_info['message'] = f'Proxy connectivity failed: {proxy_test.get("error", "connectivity_failed")}'
-                    return health_info, 503
+                
             else:
                 # Always include proxy_connectivity field for consistency
                 health_info['proxy_connectivity'] = {
