@@ -166,6 +166,69 @@ app.register_blueprint(google_auth)
 app.register_blueprint(main_routes)
 app.register_blueprint(bp_cookies)
 
+# Add new health endpoints for proxy monitoring
+@app.route('/health/live')
+def health_live():
+    """Always returns 200 if process is running"""
+    from datetime import datetime
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.route('/health/ready')
+def health_ready():
+    """Returns proxy health status from cache (non-recursive)"""
+    from flask import jsonify
+    from datetime import datetime
+    import uuid
+    
+    def generate_correlation_id():
+        return str(uuid.uuid4())
+    
+    def get_proxy_manager():
+        """Factory for ProxyManager with loaded secret and logger"""
+        import json
+        import logging
+        from proxy_manager import ProxyManager
+        
+        # Load secret from environment
+        raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
+        if not raw_config:
+            raise ValueError("OXYLABS_PROXY_CONFIG environment variable is empty")
+        
+        # Parse JSON secret
+        secret_data = json.loads(raw_config)
+        logger = logging.getLogger(__name__)
+        return ProxyManager(secret_data, logger)
+    
+    try:
+        pm = get_proxy_manager()
+        
+        # If no cached result, trigger preflight
+        if pm.healthy is None:
+            try:
+                pm.preflight()
+            except Exception as e:
+                return jsonify({
+                    "status": "not_ready", 
+                    "proxy_healthy": False, 
+                    "reason": str(e)
+                }), 503, {"Retry-After": "30"}
+        
+        # Return cached result
+        if pm.healthy:
+            return jsonify({"status": "ready", "proxy_healthy": True})
+        else:
+            return jsonify({
+                "status": "not_ready", 
+                "proxy_healthy": False
+            }), 503, {"Retry-After": "30"}
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "proxy_healthy": False, 
+            "reason": str(e)
+        }), 503, {"Retry-After": "30"}
+
 # Add health check endpoints for App Runner
 @app.route('/health')
 @app.route('/healthz')

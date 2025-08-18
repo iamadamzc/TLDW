@@ -5,9 +5,10 @@ import tempfile
 import requests
 import mimetypes
 import re
+import json
 from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
-from proxy_manager import ProxyManager
+from proxy_manager import ProxyManager, ProxyAuthError, ProxyConfigError, generate_correlation_id, error_response, BLOCK_STATUSES, extract_session_from_proxies
 from proxy_http import ProxyHTTPClient, YouTubeBlockingError
 from transcript_cache import TranscriptCache
 from user_agent_manager import UserAgentManager
@@ -16,8 +17,15 @@ from yt_download_helper import download_audio_with_retry
 class TranscriptService:
     def __init__(self):
         self.deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
-        self.proxy_manager = ProxyManager()
-        self.http_client = ProxyHTTPClient(self.proxy_manager)
+        
+        # Initialize new ProxyManager with strict validation
+        try:
+            self.proxy_manager = self._create_proxy_manager()
+        except Exception as e:
+            logging.error(f"Failed to initialize ProxyManager: {e}")
+            self.proxy_manager = None
+        
+        self.http_client = ProxyHTTPClient(self.proxy_manager) if self.proxy_manager else None
         self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
         self._video_locks = {}  # Idempotency guard: in-memory lock per video_id
         
@@ -39,12 +47,41 @@ class TranscriptService:
         # Track last download attempt for health diagnostics
         self._last_download_used_cookies = False
         self._last_download_client = "unknown"
+    
+    def _create_proxy_manager(self):
+        """Create ProxyManager with loaded secret and validation"""
+        # Load secret from environment
+        raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
+        if not raw_config:
+            raise ValueError("OXYLABS_PROXY_CONFIG environment variable is empty")
+        
+        # Parse JSON secret
+        secret_data = json.loads(raw_config)
+        
+        # Diagnostic logging to prove secret is RAW
+        username = secret_data.get('username', '')
+        password = secret_data.get('password', '')
+        masked_username = username[:4] + "***" + username[-2:] if len(username) > 6 else username[:2] + "***"
+        
+        # Quick pre-encoding check before ProxyManager validation
+        has_encoded_chars = '%2B' in password or '%25' in password or '%21' in password or '%40' in password
+        
+        logging.info(f"🔍 TranscriptService: Loading proxy secret for username={masked_username}")
+        logging.info(f"🔍 Secret pre-encoding check: has_encoded_chars={has_encoded_chars}")
+        
+        if has_encoded_chars:
+            logging.error(f"❌ CRITICAL: Proxy secret appears to be URL-encoded!")
+            logging.error(f"💡 Fix RuntimeEnvironmentSecrets in AWS to use RAW password (with + literally)")
+            logging.error(f"🚨 This WILL cause 407 errors - stop and fix secret before proceeding")
+        
+        logger = logging.getLogger(__name__)
+        return ProxyManager(secret_data, logger)
 
     def get_transcript(self, video_id, has_captions=None, language="en"):
         """
-        Main transcript fetching with discovery gate and sticky sessions
-        CONTRACT: ASR path uses same session for yt-dlp audio download
+        Main transcript fetching with preflight validation and fail-fast behavior
         """
+        correlation_id = generate_correlation_id()
         
         # Idempotency guard: prevent concurrent fetching of same video
         if video_id in self._video_locks:
@@ -59,60 +96,94 @@ class TranscriptService:
             cached_transcript = self.cache.get(video_id, language)
             if cached_transcript:
                 logging.info(f"Cache hit for video {video_id} (lang: {language})")
-                self._log_structured("transcript", video_id, "ok", 1, 0, "cache_hit", False, "none")
+                self._log_structured("transcript", video_id, "ok", 1, 0, "cache_hit", False, "none", correlation_id=correlation_id)
                 return cached_transcript
+            
+            # Step 1: Preflight validation - FAIL FAST if proxy unhealthy
+            if self.proxy_manager:
+                try:
+                    if not self.proxy_manager.preflight():
+                        self._log_structured("transcript", video_id, "proxy_auth_failed", 1, 0, "preflight", False, "none", 
+                                           correlation_id=correlation_id)
+                        return error_response('PROXY_AUTH_FAILED', correlation_id)
+                except ProxyAuthError as e:
+                    self._log_structured("transcript", video_id, "proxy_auth_failed", 1, 0, "preflight", False, "none",
+                                       correlation_id=correlation_id)
+                    return error_response('PROXY_AUTH_FAILED', correlation_id, str(e))
+                except ProxyConfigError as e:
+                    self._log_structured("transcript", video_id, "proxy_misconfigured", 1, 0, "preflight", False, "none",
+                                       correlation_id=correlation_id)
+                    return error_response('PROXY_MISCONFIGURED', correlation_id, str(e))
             
             start_time = time.time()
             
             # Discovery gate implementation - skip transcript scraping if no captions
             if has_captions is False:
                 logging.info(f"Discovery gate: Video {video_id} has no captions, skipping to ASR")
-                self._log_structured("transcript", video_id, "skip_no_captions", 1, 0, "no_captions", False, "none")
-                transcript = self._transcribe_audio_with_proxy(video_id)
+                self._log_structured("transcript", video_id, "skip_no_captions", 1, 0, "no_captions", False, "none", correlation_id=correlation_id)
+                transcript = self._transcribe_audio_with_proxy(video_id, correlation_id)
                 if transcript:
                     self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
                 return transcript
             
-            # Attempt transcript fetch with sticky session
-            session = self.proxy_manager.get_session_for_video(video_id)
-            
-            try:
-                transcript_text = self._fetch_transcript_with_session(video_id, session, language, start_time)
-                if transcript_text:
-                    self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
-                    return transcript_text
-                    
-            except YouTubeBlockingError as e:
-                logging.warning(f"YouTube blocking detected for transcript {video_id}: {e}")
-                
-                # Single retry with rotated session
-                rotated_session = self.proxy_manager.rotate_session(video_id)
-                if rotated_session:
-                    try:
-                        transcript_text = self._fetch_transcript_with_session(video_id, rotated_session, language, start_time)
-                        if transcript_text:
-                            self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
-                            return transcript_text
-                    except YouTubeBlockingError as e2:
-                        logging.error(f"YouTube blocking persists after rotation for video {video_id}: {e2}")
-                
-                # Fall back to ASR with SAME rotated session (critical for consistency)
-                logging.info(f"Falling back to ASR for video {video_id} due to persistent blocking")
-                transcript = self._transcribe_audio_with_proxy(video_id, rotated_session)
-                if transcript:
-                    self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
-                return transcript
-            
-            # If no transcript found and no blocking, fall back to ASR
-            logging.info(f"No existing transcript found for {video_id}, using ASR fallback")
-            transcript = self._transcribe_audio_with_proxy(video_id, session)
-            if transcript:
-                self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
-            return transcript
+            # Attempt transcript with fallback chain
+            return self._attempt_transcript_chain(video_id, language, start_time, correlation_id)
             
         finally:
             # Clean up idempotency lock
             self._video_locks.pop(video_id, None)
+    
+    def _attempt_transcript_chain(self, video_id, language, start_time, correlation_id):
+        """Attempt transcript with session rotation on auth failures"""
+        if not self.proxy_manager:
+            return None
+            
+        # Get proxy config with unique session
+        proxies = self.proxy_manager.proxies_for(video_id)
+        session_token = extract_session_from_proxies(proxies)
+        
+        try:
+            # Try transcript API first
+            transcript_text = self._get_transcript_api(video_id, proxies, language, start_time, correlation_id)
+            if transcript_text:
+                self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
+                return transcript_text
+        except requests.HTTPError as e:
+            if e.response.status_code in BLOCK_STATUSES:
+                # Rotate session on auth/blocking failure
+                self.proxy_manager.rotate_session(session_token)
+                self._log_structured("transcript", video_id, "blocked_rotating_session", 1, 0, "transcript_api", False, session_token,
+                                   status_code=e.response.status_code, correlation_id=correlation_id)
+                
+                # ENHANCED: Re-preflight the new session before proceeding
+                try:
+                    if not self.proxy_manager.preflight():
+                        self._log_structured("transcript", video_id, "rotated_session_still_unhealthy", 1, 0, "preflight", False, "rotated",
+                                           correlation_id=correlation_id)
+                        return error_response('PROXY_AUTH_FAILED', correlation_id, "Session rotation failed - proxy still unhealthy")
+                except (ProxyAuthError, ProxyConfigError) as preflight_error:
+                    self._log_structured("transcript", video_id, "rotated_session_preflight_failed", 1, 0, "preflight", False, "rotated",
+                                       reason=str(preflight_error), correlation_id=correlation_id)
+                    return error_response('PROXY_AUTH_FAILED', correlation_id, f"Rotated session preflight failed: {preflight_error}")
+                
+                # Preflight passed - proceed with fresh session
+                fresh_proxies = self.proxy_manager.proxies_for(video_id)
+                try:
+                    transcript_text = self._get_transcript_api(video_id, fresh_proxies, language, start_time, correlation_id)
+                    if transcript_text:
+                        self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
+                        return transcript_text
+                except Exception:
+                    # Even after successful rotation + preflight, transcript still failed
+                    # This suggests the issue is not proxy auth but something else (blocking, etc.)
+                    pass  # Fall through to ASR
+            
+        # Fall back to ASR
+        logging.info(f"Falling back to ASR for video {video_id}")
+        transcript = self._transcribe_audio_with_proxy(video_id, correlation_id)
+        if transcript:
+            self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
+        return transcript
 
 
 
@@ -210,8 +281,57 @@ class TranscriptService:
                     session.mark_failed()
                 logging.warning(f"Could not get transcript for {video_id}: {e}")
                 return None
+    
+    def _get_transcript_api(self, video_id, proxies, language, start_time, correlation_id):
+        """Get transcript using YouTube Transcript API with proxy"""
+        try:
+            # Use YouTubeTranscriptApi directly with proxies
+            chunks = YouTubeTranscriptApi.get_transcript(video_id, languages=[language], proxies=proxies)
+            transcript_text = " ".join(item["text"] for item in chunks if item.get("text"))
+            
+            # Log success
+            latency_ms = int((time.time() - start_time) * 1000)
+            session_token = extract_session_from_proxies(proxies)
+            self._log_structured("transcript", video_id, "ok", 1, latency_ms, "transcript_api", False, session_token, 
+                               correlation_id=correlation_id)
+            logging.info(f"Transcript fetch successful for {video_id}")
+            
+            return transcript_text
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            latency_ms = int((time.time() - start_time) * 1000)
+            session_token = extract_session_from_proxies(proxies)
+            
+            # Classify error types for structured logging
+            if '407' in error_msg or 'proxy authentication' in error_msg:
+                self._log_structured("transcript", video_id, "proxy_407", 1, latency_ms, "transcript_api", False, session_token,
+                                   correlation_id=correlation_id)
+                raise requests.HTTPError(response=type('obj', (object,), {'status_code': 407})())
+                
+            elif any(indicator in error_msg for indicator in ['blocked', 'captcha', 'unusual traffic', 'sign in to confirm']):
+                self._log_structured("transcript", video_id, "bot_check", 1, latency_ms, "transcript_api", False, session_token,
+                                   correlation_id=correlation_id)
+                raise requests.HTTPError(response=type('obj', (object,), {'status_code': 403})())
+                
+            elif any(indicator in error_msg for indicator in ['403', 'forbidden']):
+                self._log_structured("transcript", video_id, "blocked_403", 1, latency_ms, "transcript_api", False, session_token,
+                                   correlation_id=correlation_id)
+                raise requests.HTTPError(response=type('obj', (object,), {'status_code': 403})())
+                
+            elif any(indicator in error_msg for indicator in ['429', 'rate limit']):
+                self._log_structured("transcript", video_id, "blocked_429", 1, latency_ms, "transcript_api", False, session_token,
+                                   correlation_id=correlation_id)
+                raise requests.HTTPError(response=type('obj', (object,), {'status_code': 429})())
+                
+            else:
+                # Other errors - don't retry
+                self._log_structured("transcript", video_id, "error", 1, latency_ms, "transcript_api", False, session_token,
+                                   reason=str(e), correlation_id=correlation_id)
+                logging.warning(f"Could not get transcript for {video_id}: {e}")
+                return None
 
-    def _transcribe_audio_with_proxy(self, video_id, session=None):
+    def _transcribe_audio_with_proxy(self, video_id, correlation_id, session=None):
         """
         ASR fallback using yt-dlp with sticky proxy, bot-check detection, and retry logic
         Uses same session as transcript attempt for IP consistency
@@ -221,22 +341,27 @@ class TranscriptService:
             self._log_structured("ytdlp", video_id, "neterr", 1, 0, "no_deepgram_key", False, "none")
             return None
 
-        # Use provided session or get new one
+        # Use provided session or get new proxies
         if not session:
-            session = self.proxy_manager.get_session_for_video(video_id)
+            # For new ProxyManager, we work directly with proxies
+            pass  # Will get proxies in _attempt_ytdlp_download
         
-        # First attempt
-        result = self._attempt_ytdlp_download(video_id, session, attempt=1)
+        # First attempt - get fresh proxies
+        proxies = self.proxy_manager.proxies_for(video_id) if self.proxy_manager else {}
+        result = self._attempt_ytdlp_download(video_id, proxies, attempt=1, correlation_id=correlation_id)
         
         # Check if bot-check was detected and retry is needed
         if result['status'] == 'bot_check' and result['attempt'] == 1:
             logging.info(f"Bot-check detected for video {video_id}, rotating session and retrying")
             
             # Rotate session for retry
-            rotated_session = self.proxy_manager.rotate_session(video_id)
-            if rotated_session:
+            if self.proxy_manager:
+                session_token = extract_session_from_proxies(proxies)
+                self.proxy_manager.rotate_session(session_token)
+                # Get fresh proxies with new session
+                fresh_proxies = self.proxy_manager.proxies_for(video_id)
                 # Second attempt with rotated session
-                result = self._attempt_ytdlp_download(video_id, rotated_session, attempt=2)
+                result = self._attempt_ytdlp_download(video_id, fresh_proxies, attempt=2, correlation_id=correlation_id)
                 
                 # If second attempt also hits bot-check, mark as hard failure
                 if result['status'] == 'bot_check':
@@ -245,13 +370,13 @@ class TranscriptService:
         
         return result.get('transcript_text')
     
-    def _attempt_ytdlp_download(self, video_id, session, attempt=1):
+    def _attempt_ytdlp_download(self, video_id, proxies, attempt=1, correlation_id=None):
         """
         Single attempt at yt-dlp download using helper with bot-check detection
         Returns dict with status, transcript_text, and attempt info
         """
         start_time = time.time()
-        session_id = session.session_id if session else "none"
+        session_id = extract_session_from_proxies(proxies) if proxies else "none"
         
         # Check for environment proxy collision
         self._handle_env_proxy_collision()
@@ -273,7 +398,7 @@ class TranscriptService:
             logging.debug(f"UserAgentManager not available for yt-dlp download of {video_id}")
         
         # Get proxy URL and validate credentials
-        proxy_url = session.proxy_url if session and session.proxy_url else ""
+        proxy_url = proxies.get("https", "") if proxies else ""
         if proxy_url:
             # Log sanitized proxy info for debugging
             if '@' in proxy_url:
@@ -415,9 +540,6 @@ class TranscriptService:
                 pass
             
             if transcript_text:
-                # Mark session as successful
-                if session:
-                    session.mark_used()
                 logging.info(f"ASR transcription successful for {video_id} (attempt {attempt})")
                 return {
                     'status': last_status['status'],
@@ -441,8 +563,6 @@ class TranscriptService:
             if '407' in error_msg or 'proxy authentication' in error_msg:
                 # 407 errors: fail fast and rotate proxy
                 status = "proxy_407"
-                if session:
-                    session.mark_failed()
                 
                 # Try to handle 407 error with secrets refresh
                 if self.proxy_manager.handle_407_error(video_id):
@@ -452,8 +572,6 @@ class TranscriptService:
                 
             elif self._detect_bot_check(error_msg):
                 status = "bot_check"
-                if session:
-                    session.mark_blocked()
                 
                 # Track cookie staleness if cookies were used
                 if cookiefile:
@@ -463,12 +581,8 @@ class TranscriptService:
                         
             elif any(indicator in error_msg for indicator in ['timeout', 'connection', 'network']):
                 status = "timeout"
-                if session:
-                    session.mark_failed()
             else:
                 status = "yt_both_steps_fail"
-                if session:
-                    session.mark_failed()
             
             logging.error(f"Error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
             self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", user_agent_applied, session_id, cookies_used_flag)
@@ -484,9 +598,6 @@ class TranscriptService:
             latency_ms = int((time.time() - start_time) * 1000)
             logging.error(f"Unexpected error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
             self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_error", user_agent_applied, session_id, cookies_used_flag)
-            
-            if session:
-                session.mark_failed()
             
             return {
                 'status': 'neterr',
@@ -686,11 +797,12 @@ class TranscriptService:
             # Reset counter to avoid spam
             self._cookie_failures[user_id] = 0
 
-    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", ua_applied=False, session_id="none", cookies_used=False, reason=None, retry_reason=None):
+    def _log_structured(self, step, video_id, status, attempt, latency_ms, source="", ua_applied=False, session_id="none", cookies_used=False, reason=None, retry_reason=None, **kwargs):
         """
         Structured logging with standardized keys for extraction hardening
         Never logs password or full proxy URL; only logs session ID
         Enhanced with unified attempt logging keys for consistent grep/alerting
+        Now accepts additional keyword arguments for new proxy validation fields
         """
         # Convert boolean flags to lowercase strings for consistency
         ua_status = "true" if ua_applied else "false"
@@ -715,6 +827,9 @@ class TranscriptService:
         elif attempt == 2 and retry_reason:
             log_data["retry_reason"] = retry_reason
         
+        # Add any additional keyword arguments (for new proxy validation fields)
+        log_data.update(kwargs)
+        
         # Legacy download step for backward compatibility
         download_step = "unknown"
         if step == "ytdlp" and status == "ok":
@@ -726,6 +841,10 @@ class TranscriptService:
             download_step = f"step{attempt}_fail"
         log_data["download_step"] = download_step
         
-        # Log as structured JSON for easy parsing
-        import json
-        logging.info(json.dumps(log_data))
+        # Use SafeStructuredLogger if available, otherwise fall back to JSON logging
+        if hasattr(self, 'proxy_manager') and self.proxy_manager and hasattr(self.proxy_manager, 'logger'):
+            self.proxy_manager.logger.log_event("info", f"Transcript operation: {step}", **log_data)
+        else:
+            # Fallback to JSON logging
+            import json
+            logging.info(json.dumps(log_data))

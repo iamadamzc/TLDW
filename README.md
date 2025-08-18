@@ -48,6 +48,63 @@ python tests/run_all_tests.py
 ## Features
 
 - YouTube transcript extraction with language support
+- Robust proxy authentication with fail-fast validation
+- Session rotation to prevent recurring 407 errors
+- Health monitoring endpoints for deployment validation
+
+## Proxy Configuration
+
+### RAW Secret Format (Required)
+
+Store proxy credentials in AWS Secrets Manager using **RAW format** (not URL-encoded):
+
+```json
+{
+  "provider": "oxylabs",
+  "host": "pr.oxylabs.io",
+  "port": 7777,
+  "username": "customer-<your-account>",
+  "password": "<RAW-PASSWORD-NOT-ENCODED>",
+  "geo_enabled": false,
+  "country": "us",
+  "version": 1
+}
+```
+
+### Environment Variables
+
+```bash
+# Required
+OXYLABS_PROXY_CONFIG=<JSON-secret-from-secrets-manager>
+
+# Optional (with defaults)
+OXY_PREFLIGHT_TTL_SECONDS=300
+OXY_PREFLIGHT_MAX_PER_MINUTE=10
+OXY_DISABLE_GEO=true
+OXY_PREFLIGHT_DISABLED=false
+```
+
+### Deployment Validation
+
+Before deploying, validate your proxy configuration:
+
+```bash
+# Validate secret format and proxy connectivity
+python validate_deployment.py
+```
+
+### Common Issues
+
+❌ **Password is URL-encoded** (contains `%` characters)
+- Store RAW password in secrets, not URL-encoded
+
+❌ **Host contains scheme** (`http://` or `https://`)
+- Use hostname only: `pr.oxylabs.io`
+
+❌ **Missing required fields**
+- Ensure all required fields are present in secret JSON
+
+✅ **Correct format**: RAW credentials, hostname only, all fields present
 - ASR fallback using Deepgram when transcripts unavailable
 - Proxy rotation and sticky sessions for bot detection avoidance
 - Per-user cookie support for enhanced YouTube access
