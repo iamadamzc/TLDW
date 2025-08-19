@@ -26,6 +26,7 @@ class TranscriptService:
         
         # Log successful initialization
         logging.info("TranscriptService initialized with shared managers")
+        logging.info("BUILD MARKER: no-discovery-gate-2025-08-19")
         
         self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
         self._video_locks = {}  # Idempotency guard: in-memory lock per video_id
@@ -42,7 +43,7 @@ class TranscriptService:
     
 
 
-    def get_transcript(self, video_id, has_captions=None, language="en"):
+    def get_transcript(self, video_id, language="en"):
         """
         Main transcript fetching with preflight validation and fail-fast behavior
         """

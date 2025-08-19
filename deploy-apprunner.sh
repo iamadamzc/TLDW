@@ -145,6 +145,7 @@ else
 
   echo "🔨 Building Docker image: ${IMAGE_URI}..."
   docker build \
+    --no-cache \
     --build-arg YTDLP_VERSION=2025.8.11 \
     --build-arg CACHE_BUSTER="${IMAGE_TAG}" \
     -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .

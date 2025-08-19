@@ -332,8 +332,7 @@ class YouTubeService:
 
     def get_video_details(self, video_id):
         """
-        Get detailed information about a specific video including caption availability.
-        Implements discovery gate by checking videos.list.contentDetails.caption field.
+        Get detailed information about a specific video.
         """
         def _get_details():
             try:
@@ -346,13 +345,6 @@ class YouTubeService:
                 if response.get('items'):
                     item = response['items'][0]
                     
-                    # Discovery gate: Check if captions are available
-                    # This determines whether transcript scraping should be attempted
-                    caption_field = item['contentDetails'].get('caption', 'false')
-                    has_captions = caption_field == 'true'
-                    
-                    logging.debug(f"Video {video_id} caption availability: {caption_field} -> {has_captions}")
-                    
                     video_details = {
                         'id': video_id,
                         'title': item['snippet']['title'],
@@ -361,14 +353,8 @@ class YouTubeService:
                         'channel_title': item['snippet']['channelTitle'],
                         'published_at': item['snippet']['publishedAt'],
                         'duration': item['contentDetails']['duration'],
-                        'has_captions': has_captions
+                        'has_captions': None # This is no longer used to gate transcript attempts
                     }
-                    
-                    # Log discovery gate decision
-                    if has_captions:
-                        logging.info(f"Discovery gate: Video {video_id} has captions - transcript scraping enabled")
-                    else:
-                        logging.info(f"Discovery gate: Video {video_id} has no captions - will skip to ASR")
                     
                     return video_details
                 else:
@@ -386,41 +372,4 @@ class YouTubeService:
             raise
         except Exception as e:
             logging.error(f"YouTube API error getting video details for {video_id}: {e}")
-            return None
-    
-    def check_caption_availability(self, video_id):
-        """
-        Lightweight method to check only caption availability for discovery gate.
-        Returns True if captions available, False if not, None if error.
-        """
-        def _check_captions():
-            try:
-                request = self.youtube.videos().list(
-                    part="contentDetails",  # Only request contentDetails for efficiency
-                    id=video_id
-                )
-                response = request.execute()
-                
-                if response.get('items'):
-                    item = response['items'][0]
-                    caption_field = item['contentDetails'].get('caption', 'false')
-                    has_captions = caption_field == 'true'
-                    
-                    logging.debug(f"Caption check for video {video_id}: {caption_field} -> {has_captions}")
-                    return has_captions
-                else:
-                    logging.warning(f"No video found for caption check: {video_id}")
-                    return None
-                    
-            except Exception as e:
-                logging.error(f"Error checking captions for video {video_id}: {e}")
-                raise
-        
-        try:
-            return self._handle_auth_error_and_retry(_check_captions)
-        except AuthenticationError:
-            logging.error(f"Authentication error checking captions for {video_id}")
-            raise
-        except Exception as e:
-            logging.error(f"YouTube API error checking captions for {video_id}: {e}")
             return None
