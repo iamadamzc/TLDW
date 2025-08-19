@@ -306,10 +306,12 @@ class ProxyManager:
                                 secret_name=self.secret_name, missing_fields=missing_fields)
             return False
         
-        # Validate field values are not empty
-        empty_fields = [field for field in required_fields 
-                       if not secret_data[field] or (isinstance(secret_data[field], str) and not secret_data[field].strip())]
-        
+        # For IP Whitelisting, username/password can be empty.
+        # Only validate that provider, host, and port are not empty.
+        core_fields = ["provider", "host", "port"]
+        empty_fields = [field for field in core_fields
+                       if not secret_data.get(field) or (isinstance(secret_data.get(field), str) and not str(secret_data.get(field)).strip())]
+
         if empty_fields:
             self.logger.log_event("warning", f"Proxy secret has empty fields: {empty_fields}",
                                 secret_name=self.secret_name, empty_fields=empty_fields)
