@@ -235,6 +235,7 @@ class ProxyManager:
     def __init__(self, secret_dict: Optional[Dict] = None, logger=None):
         """Initialize ProxyManager with resilient secret handling"""
         self.logger = SafeStructuredLogger(logger or logging.getLogger(__name__))
+        # Explicitly initialize in_use to False. It will be set to True upon successful secret validation.
         self.in_use = False
         self.secret = None
         self.preflight_cache = PreflightCache()
