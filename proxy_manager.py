@@ -123,7 +123,7 @@ class ProxySecret:
         
     def build_proxy_url(self, session_token: Optional[str] = None) -> str:
         """Build proxy URL with runtime password encoding"""
-        user = self.username
+        user = self.username if session_token is None else self.build_username_with_session(session_token)
         return f"http://{user}:{quote(self.password, safe='')}@{self.host}:{self.port}"
 
 @dataclass
@@ -448,14 +448,18 @@ class ProxyManager:
             raise ProxyConfigError(f"proxy_preflight_unreachable: {last_err}")
         
     def proxies_for(self, video_id: Optional[str] = None) -> Dict[str, str]:
-        """Get proxy config without session logic"""
+        """Get proxy config with unique session"""
         if not self.in_use or self.secret is None:
             self.logger.log_event("debug", "Proxy not available, returning empty config")
             return {}
 
-        # Always use the base proxy URL, ignoring session tokens
-        base_proxy_url = self.secret.build_proxy_url(None)
-        return {"http": base_proxy_url, "https": base_proxy_url}
+        token = self._generate_session_token(video_id)
+        # Ensure we don't reuse blacklisted tokens
+        while token in self.session_blacklist:
+            token = self._generate_session_token(video_id)
+
+        return {"http": self.secret.build_proxy_url(token), 
+                "https": self.secret.build_proxy_url(token)}
         
     def _generate_session_token(self, video_id: Optional[str] = None) -> str:
         """Generate cryptographically secure session token"""
