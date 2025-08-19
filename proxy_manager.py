@@ -278,7 +278,7 @@ class ProxyManager:
             self.logger.log_event("warning", "Proxy secret is empty", secret_name=self.secret_name)
             return False
             
-        required_fields = ["provider", "host", "port", "username", "password", "protocol"]
+        required_fields = ["provider", "host", "port", "username", "password"]
         missing_fields = [field for field in required_fields if field not in secret_data]
         
         if missing_fields:
