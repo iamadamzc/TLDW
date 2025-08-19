@@ -82,15 +82,6 @@ class TranscriptService:
             
             start_time = time.time()
             
-            # Discovery gate implementation - skip transcript scraping if no captions
-            if has_captions is False:
-                logging.info(f"Discovery gate: Video {video_id} has no captions, skipping to ASR")
-                self._log_structured("transcript", video_id, "skip_no_captions", 1, 0, "no_captions", False, "none", correlation_id=correlation_id)
-                transcript = self._transcribe_audio_with_proxy(video_id, correlation_id)
-                if transcript:
-                    self.cache.set(video_id, transcript, language, source="asr", ttl_days=30)
-                return transcript
-            
             # Attempt transcript with fallback chain
             return self._attempt_transcript_chain(video_id, language, start_time, correlation_id)
             
