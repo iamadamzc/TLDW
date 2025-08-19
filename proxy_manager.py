@@ -59,10 +59,17 @@ class ProxySecret:
     @classmethod
     def from_dict(cls, d: Dict) -> 'ProxySecret':
         """Validate and create ProxySecret from dict with diagnostic logging"""
-        req = ["provider", "host", "port", "username", "password"]
-        for k in req:
+        # Core fields that must not be empty
+        core_req = ["provider", "host", "port"]
+        for k in core_req:
             v = d.get(k)
             if v is None or (isinstance(v, str) and not v.strip()):
+                raise ProxyValidationError(f"proxy_secret_missing_{k}")
+
+        # Auth fields that must exist but can be empty for IP whitelisting
+        auth_req = ["username", "password"]
+        for k in auth_req:
+            if d.get(k) is None:
                 raise ProxyValidationError(f"proxy_secret_missing_{k}")
         
         host = str(d["host"])
