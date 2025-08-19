@@ -17,8 +17,8 @@ class TokenManager:
             user: User model instance with access_token and refresh_token
         """
         self.user = user
-        self.client_id = os.environ.get("GOOGLE_CLIENT_ID")
-        self.client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+        self.client_id = os.environ.get("GOOGLE_CLIENT_ID") or os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+        self.client_secret = os.environ.get("GOOGLE_CLIENT_SECRET") or os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
         self.token_uri = "https://oauth2.googleapis.com/token"
         
         if not self.client_id or not self.client_secret:
