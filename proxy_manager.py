@@ -116,7 +116,7 @@ class ProxySecret:
         
     def build_proxy_url(self, session_token: Optional[str] = None) -> str:
         """Build proxy URL with runtime password encoding"""
-        user = self.username if session_token is None else self.build_username_with_session(session_token)
+        user = self.username
         return f"http://{user}:{quote(self.password, safe='')}@{self.host}:{self.port}"
 
 @dataclass
@@ -357,6 +357,12 @@ class ProxyManager:
             
             # Perform actual preflight with enhanced out-of-band validation
             proxies = self.proxies_for(None)
+            
+            # --- ADD THESE TWO LINES FOR DEBUGGING ---
+            full_proxy_user = urlparse(proxies.get("https", "")).username
+            logging.info(f"DIAGNOSTIC_LOG: Full proxy username being sent is: {full_proxy_user}")
+            # -----------------------------------------
+            
             session_token = extract_session_from_proxies(proxies)
             
             # Enhanced: Test with httpbin.org/ip first for pure proxy validation
