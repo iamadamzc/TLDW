@@ -99,13 +99,10 @@ class TranscriptService:
             self._video_locks.pop(video_id, None)
     
     def _attempt_transcript_chain(self, video_id, language, start_time, correlation_id):
-        """Attempt transcript with session rotation on auth failures"""
-        if not self.proxy_manager:
-            return None
-            
-        # Get proxy config with unique session
-        proxies = self.proxy_manager.proxies_for(video_id)
-        session_token = extract_session_from_proxies(proxies)
+        """Attempt transcript with optional proxy; gracefully handle no-proxy mode."""
+        # Use proxies if available; otherwise, operate in no-proxy mode
+        proxies = self.proxy_manager.proxies_for(video_id) if self.proxy_manager else {}
+        session_token = extract_session_from_proxies(proxies) if proxies else "none"
         
         try:
             # Try transcript API first
@@ -114,36 +111,32 @@ class TranscriptService:
                 self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
                 return transcript_text
         except requests.HTTPError as e:
-            if e.response.status_code in BLOCK_STATUSES:
-                # Rotate session on auth/blocking failure
+            if e.response.status_code in BLOCK_STATUSES and proxies and self.proxy_manager:
+                # Rotate session on auth/blocking failure (only if we actually have a proxy)
                 self.proxy_manager.rotate_session(session_token)
                 self._log_structured("transcript", video_id, "blocked_rotating_session", 1, 0, "transcript_api", False, session_token,
                                    status_code=e.response.status_code, correlation_id=correlation_id)
-                
-                # ENHANCED: Re-preflight the new session before proceeding
+                # Re-preflight the new session before proceeding
                 try:
                     if not self.proxy_manager.preflight():
                         self._log_structured("transcript", video_id, "rotated_session_still_unhealthy", 1, 0, "preflight", False, "rotated",
                                            correlation_id=correlation_id)
-                        return error_response('PROXY_AUTH_FAILED', correlation_id, "Session rotation failed - proxy still unhealthy")
+                    else:
+                        # Preflight passed - proceed with fresh session
+                        fresh_proxies = self.proxy_manager.proxies_for(video_id)
+                        try:
+                            transcript_text = self._get_transcript_api(video_id, fresh_proxies, language, start_time, correlation_id)
+                            if transcript_text:
+                                self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
+                                return transcript_text
+                        except Exception:
+                            pass  # Fall through to ASR
                 except (ProxyAuthError, ProxyConfigError) as preflight_error:
                     self._log_structured("transcript", video_id, "rotated_session_preflight_failed", 1, 0, "preflight", False, "rotated",
                                        reason=str(preflight_error), correlation_id=correlation_id)
-                    return error_response('PROXY_AUTH_FAILED', correlation_id, f"Rotated session preflight failed: {preflight_error}")
-                
-                # Preflight passed - proceed with fresh session
-                fresh_proxies = self.proxy_manager.proxies_for(video_id)
-                try:
-                    transcript_text = self._get_transcript_api(video_id, fresh_proxies, language, start_time, correlation_id)
-                    if transcript_text:
-                        self.cache.set(video_id, transcript_text, language, source="transcript_api", ttl_days=7)
-                        return transcript_text
-                except Exception:
-                    # Even after successful rotation + preflight, transcript still failed
-                    # This suggests the issue is not proxy auth but something else (blocking, etc.)
-                    pass  # Fall through to ASR
+                    # Fall through to ASR
             
-        # Fall back to ASR
+        # Fall back to ASR (works in both proxy and no-proxy modes)
         logging.info(f"Falling back to ASR for video {video_id}")
         transcript = self._transcribe_audio_with_proxy(video_id, correlation_id)
         if transcript:
@@ -495,6 +488,27 @@ class TranscriptService:
                 video_url, ua, proxy_url, ffmpeg_path, _log_adapter, cookiefile=cookiefile, user_id=user_id
             )
             
+            # --- NEW: validate audio before sending to Deepgram ---
+            if not audio_path:
+                latency_ms = int((time.time() - start_time) * 1000)
+                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_no_audio", user_agent_applied, session_id, cookies_used_flag)
+                return {'status': 'neterr', 'attempt': attempt, 'transcript_text': None}
+
+            try:
+                size_bytes = os.path.getsize(audio_path)
+            except Exception:
+                size_bytes = -1
+            logging.info(f"ASR input ready: file={audio_path} size={size_bytes}")
+            if size_bytes is None or size_bytes < 32000:  # ~32 KB guard
+                latency_ms = int((time.time() - start_time) * 1000)
+                self._log_structured("ytdlp", video_id, "neterr", attempt, latency_ms, "asr_too_small", user_agent_applied, session_id, cookies_used_flag)
+                try:
+                    os.unlink(audio_path)
+                except Exception:
+                    pass
+                return {'status': 'neterr', 'attempt': attempt, 'transcript_text': None}
+            # --- end NEW ---
+
             # Send to Deepgram for transcription
             transcript_text = self._send_to_deepgram(audio_path)
             
@@ -505,6 +519,8 @@ class TranscriptService:
                 pass
             
             if transcript_text:
+                # Preview first 120 chars so we can see if we're getting words
+                logging.info("Deepgram text preview: %s", transcript_text[:120].replace("\n", " "))
                 logging.info(f"ASR transcription successful for {video_id} (attempt {attempt})")
                 return {
                     'status': last_status['status'],
