@@ -278,13 +278,28 @@ def summarize_videos():
                 # Get transcript with caption information for MVP optimization
                 has_captions = video_details.get('has_captions', None)
                 transcript = transcript_service.get_transcript(video_id, has_captions=has_captions)
-                if not transcript:
-                    logging.warning(f"Could not get transcript for video {video_id}")
+
+                # Defensive normalization for transcript
+                def _to_text(value):
+                    if value is None:
+                        return ""
+                    if isinstance(value, tuple):
+                        # Assume (text, *rest)
+                        return value[0] if value and isinstance(value[0], str) else ""
+                    return str(value)
+
+                transcript_text = _to_text(transcript)
+                if not transcript_text.strip():
+                    logging.warning(f"Empty transcript for video {video_id} after ASR/captions.")
                     continue
+
+                # Enhanced logging for transcript type and length
+                logging.info("Summarizing with transcript type=%s len=%s",
+                             type(transcript_text).__name__, len(transcript_text))
                 
                 # Generate summary
                 try:
-                    summary = summarizer.summarize_video(transcript, video_id)
+                    summary = summarizer.summarize_video(transcript_text, video_id)
                     if not summary:
                         logging.warning(f"Could not generate summary for video {video_id}")
                         continue
