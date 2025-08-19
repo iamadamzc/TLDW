@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "transaction_key": "deprecated",
+    "request_id": "test-request-id-12345",
+    "sha256": "test-sha256-hash",
+    "created": "2024-01-15T10:30:00.000Z",
+    "duration": 13.5,
+    "channels": 1,
+    "models": ["nova"]
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "This is a test audio file for ASR testing. The content should be transcribed accurately by the Deepgram service. This fixture allows us to test the complete pipeline without making real API calls.",
+            "confidence": 0.95,
+            "words": [
+              {"word": "this", "start": 0.0, "end": 0.2, "confidence": 0.98},
+              {"word": "is", "start": 0.2, "end": 0.3, "confidence": 0.99},
+              {"word": "a", "start": 0.3, "end": 0.4, "confidence": 0.97},
+              {"word": "test", "start": 0.4, "end": 0.7, "confidence": 0.96}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

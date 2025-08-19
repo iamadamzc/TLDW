@@ -389,8 +389,8 @@ class TestTranscriptYtdlpSmoke(unittest.TestCase):
         """Test that Google OAuth environment variables are consistent"""
         # Test that google_auth.py expects the right variables
         test_env = {
-            'GOOGLE_OAUTH_CLIENT_ID': 'test-client-id',
-            'GOOGLE_OAUTH_CLIENT_SECRET': 'test-client-secret'
+            'GOOGLE_CLIENT_ID': 'test-client-id',
+            'GOOGLE_CLIENT_SECRET': 'test-client-secret'
         }
         
         for key, value in test_env.items():
@@ -398,8 +398,8 @@ class TestTranscriptYtdlpSmoke(unittest.TestCase):
         
         try:
             # Test environment variable reading
-            client_id = os.environ.get('GOOGLE_OAUTH_CLIENT_ID')
-            client_secret = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET')
+            client_id = os.environ.get('GOOGLE_CLIENT_ID')
+            client_secret = os.environ.get('GOOGLE_CLIENT_SECRET')
             
             self.assertEqual(client_id, 'test-client-id')
             self.assertEqual(client_secret, 'test-client-secret')
@@ -430,9 +430,9 @@ class TestCIIntegration(unittest.TestCase):
                     content = f.read()
                     
                     # Should use GOOGLE_OAUTH_CLIENT_*
-                    if 'GOOGLE_OAUTH_CLIENT_ID' in content or 'GOOGLE_OAUTH_CLIENT_SECRET' in content:
-                        self.assertIn('GOOGLE_OAUTH_CLIENT_ID', content)
-                        self.assertIn('GOOGLE_OAUTH_CLIENT_SECRET', content)
+                    if 'GOOGLE_CLIENT_ID' in content or 'GOOGLE_CLIENT_SECRET' in content:
+                        self.assertIn('GOOGLE_CLIENT_ID', content)
+                        self.assertIn('GOOGLE_CLIENT_SECRET', content)
                     
                     # Should NOT use GOOGLE_CLIENT_*
                     self.assertNotIn('GOOGLE_CLIENT_ID":', content)

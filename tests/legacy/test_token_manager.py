@@ -21,8 +21,8 @@ class TestTokenManager(unittest.TestCase):
         
         # Mock environment variables
         self.env_patcher = patch.dict(os.environ, {
-            'GOOGLE_OAUTH_CLIENT_ID': 'test_client_id',
-            'GOOGLE_OAUTH_CLIENT_SECRET': 'test_client_secret'
+            'GOOGLE_CLIENT_ID': 'test_client_id',
+            'GOOGLE_CLIENT_SECRET': 'test_client_secret'
         })
         self.env_patcher.start()
         

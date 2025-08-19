@@ -13,30 +13,22 @@ from proxy_http import ProxyHTTPClient, YouTubeBlockingError
 from transcript_cache import TranscriptCache
 from user_agent_manager import UserAgentManager
 from yt_download_helper import download_audio_with_retry
+from shared_managers import shared_managers
 
 class TranscriptService:
-    def __init__(self):
+    def __init__(self, use_shared_managers: bool = True):
         self.deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
         
-        # Initialize new ProxyManager with strict validation
-        try:
-            self.proxy_manager = self._create_proxy_manager()
-        except Exception as e:
-            logging.error(f"Failed to initialize ProxyManager: {e}")
-            self.proxy_manager = None
+        # Use shared manager instances to eliminate duplication
+        self.proxy_manager = shared_managers.get_proxy_manager()
+        self.http_client = shared_managers.get_proxy_http_client()
+        self.user_agent_manager = shared_managers.get_user_agent_manager()
         
-        self.http_client = ProxyHTTPClient(self.proxy_manager) if self.proxy_manager else None
+        # Log successful initialization
+        logging.info("TranscriptService initialized with shared managers")
+        
         self.cache = TranscriptCache(default_ttl_days=7)  # MVP: 7-day cache
         self._video_locks = {}  # Idempotency guard: in-memory lock per video_id
-        
-        # Initialize UserAgentManager with error handling
-        try:
-            self.user_agent_manager = UserAgentManager()
-            logging.info("UserAgentManager initialized successfully")
-        except Exception as e:
-            logging.error(f"Failed to initialize UserAgentManager: {e}")
-            # Create a fallback manager that returns empty headers
-            self.user_agent_manager = None
         
         # Allow route layer to set current user id directly if desired
         self.current_user_id: Optional[int] = None
@@ -48,34 +40,7 @@ class TranscriptService:
         self._last_download_used_cookies = False
         self._last_download_client = "unknown"
     
-    def _create_proxy_manager(self):
-        """Create ProxyManager with loaded secret and validation"""
-        # Load secret from environment
-        raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
-        if not raw_config:
-            raise ValueError("OXYLABS_PROXY_CONFIG environment variable is empty")
-        
-        # Parse JSON secret
-        secret_data = json.loads(raw_config)
-        
-        # Diagnostic logging to prove secret is RAW
-        username = secret_data.get('username', '')
-        password = secret_data.get('password', '')
-        masked_username = username[:4] + "***" + username[-2:] if len(username) > 6 else username[:2] + "***"
-        
-        # Quick pre-encoding check before ProxyManager validation
-        has_encoded_chars = '%2B' in password or '%25' in password or '%21' in password or '%40' in password
-        
-        logging.info(f"🔍 TranscriptService: Loading proxy secret for username={masked_username}")
-        logging.info(f"🔍 Secret pre-encoding check: has_encoded_chars={has_encoded_chars}")
-        
-        if has_encoded_chars:
-            logging.error(f"❌ CRITICAL: Proxy secret appears to be URL-encoded!")
-            logging.error(f"💡 Fix RuntimeEnvironmentSecrets in AWS to use RAW password (with + literally)")
-            logging.error(f"🚨 This WILL cause 407 errors - stop and fix secret before proceeding")
-        
-        logger = logging.getLogger(__name__)
-        return ProxyManager(secret_data, logger)
+
 
     def get_transcript(self, video_id, has_captions=None, language="en"):
         """
@@ -557,8 +522,12 @@ class TranscriptService:
                 
         except RuntimeError as e:
             # Helper failed - check for bot detection in error message
-            error_msg = str(e).lower()
+            original_error = str(e)
+            error_msg = original_error.lower()
             latency_ms = int((time.time() - start_time) * 1000)
+            
+            # Normalize error for logging (preserves original but sanitizes for logs)
+            normalized_error = self._normalize_error_for_logging(original_error, video_id)
             
             if '407' in error_msg or 'proxy authentication' in error_msg:
                 # 407 errors: fail fast and rotate proxy
@@ -570,7 +539,7 @@ class TranscriptService:
                 
                 logging.warning(f"407 Proxy Authentication Required in yt-dlp for {video_id}")
                 
-            elif self._detect_bot_check(error_msg):
+            elif self._detect_bot_check(original_error):  # Use original error for detection
                 status = "bot_check"
                 
                 # Track cookie staleness if cookies were used
@@ -584,7 +553,8 @@ class TranscriptService:
             else:
                 status = "yt_both_steps_fail"
             
-            logging.error(f"Error in yt-dlp download for {video_id} (attempt {attempt}): {e}")
+            # Log the normalized error (capped and sanitized)
+            logging.error(f"Error in yt-dlp download for {video_id} (attempt {attempt}): {normalized_error}")
             self._log_structured("ytdlp", video_id, status, attempt, latency_ms, "asr_error", user_agent_applied, session_id, cookies_used_flag)
             
             return {
@@ -614,12 +584,15 @@ class TranscriptService:
     
     def _detect_bot_check(self, text):
         """
-        Detect bot-check patterns in yt-dlp output/errors (case-insensitive)
+        Detect bot-check patterns in yt-dlp output/errors (case-insensitive).
+        Enhanced to handle combined error messages from both download steps.
         """
         if not text:
             return False
         
         text_lower = text.lower()
+        
+        # Enhanced bot check patterns for better detection
         bot_check_patterns = [
             'sign in to confirm you\'re not a bot',
             'sign in to confirm youre not a bot',
@@ -628,10 +601,45 @@ class TranscriptService:
             'not a bot',
             'unusual traffic',
             'automated requests',
-            'captcha'
+            'captcha',
+            'bot detection',
+            'verify you are human',
+            'please complete the security check',
+            'suspicious activity',
+            'too many requests'
         ]
         
+        # Check if any pattern is found in the text (handles combined messages)
         return any(pattern in text_lower for pattern in bot_check_patterns)
+    
+    def _normalize_error_for_logging(self, error_message: str, video_id: str) -> str:
+        """
+        Create normalized error string for structured logging.
+        Caps length and sanitizes sensitive information.
+        """
+        MAX_LOG_LENGTH = 10000  # 10k chars max for App Runner logs
+        
+        if not error_message:
+            return "unknown_error"
+        
+        # Remove sensitive information (URLs, file paths, etc.)
+        normalized = str(error_message)
+        
+        # Replace potential sensitive patterns
+        import re
+        # Remove proxy URLs first (more specific pattern)
+        normalized = re.sub(r'http://[^@\s]+@[^/\s]+', '[proxy_url]', normalized)
+        # Remove file paths
+        normalized = re.sub(r'/[^\s]+\.(m4a|mp3|tmp)', '[audio_file]', normalized)
+        # Remove URLs (keep domain for debugging)
+        normalized = re.sub(r'https?://[^\s]+', '[url]', normalized)
+        
+        # Cap the length
+        if len(normalized) > MAX_LOG_LENGTH:
+            truncated_length = MAX_LOG_LENGTH - 50
+            normalized = normalized[:truncated_length] + "... [truncated: log too long]"
+        
+        return normalized
     
     def _handle_env_proxy_collision(self):
         """Check and warn about HTTP_PROXY/HTTPS_PROXY conflicts"""

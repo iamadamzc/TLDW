@@ -1,0 +1,12 @@
+{
+  "video_id": "test_fixture_with_captions",
+  "language": "en",
+  "captions": [
+    {"text": "Welcome to this test video.", "start": 0.0, "duration": 2.5},
+    {"text": "This is a sample transcript for testing purposes.", "start": 2.5, "duration": 3.0},
+    {"text": "It contains multiple segments to simulate real captions.", "start": 5.5, "duration": 3.2},
+    {"text": "The transcript should be properly parsed and returned.", "start": 8.7, "duration": 2.8},
+    {"text": "Thank you for watching this test fixture.", "start": 11.5, "duration": 2.0}
+  ],
+  "full_transcript": "Welcome to this test video. This is a sample transcript for testing purposes. It contains multiple segments to simulate real captions. The transcript should be properly parsed and returned. Thank you for watching this test fixture."
+}

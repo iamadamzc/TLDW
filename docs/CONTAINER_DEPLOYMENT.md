@@ -169,8 +169,8 @@ After deployment:
 The container requires these environment variables (configured in App Runner):
 
 - `SESSION_SECRET`
-- `GOOGLE_OAUTH_CLIENT_ID`
-- `GOOGLE_OAUTH_CLIENT_SECRET`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
 - `OPENAI_API_KEY`
 - `RESEND_API_KEY`
 - `DEEPGRAM_API_KEY`

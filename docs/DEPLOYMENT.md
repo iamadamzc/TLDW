@@ -55,8 +55,8 @@ In the App Runner service configuration, add these environment variables:
 
 ```
 SESSION_SECRET=your-super-secret-session-key-here
-GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id
-GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
+GOOGLE_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
 OPENAI_API_KEY=your-openai-api-key
 DATABASE_URL=your-postgresql-database-url
 RESEND_API_KEY=your-resend-api-key
@@ -173,8 +173,8 @@ Set these in your Vercel dashboard under Project Settings > Environment Variable
 ### Required Variables
 ```
 SESSION_SECRET=your-super-secret-session-key-here
-GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id
-GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
+GOOGLE_CLIENT_ID=your-google-oauth-client-id
+GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
 OPENAI_API_KEY=your-openai-api-key
 DATABASE_URL=your-postgresql-database-url
 RESEND_API_KEY=your-resend-api-key

@@ -71,8 +71,8 @@ The container automatically sets:
 
 App Runner secrets (configured via console or CLI):
 - `SESSION_SECRET`
-- `GOOGLE_OAUTH_CLIENT_ID`
-- `GOOGLE_OAUTH_CLIENT_SECRET`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
 - `OPENAI_API_KEY`
 - `RESEND_API_KEY`
 - `DEEPGRAM_API_KEY`

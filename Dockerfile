@@ -12,17 +12,25 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Optional: Auto-update yt-dlp at build time for latest extractors
-# Set YT_DLP_AUTO_UPDATE=true during build to enable
-ARG YT_DLP_AUTO_UPDATE=false
+# Enhanced yt-dlp version management with pinned default
+ARG YTDLP_VERSION=2025.8.11
 ARG CACHE_BUSTER
-RUN if [ "$YT_DLP_AUTO_UPDATE" = "true" ]; then \
+
+# Install yt-dlp with flexible version control
+RUN if [ "$YTDLP_VERSION" = "latest" ]; then \
         echo "Cache Buster: $CACHE_BUSTER" && \
-        echo "Auto-updating yt-dlp to latest version..." && \
+        echo "Installing latest yt-dlp version..." && \
         pip install --no-cache-dir -U yt-dlp; \
     else \
-        echo "Using yt-dlp version from requirements.txt"; \
+        echo "Installing pinned yt-dlp version: $YTDLP_VERSION" && \
+        pip install --no-cache-dir yt-dlp=="$YTDLP_VERSION"; \
     fi
+
+# Log installed yt-dlp version for debugging and health checks
+RUN python -c "import yt_dlp; print('yt-dlp version:', yt_dlp.version.__version__)"
+
+# Verify FFmpeg is available during build
+RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"
 
 # Copy application code
 COPY . .

@@ -9,8 +9,20 @@ from flask_login import login_required, login_user, logout_user
 from models import User
 from oauthlib.oauth2 import WebApplicationClient
 
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "your-client-id")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "your-client-secret")
+# Standardized Google OAuth environment variable names with backwards compatibility
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID") or os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "your-client-id")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET") or os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "your-client-secret")
+
+# Log which variables are being used for debugging
+if os.environ.get("GOOGLE_CLIENT_ID"):
+    logging.info("Using standardized GOOGLE_CLIENT_ID environment variable")
+elif os.environ.get("GOOGLE_OAUTH_CLIENT_ID"):
+    logging.warning("Using legacy GOOGLE_OAUTH_CLIENT_ID. Consider migrating to GOOGLE_CLIENT_ID")
+
+if os.environ.get("GOOGLE_CLIENT_SECRET"):
+    logging.info("Using standardized GOOGLE_CLIENT_SECRET environment variable")
+elif os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET"):
+    logging.warning("Using legacy GOOGLE_OAUTH_CLIENT_SECRET. Consider migrating to GOOGLE_CLIENT_SECRET")
 GOOGLE_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration"
 
 # Make sure to use this redirect URL. It has to match the one in the whitelist

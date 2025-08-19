@@ -93,6 +93,36 @@ def _check_dependencies():
     
     return dependencies
 
+def update_download_metadata(used_cookies=False, client_used="unknown"):
+    """Update last download metadata for health endpoint exposure"""
+    from datetime import datetime
+    
+    if hasattr(app, 'last_download_meta'):
+        app.last_download_meta.update({
+            "used_cookies": used_cookies,
+            "client_used": client_used,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    # Also update the comprehensive download attempt tracker
+    try:
+        from download_attempt_tracker import get_global_tracker
+        tracker = get_global_tracker()
+        # This is called on success, so we track a successful attempt
+        tracker.create_attempt(
+            video_id="health_update",  # Placeholder for health updates
+            success=True,
+            cookies_used=used_cookies,
+            client_used=client_used,
+            proxy_used=False  # We don't have proxy info in this context
+        )
+    except ImportError:
+        # download_attempt_tracker not available, skip enhanced tracking
+        pass
+    except Exception:
+        # Don't fail on tracking errors
+        pass
+
 def _log_startup_dependencies():
     """Log dependency status on application startup for fast failure detection"""
     import shutil
@@ -153,6 +183,13 @@ with app.app_context():
     # Import models to ensure tables are created
     import models  # noqa: F401
     db.create_all()
+    
+    # Initialize download metadata tracking
+    app.last_download_meta = {
+        "used_cookies": False,
+        "client_used": "unknown",
+        "timestamp": None
+    }
     
     # Log dependency status on startup
     _log_startup_dependencies()
@@ -229,19 +266,93 @@ def health_ready():
             "reason": str(e)
         }), 503, {"Retry-After": "30"}
 
-# Add health check endpoints for App Runner
+# Enhanced health check endpoints with gated diagnostics
 @app.route('/healthz')
 def health_check_apprunner():
-    """Lightweight health check for App Runner deployment - no expensive operations"""
+    """Enhanced health check with gated diagnostics for App Runner deployment"""
     from datetime import datetime
+    import os
     
-    # Simple liveness check - if Flask is responding, we're healthy
-    return {
-        'status': 'healthy',
-        'message': 'TL;DW API is running',
-        'timestamp': datetime.utcnow().isoformat(),
-        'deployment_mode': 'apprunner'
-    }, 200
+    # Basic health check always available
+    basic_health = {"status": "healthy"}
+    
+    # Detailed diagnostics only when explicitly enabled (default off for security)
+    if os.getenv('EXPOSE_HEALTH_DIAGNOSTICS', 'false').lower() == 'true':
+        try:
+            import yt_dlp
+            yt_dlp_version = yt_dlp.version.__version__
+        except:
+            yt_dlp_version = "unknown"
+        
+        # Check ffmpeg availability (boolean only, no path exposure)
+        ffmpeg_available = os.path.exists("/usr/bin/ffmpeg")
+        
+        # Get proxy status from ProxyManager if available
+        proxy_in_use = False
+        try:
+            import json
+            from proxy_manager import ProxyManager
+            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
+            if raw_config:
+                secret_data = json.loads(raw_config)
+                proxy_manager = ProxyManager(secret_data, logging.getLogger(__name__))
+                proxy_in_use = proxy_manager.in_use
+        except:
+            proxy_in_use = False
+        
+        # Get last download metadata (without sensitive data)
+        last_download_meta = getattr(app, 'last_download_meta', {})
+        
+        # Get comprehensive download attempt metadata
+        download_attempt_meta = {}
+        try:
+            from download_attempt_tracker import get_download_health_metadata
+            download_attempt_meta = get_download_health_metadata()
+        except ImportError:
+            # download_attempt_tracker not available
+            pass
+        except Exception:
+            # Don't fail health check on tracking errors
+            pass
+        
+        basic_health.update({
+            "yt_dlp_version": yt_dlp_version,
+            "ffmpeg_available": ffmpeg_available,
+            "proxy_in_use": proxy_in_use,
+            "last_download_used_cookies": last_download_meta.get("used_cookies", False),
+            "last_download_client": last_download_meta.get("client_used", "unknown"),
+            "download_attempts": download_attempt_meta,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    return basic_health, 200
+
+@app.route('/health/yt-dlp')
+def yt_dlp_health():
+    """Specific yt-dlp diagnostics endpoint"""
+    try:
+        import yt_dlp
+        
+        # Get proxy status
+        proxy_in_use = False
+        try:
+            import json
+            from proxy_manager import ProxyManager
+            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
+            if raw_config:
+                secret_data = json.loads(raw_config)
+                proxy_manager = ProxyManager(secret_data, logging.getLogger(__name__))
+                proxy_in_use = proxy_manager.in_use
+        except:
+            proxy_in_use = False
+        
+        return {
+            "version": yt_dlp.version.__version__,
+            "proxy_in_use": proxy_in_use,
+            "status": "available"
+        }, 200
+    except Exception as e:
+        return {"status": "error", "error": str(e)}, 500
 
 @app.route('/health')
 def health_check_detailed():

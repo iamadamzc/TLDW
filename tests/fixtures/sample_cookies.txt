@@ -1,0 +1,10 @@
+# Netscape HTTP Cookie File
+# This is a mock cookie file for testing purposes
+# Do not use real cookies in test fixtures
+
+.youtube.com	TRUE	/	FALSE	1735689600	session_token	mock_session_token_12345
+.youtube.com	TRUE	/	TRUE	1735689600	VISITOR_INFO1_LIVE	mock_visitor_info_67890
+.youtube.com	TRUE	/	FALSE	1735689600	YSC	mock_ysc_token_abcdef
+.youtube.com	TRUE	/	TRUE	1735689600	PREF	mock_preferences_settings
+.youtube.com	TRUE	/	FALSE	1735689600	GPS	1
+youtube.com	FALSE	/	FALSE	1735689600	CONSENT	YES+cb.20240115-10-p0.en+FX+123

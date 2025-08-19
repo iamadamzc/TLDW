@@ -497,8 +497,8 @@ else
           {"Name": "OXYLABS_PROXY_CONFIG", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:tldw-oxylabs-proxy-config-mkbzlM"},
           {"Name": "RESEND_API_KEY", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-RESEND-API-KEY-5O5Kdx"},
           {"Name": "OPENAI_API_KEY", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-OPENAI-API-KEY-5rNo6a"},
-          {"Name": "GOOGLE_OAUTH_CLIENT_SECRET", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI"},
-          {"Name": "GOOGLE_OAUTH_CLIENT_ID", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN"},
+          {"Name": "GOOGLE_CLIENT_SECRET", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI"},
+          {"Name": "GOOGLE_CLIENT_ID", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN"},
           {"Name": "SESSION_SECRET", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-SESSION-SECRET-hJDTQ1"},
           {"Name": "DEEPGRAM_API_KEY", "Value": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv"}
         ]

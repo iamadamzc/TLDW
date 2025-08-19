@@ -231,18 +231,71 @@ class SafeStructuredLogger:
         return result
 
 class ProxyManager:
-    def __init__(self, secret_dict: Dict, logger):
-        self.logger = SafeStructuredLogger(logger)  # Wrap logger for safety
-        self.secret = ProxySecret.from_dict(secret_dict)
+    def __init__(self, secret_dict: Optional[Dict] = None, logger=None):
+        """Initialize ProxyManager with resilient secret handling"""
+        self.logger = SafeStructuredLogger(logger or logging.getLogger(__name__))
+        self.in_use = False
+        self.secret = None
         self.preflight_cache = PreflightCache()
         self.session_blacklist = BoundedBlacklist(max_size=1000, ttl=3600)
-        self._preflight_lock = threading.Lock()  # Single-flight guard
+        self._preflight_lock = threading.Lock()
         self._preflight_count = 0
         self._preflight_window_start = time.time()
-        self._healthy: Optional[bool] = None  # Track for /health/ready
+        self._healthy: Optional[bool] = None
+        
+        # Get secret name from environment variable for logging
+        self.secret_name = os.getenv('PROXY_SECRET_NAME', 'proxy-secret')
         
         # Optional: allow disabling preflight for local dev
         self.preflight_disabled = os.getenv("OXY_PREFLIGHT_DISABLED", "false").lower() == "true"
+        
+        # Initialize proxy configuration with graceful error handling
+        try:
+            if secret_dict is None:
+                secret_dict = self._fetch_secret()
+            
+            if self._validate_secret_schema(secret_dict):
+                self.secret = ProxySecret.from_dict(secret_dict)
+                self.in_use = True
+                self.logger.log_event("info", f"ProxyManager initialized successfully", 
+                                    secret_name=self.secret_name, provider=self.secret.provider)
+            else:
+                self.logger.log_event("warning", "Invalid proxy secret schema, continuing without proxies",
+                                    secret_name=self.secret_name)
+        except Exception as e:
+            self.logger.log_event("error", f"Proxy initialization failed: {e}, continuing without proxies",
+                                secret_name=self.secret_name, error_type=type(e).__name__)
+    
+    def _fetch_secret(self) -> Dict:
+        """Fetch secret from AWS Secrets Manager - placeholder for actual implementation"""
+        # This would normally fetch from AWS Secrets Manager
+        # For now, return empty dict to trigger graceful degradation
+        return {}
+    
+    def _validate_secret_schema(self, secret_data: Dict) -> bool:
+        """Validate that secret contains all required fields"""
+        if not secret_data:
+            self.logger.log_event("warning", "Proxy secret is empty", secret_name=self.secret_name)
+            return False
+            
+        required_fields = ["provider", "host", "port", "username", "password", "protocol"]
+        missing_fields = [field for field in required_fields if field not in secret_data]
+        
+        if missing_fields:
+            self.logger.log_event("warning", f"Proxy secret missing required fields: {missing_fields}",
+                                secret_name=self.secret_name, missing_fields=missing_fields)
+            return False
+        
+        # Validate field values are not empty
+        empty_fields = [field for field in required_fields 
+                       if not secret_data[field] or (isinstance(secret_data[field], str) and not secret_data[field].strip())]
+        
+        if empty_fields:
+            self.logger.log_event("warning", f"Proxy secret has empty fields: {empty_fields}",
+                                secret_name=self.secret_name, empty_fields=empty_fields)
+            return False
+            
+        return True
         
     @property
     def healthy(self) -> Optional[bool]:
@@ -254,6 +307,11 @@ class ProxyManager:
         
     def preflight(self, timeout: float = 5.0) -> bool:
         """Perform cached preflight check with stampede control"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("info", "Proxy not in use, skipping preflight")
+            self._healthy = False
+            return False
+            
         if self.preflight_disabled:
             self.logger.log_event("info", "Proxy preflight disabled via OXY_PREFLIGHT_DISABLED")
             self._healthy = True
@@ -356,6 +414,10 @@ class ProxyManager:
         
     def proxies_for(self, video_id: Optional[str] = None) -> Dict[str, str]:
         """Get proxy config with unique session"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available, returning empty config")
+            return {}
+            
         token = self._generate_session_token(video_id)
         # Ensure we don't reuse blacklisted tokens
         while token in self.session_blacklist:
@@ -375,6 +437,10 @@ class ProxyManager:
         
     def rotate_session(self, failed_token: str):
         """Blacklist failed session and force new token"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not in use, skipping session rotation")
+            return
+            
         # Only log last 4 chars to prevent token leakage
         self.logger.log_event("info", f"Blacklisting session: ...{failed_token[-4:]}")
         self.session_blacklist.add(failed_token)

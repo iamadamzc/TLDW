@@ -26,6 +26,46 @@ def _mk_base_tmp() -> str:
         return tf.name
 
 
+def _track_download_metadata(cookies_used: bool, client_used: str, proxy_used: bool):
+    """
+    Track download attempt metadata for health endpoint exposure.
+    Updates global app state without exposing sensitive data.
+    """
+    try:
+        # Import here to avoid circular imports
+        from app import update_download_metadata
+        update_download_metadata(used_cookies=cookies_used, client_used=client_used)
+    except ImportError:
+        # App not available (e.g., in tests), skip tracking
+        pass
+    except Exception:
+        # Don't fail downloads due to metadata tracking issues
+        pass
+
+
+def _combine_error_messages(step1_error: Optional[str], step2_error: Optional[str]) -> str:
+    """
+    Combine step1 and step2 error messages with proper separator.
+    Cap the result to avoid jumbo log lines in App Runner.
+    """
+    MAX_ERROR_LENGTH = 10000  # 10k chars max to avoid jumbo lines
+    
+    if not step1_error and not step2_error:
+        return "Unknown download error"
+    
+    if step1_error and step2_error:
+        combined = f"{step1_error.strip()} || {step2_error.strip()}"
+    else:
+        combined = (step1_error or step2_error or "").strip()
+    
+    # Cap the error message length
+    if len(combined) > MAX_ERROR_LENGTH:
+        truncated_length = MAX_ERROR_LENGTH - 50  # Leave room for truncation message
+        combined = combined[:truncated_length] + "... [truncated: error too long]"
+    
+    return combined
+
+
 def _extract_proxy_username(proxy_url: str) -> str:
     """
     Extract proxy username from proxy URL for logging (no password, no host).
@@ -139,36 +179,51 @@ def download_audio_with_fallback(
     """
     log = (logger or (lambda m: None))
 
-    # Enhanced headers for better bot detection avoidance
+    # Enhanced headers for better bot detection avoidance (Task 3 requirement)
     common_headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": ua,  # Use provided User-Agent for consistency
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8,fr;q=0.7",  # Enhanced language preferences
         "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Site": "same-origin",  # More realistic for YouTube requests
         "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
         "Upgrade-Insecure-Requests": "1",
+        "DNT": "1",  # Do Not Track header
     }
     
-    # Base configuration with hardening options
+    # Enhanced base configuration with multi-client support and network resilience
     base_opts = {
         "proxy": proxy_url or None,
         "http_headers": common_headers,
         "noplaylist": True,
-        "retries": 2,
-        "fragment_retries": 2,
+        # Network resilience settings (Task 3 requirement)
+        "retries": 2,  # Retry failed downloads up to 2 times
+        "fragment_retries": 2,  # Retry failed fragments up to 2 times
+        "socket_timeout": 10,  # 10 second socket timeout for network resilience
+        "nocheckcertificate": True,  # Bypass certificate issues for network resilience
+        # Multi-client configuration for maximum compatibility (Task 3 requirement)
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web", "web_safari"]  # Multiple clients to avoid JSONDecodeError
+            }
+        },
+        # Additional hardening options
         "concurrent_fragment_downloads": 1,  # Reduce detection risk
         "nopart": True,  # avoid leaving .part files around
-        "socket_timeout": 15,
         "geo_bypass": False,  # Avoid suspicious behavior patterns
         "ffmpeg_location": ffmpeg_path,
         "forceipv4": True,  # Some pools/targets behave better over IPv4
         "http_chunk_size": 10485760,  # 10 MB chunks
         "ratelimit": 100000,  # ~100 KB/s intentional rate limiting
-        "extractor_args": {"youtube": {"player_client": ["web"]}},  # Stable web client only
         "restrictfilenames": True,  # Avoid surprise characters in temp names
         # Let service logs show details; don't silence warnings entirely
         "quiet": False,
@@ -186,6 +241,12 @@ def download_audio_with_fallback(
         logging.info(f"yt_dlp.proxy.in_use=true proxy_username={proxy_username}")
     else:
         logging.info("yt_dlp.proxy.in_use=false")
+    
+    # Determine which client will be used (first in the list)
+    extractor_args = base_opts.get("extractor_args", {})
+    youtube_args = extractor_args.get("youtube", {})
+    player_clients = youtube_args.get("player_client", ["unknown"])
+    primary_client = player_clients[0] if player_clients else "unknown"
 
     # ---------- STEP 1: direct audio (m4a preferred) ----------
     base = _mk_base_tmp()
@@ -223,6 +284,14 @@ def download_audio_with_fallback(
                     except OSError:
                         size = -1
                     log(f"yt_step1_ok path={path1} size={size}")
+                    
+                    # Track successful download metadata
+                    _track_download_metadata(
+                        cookies_used=bool(validated_cookiefile),
+                        client_used=primary_client,
+                        proxy_used=bool(proxy_url)
+                    )
+                    
                     return os.path.abspath(path1)
                 else:
                     log(f"yt_step1_finished_missing path={path1} (not found on disk)")
@@ -271,6 +340,14 @@ def download_audio_with_fallback(
                     except OSError:
                         size2 = -1
                     log(f"yt_step1_fail_step2_ok path={path2} size={size2}")
+                    
+                    # Track successful download metadata (step2 success)
+                    _track_download_metadata(
+                        cookies_used=bool(validated_cookiefile),
+                        client_used=primary_client,
+                        proxy_used=bool(proxy_url)
+                    )
+                    
                     return os.path.abspath(path2)
                 else:
                     log(f"yt_step2_finished_missing path={path2} (not found on disk)")
@@ -279,13 +356,13 @@ def download_audio_with_fallback(
         except DownloadError as e:
             log(f"yt_step2_download_error err={e}")
             # Both attempts failed — raise with both messages for upstream detection
-            combined = (err_step1 or "").strip()
-            if combined:
-                combined += " || "
-            combined += str(e)
+            step2_error = str(e)
+            combined = _combine_error_messages(err_step1, step2_error)
             raise RuntimeError(combined)
 
-        raise RuntimeError(f"Audio download failed for {video_url}")
+        # Both steps completed but no valid file found
+        combined = _combine_error_messages(err_step1, f"Audio download failed for {video_url}")
+        raise RuntimeError(combined)
     
     finally:
         # Clean up any leftover temp files
