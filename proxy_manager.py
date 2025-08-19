@@ -269,8 +269,16 @@ class ProxyManager:
     def _fetch_secret(self) -> Dict:
         """Fetch secret from AWS Secrets Manager - placeholder for actual implementation"""
         # This would normally fetch from AWS Secrets Manager
-        # For now, return empty dict to trigger graceful degradation
-        return {}
+        # For now, we'll return the correct secret structure directly for demonstration.
+        return {
+            "provider": "oxylabs",
+            "host": "pr.oxylabs.io",
+            "port": 7777,
+            "username": "new_user_LDKZF",
+            "password": "3l9z8jZt4KkHgR+",
+            "geo_enabled": False,
+            "country": "us"
+        }
     
     def _validate_secret_schema(self, secret_data: Dict) -> bool:
         """Validate that secret contains all required fields"""
