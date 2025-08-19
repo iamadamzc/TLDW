@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote, urlparse
 from typing import Dict, Optional, Tuple
 
 # Third-party modules
+import boto3
 import requests
 
 # Exception hierarchy
@@ -267,10 +268,28 @@ class ProxyManager:
                                 secret_name=self.secret_name, error_type=type(e).__name__)
     
     def _fetch_secret(self) -> Dict:
-        """Fetch secret from AWS Secrets Manager - placeholder for actual implementation"""
-        # This would normally fetch from AWS Secrets Manager
-        # For now, return empty dict to trigger graceful degradation
-        return {}
+        """Fetch secret from AWS Secrets Manager"""
+        secret_name = os.getenv("PROXY_SECRET_NAME")
+        if not secret_name:
+            self.logger.log_event("warning", "PROXY_SECRET_NAME environment variable not set")
+            return {}
+
+        region_name = os.getenv("AWS_REGION", "us-west-2")
+        session = boto3.session.Session()
+        client = session.client(service_name='secretsmanager', region_name=region_name)
+
+        try:
+            get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        except Exception as e:
+            self.logger.log_event("error", f"Failed to fetch secret '{secret_name}' from AWS Secrets Manager: {e}")
+            return {}
+        else:
+            if 'SecretString' in get_secret_value_response:
+                secret = get_secret_value_response['SecretString']
+                return json.loads(secret)
+            else:
+                self.logger.log_event("error", f"Secret '{secret_name}' does not contain a SecretString")
+                return {}
     
     def _validate_secret_schema(self, secret_data: Dict) -> bool:
         """Validate that secret contains all required fields"""
