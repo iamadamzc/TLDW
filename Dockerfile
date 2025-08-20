@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+# Use Playwright’s Python image that includes OS deps
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
 # Set up working dir early
 WORKDIR /app
@@ -11,23 +12,6 @@ RUN apt-get update && \
 # Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Enhanced yt-dlp version management with pinned default
-ARG YTDLP_VERSION=2025.8.11
-ARG CACHE_BUSTER
-
-# Install yt-dlp with flexible version control
-RUN if [ "$YTDLP_VERSION" = "latest" ]; then \
-        echo "Cache Buster: $CACHE_BUSTER" && \
-        echo "Installing latest yt-dlp version..." && \
-        pip install --no-cache-dir -U yt-dlp; \
-    else \
-        echo "Installing pinned yt-dlp version: $YTDLP_VERSION" && \
-        pip install --no-cache-dir yt-dlp=="$YTDLP_VERSION"; \
-    fi
-
-# Log installed yt-dlp version for debugging and health checks
-RUN python -c "import yt_dlp; print('yt-dlp version:', yt_dlp.version.__version__)"
 
 # Verify FFmpeg is available during build
 RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"

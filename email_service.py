@@ -5,13 +5,17 @@ from requests.exceptions import RequestException, Timeout, ConnectionError
 
 class EmailService:
     def __init__(self):
-        self.resend_api_key = os.environ.get("RESEND_API_KEY", "")
+        self.resend_api_key = os.environ.get("RESEND_API_KEY")
+        self.sender_email = os.environ.get("SENDER_EMAIL", "noreply@resend.dev")
         self.api_url = "https://api.resend.com/emails"
-        
+
         if not self.resend_api_key:
             logging.error("RESEND_API_KEY environment variable is required but not set")
-            raise ValueError("RESEND_API_KEY environment variable is required")
-        
+            raise ValueError("RESEND_API_KEY is required")
+        if not self.sender_email:
+            logging.error("No sender email available")
+            raise ValueError("SENDER_EMAIL missing")
+
         logging.info("Email service initialized successfully")
 
     def send_digest_email(self, user_email, summaries_data):
@@ -33,7 +37,7 @@ class EmailService:
             html_content = self._generate_email_html(summaries_data)
             
             payload = {
-                "from": "TL;DW <noreply@resend.dev>",
+                "from": f"TL;DW <{self.sender_email}>",
                 "to": [user_email],
                 "subject": "Your TL;DW Video Digest",
                 "html": html_content
@@ -46,10 +50,12 @@ class EmailService:
 
             response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
             
-            if response.status_code == 200:
-                logging.info(f"Email sent successfully to {user_email}")
+            if response.ok:
+                logging.info(f"Email sent successfully to {user_email} (status: {response.status_code})")
                 return True
-            elif response.status_code == 401:
+            
+            # Specific error handling for auth/rate limits
+            if response.status_code == 401:
                 logging.error(f"Resend API authentication failed - check API key: {response.text}")
                 raise requests.exceptions.HTTPError("Resend API authentication failed. Please check your API key.")
             elif response.status_code == 429:

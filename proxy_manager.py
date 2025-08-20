@@ -474,6 +474,39 @@ class ProxyManager:
             return f"{video_hash}{base_token}"
         return base_token
         
+    def proxy_url(self, sticky: bool = True) -> Optional[str]:
+        """
+        Return a full URL with auth, e.g. http://user:pass@pr.oxylabs.io:10000
+        Return None if proxies disabled/unavailable.
+        """
+        if not self.in_use or not self.secret:
+            return None
+        token = self._generate_session_token()
+        return self.secret.build_proxy_url(token)
+
+    def proxy_dict_for(self, client: str = "requests", sticky: bool = True):
+        """
+        requests  -> {"http": url, "https": url}
+        playwright-> {"server": "http://host:port", "username": "...", "password": "..."}
+        """
+        url = self.proxy_url(sticky=sticky)
+        if not url:
+            return None
+
+        if client == "requests":
+            return {"http": url, "https": url}
+
+        if client == "playwright":
+            from urllib.parse import urlparse
+            u = urlparse(url)
+            server = f"{u.scheme}://{u.hostname}:{u.port}"
+            return {
+                "server": server,
+                "username": u.username or "",
+                "password": u.password or ""
+            }
+        return None
+
     def rotate_session(self, failed_token: str):
         """Blacklist failed session and force new token"""
         if not self.in_use or self.secret is None:
