@@ -18,13 +18,35 @@ class VideoSummarizer:
             logging.error(f"Failed to initialize OpenAI client: {e}")
             raise
 
-    def summarize_video(self, transcript_text, video_id):
+    def summarize_video(self, *, transcript_text: str, video_id: str) -> str:
         """
-        Generate AI summary using OpenAI GPT-4o with specific formatting
+        Generate AI summary using OpenAI GPT-4o with specific formatting.
+        
+        Args:
+            transcript_text: The video transcript text (keyword-only)
+            video_id: The video ID for timestamp links (keyword-only)
+            
+        Returns:
+            Summary text or "No transcript available for this video." for empty input
         """
-        if not transcript_text or not transcript_text.strip():
-            logging.error("Empty or invalid transcript provided")
-            raise ValueError("Transcript text is required for summarization")
+        # Strict input validation to prevent pipeline crashes
+        if not isinstance(transcript_text, str):
+            logging.warning(f"Invalid transcript_text type: {type(transcript_text)}")
+            return "No transcript available for this video."
+        
+        if not isinstance(video_id, str):
+            logging.warning(f"Invalid video_id type: {type(video_id)}")
+            video_id = str(video_id) if video_id else "unknown"
+        
+        # Check for empty or whitespace-only transcript
+        if not transcript_text.strip():
+            logging.info(f"Empty transcript for video {video_id} - skipping LLM call")
+            return "No transcript available for this video."
+
+        # Additional validation for transcript length
+        if len(transcript_text.strip()) < 10:
+            logging.info(f"Transcript too short for video {video_id} ({len(transcript_text)} chars) - skipping LLM call")
+            return "No transcript available for this video."
 
         try:
             logging.info(f"Starting summarization for video {video_id}")
@@ -67,39 +89,57 @@ Transcript to summarize:
             return summary_with_links
 
         except AuthenticationError as e:
-            logging.error(f"OpenAI authentication failed - check API key: {e}")
-            raise AuthenticationError("OpenAI API authentication failed. Please check your API key.")
+            logging.error(f"OpenAI authentication failed for video {video_id}: {e}")
+            return "Summary unavailable: OpenAI authentication failed."
         except RateLimitError as e:
-            logging.error(f"OpenAI rate limit exceeded: {e}")
-            raise RateLimitError("OpenAI API rate limit exceeded. Please try again later.")
+            logging.error(f"OpenAI rate limit exceeded for video {video_id}: {e}")
+            return "Summary unavailable: API rate limit exceeded."
         except APIError as e:
-            logging.error(f"OpenAI API error: {e}")
-            raise APIError(f"OpenAI API error: {str(e)}")
+            logging.error(f"OpenAI API error for video {video_id}: {e}")
+            return "Summary unavailable: API error occurred."
         except Exception as e:
-            logging.error(f"Unexpected error during summarization: {e}")
-            raise Exception(f"Unexpected error during video summarization: {str(e)}")
+            logging.error(f"Unexpected error during summarization for video {video_id}: {e}")
+            return "Summary unavailable: Processing error occurred."
 
     def _add_timestamp_links(self, summary_text, video_id):
         """
         Convert timestamps like (12:34) or (1:05:22) to clickable YouTube links
         """
-        def replace_timestamp(match):
-            timestamp = match.group(1)
-            total_seconds = self._timestamp_to_seconds(timestamp)
-            return f'<a href="https://www.youtube.com/watch?v={video_id}&t={total_seconds}s">({timestamp})</a>'
-        
-        # Regex to find timestamps in format (MM:SS) or (HH:MM:SS)
-        timestamp_pattern = r'\((\d{1,2}:\d{2}(?::\d{2})?)\)'
-        
-        return re.sub(timestamp_pattern, replace_timestamp, summary_text)
+        try:
+            if not isinstance(summary_text, str) or not isinstance(video_id, str):
+                return summary_text
+            
+            def replace_timestamp(match):
+                try:
+                    timestamp = match.group(1)
+                    total_seconds = self._timestamp_to_seconds(timestamp)
+                    return f'<a href="https://www.youtube.com/watch?v={video_id}&t={total_seconds}s">({timestamp})</a>'
+                except Exception:
+                    # If timestamp conversion fails, return original
+                    return match.group(0)
+            
+            # Regex to find timestamps in format (MM:SS) or (HH:MM:SS)
+            timestamp_pattern = r'\((\d{1,2}:\d{2}(?::\d{2})?)\)'
+            
+            return re.sub(timestamp_pattern, replace_timestamp, summary_text)
+        except Exception as e:
+            logging.warning(f"Failed to add timestamp links: {e}")
+            return summary_text
 
     def _timestamp_to_seconds(self, timestamp):
         """Convert timestamp string to total seconds"""
-        parts = timestamp.split(':')
-        if len(parts) == 2:  # MM:SS
-            minutes, seconds = map(int, parts)
-            return minutes * 60 + seconds
-        elif len(parts) == 3:  # HH:MM:SS
-            hours, minutes, seconds = map(int, parts)
-            return hours * 3600 + minutes * 60 + seconds
-        return 0
+        try:
+            if not isinstance(timestamp, str):
+                return 0
+            
+            parts = timestamp.split(':')
+            if len(parts) == 2:  # MM:SS
+                minutes, seconds = map(int, parts)
+                return max(0, minutes * 60 + seconds)
+            elif len(parts) == 3:  # HH:MM:SS
+                hours, minutes, seconds = map(int, parts)
+                return max(0, hours * 3600 + minutes * 60 + seconds)
+            return 0
+        except (ValueError, TypeError) as e:
+            logging.warning(f"Failed to convert timestamp '{timestamp}': {e}")
+            return 0

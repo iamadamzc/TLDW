@@ -176,6 +176,17 @@ with app.app_context():
     
     # Log dependency status on startup
     _log_startup_dependencies()
+    
+    # Validate configuration on startup
+    from config_validator import validate_startup_config
+    config_valid = validate_startup_config()
+    
+    if not config_valid:
+        logging.warning("⚠️  Application starting with configuration issues - some features may not work properly")
+    
+    # Setup secure logging with credential redaction
+    from security_manager import setup_secure_logging
+    setup_secure_logging()
 
 # Import and register blueprints
 from google_auth import google_auth
@@ -325,6 +336,27 @@ def health_check_detailed():
     
     # Check critical dependencies
     health_info['dependencies'] = _check_dependencies()
+    
+    # Add configuration validation status
+    try:
+        from config_validator import config_validator
+        config_summary = config_validator.get_config_summary()
+        health_info['configuration'] = config_summary
+        
+        # Update overall health status based on configuration
+        if config_summary['validation_status'] != 'valid':
+            health_info['status'] = 'degraded'
+            health_info['message'] = f"Configuration issues detected ({config_summary['error_count']} errors, {config_summary['warning_count']} warnings)"
+    except Exception as e:
+        health_info['configuration'] = {'error': f'Configuration validation failed: {str(e)}'}
+        health_info['status'] = 'degraded'
+    
+    # Add security status
+    try:
+        from security_manager import get_security_status
+        health_info['security'] = get_security_status()
+    except Exception as e:
+        health_info['security'] = {'error': f'Security status check failed: {str(e)}'}
     
     # Add ffmpeg_location
     health_info['ffmpeg_location'] = os.environ.get('FFMPEG_LOCATION')
