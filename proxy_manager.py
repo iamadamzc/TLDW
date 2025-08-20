@@ -52,6 +52,7 @@ class ProxySecret:
     port: int
     username: str          # base username, no -sessid-
     password: str          # RAW (not URL-encoded)
+    session_ttl_minutes: int = 10
     geo_enabled: bool = False
     country: Optional[str] = None
     version: int = 1
@@ -111,15 +112,18 @@ class ProxySecret:
             port=int(d["port"]),
             username=str(d["username"]),
             password=pw,
+            session_ttl_minutes=int(d.get("session_ttl_minutes", 10)),
             geo_enabled=bool(d.get("geo_enabled", False)),
             country=str(d.get("country")) if d.get("country") else None,
             version=int(d.get("version", 1)),
         )
         
     def build_username_with_session(self, session_token: str) -> str:
-        """Create session-specific username"""
+        """Create session-specific username with session time"""
         base = self.username.split("-sessid-")[0]
-        return f"{base}-sessid-{session_token}"
+        # Use the session_ttl_minutes value from the secret
+        ttl = self.session_ttl_minutes 
+        return f"{base}-sessid-{session_token}-sesstime-{ttl}"
         
     def build_proxy_url(self, session_token: Optional[str] = None) -> str:
         """Build proxy URL with runtime password encoding"""
