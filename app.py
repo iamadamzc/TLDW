@@ -77,20 +77,6 @@ def _check_dependencies():
     except Exception as e:
         dependencies['ffprobe'] = {'available': False, 'error': str(e)}
     
-    # Check yt-dlp
-    try:
-        import yt_dlp
-        version = yt_dlp.version.__version__
-        dependencies['yt_dlp'] = {
-            'available': True,
-            'version': version
-        }
-        # Structured JSON logging for yt-dlp version
-        logging.info(f'{{"component": "yt_dlp", "version": "{version}", "status": "loaded"}}')
-    except Exception as e:
-        dependencies['yt_dlp'] = {'available': False, 'error': str(e)}
-        logging.error(f'{{"component": "yt_dlp", "version": null, "status": "failed", "error": "{str(e)}"}}')
-    
     return dependencies
 
 def update_download_metadata(used_cookies=False, client_used="unknown"):
@@ -135,7 +121,6 @@ def _log_startup_dependencies():
     logging.info(f"Working directory: {os.getcwd()}")
     
     # Quick PATH check for critical binaries
-    logging.info(f"yt-dlp: {shutil.which('yt-dlp')}")
     logging.info(f"ffmpeg: {shutil.which('ffmpeg')}")
     logging.info(f"ffprobe: {shutil.which('ffprobe')}")
     
@@ -164,8 +149,6 @@ def _log_startup_dependencies():
         critical_missing.append('ffmpeg')
     if not dependencies.get('ffprobe', {}).get('available'):
         critical_missing.append('ffprobe')
-    if not dependencies.get('yt_dlp', {}).get('available'):
-        critical_missing.append('yt-dlp')
     
     if critical_missing:
         logging.error(f"🚨 CRITICAL: Missing dependencies {critical_missing} - ASR functionality will fail!")
@@ -327,32 +310,6 @@ def health_check_apprunner():
     
     return basic_health, 200
 
-@app.route('/health/yt-dlp')
-def yt_dlp_health():
-    """Specific yt-dlp diagnostics endpoint"""
-    try:
-        import yt_dlp
-        
-        # Get proxy status
-        proxy_in_use = False
-        try:
-            import json
-            from proxy_manager import ProxyManager
-            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
-            if raw_config:
-                secret_data = json.loads(raw_config)
-                proxy_manager = ProxyManager(secret_data, logging.getLogger(__name__))
-                proxy_in_use = proxy_manager.in_use
-        except:
-            proxy_in_use = False
-        
-        return {
-            "version": yt_dlp.version.__version__,
-            "proxy_in_use": proxy_in_use,
-            "status": "available"
-        }, 200
-    except Exception as e:
-        return {"status": "error", "error": str(e)}, 500
 
 @app.route('/health')
 def health_check_detailed():
@@ -369,15 +326,8 @@ def health_check_detailed():
     # Check critical dependencies
     health_info['dependencies'] = _check_dependencies()
     
-    # Add ffmpeg_location and yt_dlp_version fields
+    # Add ffmpeg_location
     health_info['ffmpeg_location'] = os.environ.get('FFMPEG_LOCATION')
-    
-    # Extract yt-dlp version from dependencies
-    yt_dlp_dep = health_info['dependencies'].get('yt_dlp', {})
-    if yt_dlp_dep.get('available'):
-        health_info['yt_dlp_version'] = yt_dlp_dep.get('version', 'unknown')
-    else:
-        health_info['yt_dlp_version'] = None
     
     # Add proxy status if enabled
     if health_info['proxy_enabled']:
@@ -488,8 +438,6 @@ def health_check_detailed():
     critical_missing = []
     if not health_info['dependencies']['ffmpeg']['available']:
         critical_missing.append('ffmpeg')
-    if not health_info['dependencies']['yt_dlp']['available']:
-        critical_missing.append('yt-dlp')
     
     if critical_missing:
         if allow_missing_deps:
@@ -508,3 +456,9 @@ def health_check_detailed():
     health_info['status'] = 'healthy'
     health_info['message'] = 'All dependencies available - ASR functionality ready'
     return health_info, 200
+
+@app.errorhandler(Exception)
+def handle_exc(e):
+    from flask import jsonify
+    code = getattr(e, "code", 500)
+    return jsonify({"error": str(e)}), code

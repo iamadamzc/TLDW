@@ -171,38 +171,30 @@ class TLDWApp {
         }
     }
 
-    async handleSummarize() {
-        const checkedVideos = document.querySelectorAll('.video-checkbox:checked');
-        const videoIds = Array.from(checkedVideos).map(cb => cb.value);
-
-        if (!videoIds.length) {
-            this.showAlert('warning', 'Please select at least one video to summarize.');
-            return;
-        }
-
+    async handleSummarize(videoIds) {
+        this.showLoadingModal();
         try {
-            this.showLoadingModal();
-
-            const response = await fetch('/api/summarize', {
+            const res = await fetch('/api/summarize', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ video_ids: videoIds })
             });
 
-            const data = await response.json();
-            
-            if (response.ok) {
-                this.showAlert('success', data.message);
-                this.clearVideoSelection();
-            } else {
-                this.showAlert('error', data.error || 'Failed to process videos');
+            const ct = res.headers.get('content-type') || '';
+            const body = await res.text();
+
+            if (!res.ok) {
+                this.hideLoadingModal();
+                throw new Error(`${res.status} ${res.statusText}: ${body.slice(0, 200)}`);
             }
-        } catch (error) {
-            console.error('Error summarizing videos:', error);
-            this.showAlert('error', 'Network error. Please try again.');
-        } finally {
+
+            const data = ct.includes('application/json') ? JSON.parse(body) : {};
+            this.showToast(data.message || 'Request received — we’ll email you when it’s ready.');
+            this.clearVideoSelection();
+            this.hideLoadingModal();
+        } catch (err) {
+            console.error(err);
+            this.showToast('Failed to start the job. Please try again.');
             this.hideLoadingModal();
         }
     }
@@ -266,32 +258,27 @@ class TLDWApp {
         }
     }
 
-    showAlert(type, message) {
-        const alertContainer = document.getElementById('alert-container');
-        if (!alertContainer) return;
+    showToast(message, type = 'info') {
+        const toastContainer = document.getElementById('toast-container');
+        if (!toastContainer) return;
 
-        const alertId = 'alert-' + Date.now();
-        const alertHtml = `
-            <div class="alert alert-${type === 'error' ? 'danger' : type} alert-dismissible fade show" 
-                 id="${alertId}" role="alert">
-                <strong>${type === 'success' ? 'Success!' : type === 'error' ? 'Error!' : 'Info:'}</strong>
-                ${this.escapeHtml(message)}
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        const toastId = 'toast-' + Date.now();
+        const toastHtml = `
+            <div class="toast" role="alert" aria-live="assertive" aria-atomic="true" id="${toastId}">
+                <div class="toast-header">
+                    <strong class="me-auto">${type.charAt(0).toUpperCase() + type.slice(1)}</strong>
+                    <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+                </div>
+                <div class="toast-body">
+                    ${this.escapeHtml(message)}
+                </div>
             </div>
         `;
-        
-        alertContainer.insertAdjacentHTML('beforeend', alertHtml);
-        
-        // Auto-dismiss success alerts after 5 seconds
-        if (type === 'success') {
-            setTimeout(() => {
-                const alert = document.getElementById(alertId);
-                if (alert) {
-                    const bsAlert = new bootstrap.Alert(alert);
-                    bsAlert.close();
-                }
-            }, 5000);
-        }
+
+        toastContainer.insertAdjacentHTML('beforeend', toastHtml);
+        const toastElement = document.getElementById(toastId);
+        const toast = new bootstrap.Toast(toastElement);
+        toast.show();
     }
 
     escapeHtml(text) {

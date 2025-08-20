@@ -105,7 +105,6 @@ def get_captions_via_timedtext(video_id: str, proxy_manager=None, cookie_jar=Non
     logging.info("Timedtext: no captions found")
     return ""
 
-# --- helper: click any of several selectors ---
 def _try_click_any(page, selectors, wait_after=0):
     for sel in selectors:
         try:
@@ -119,70 +118,54 @@ def _try_click_any(page, selectors, wait_after=0):
             continue
     return False
 
-def _playwright_launch_kwargs(proxy_manager):
-    launch_args = {"headless": True}
+def _launch_args_with_proxy(proxy_manager):
+    args = {"headless": True}
     if proxy_manager:
         cfg = proxy_manager.proxy_dict_for("playwright")
         if cfg:
-            launch_args["proxy"] = cfg
+            args["proxy"] = cfg
             logging.info(f"Playwright proxy -> server={cfg['server']}")
         else:
             logging.info("Playwright proxy -> none")
-    return launch_args
+    return args
 
-def _parse_youtubei_transcript_json(data: dict) -> str:
-    """Extract transcript lines from various YouTubei shapes."""
-    def join_runs(runs):
-        return "".join((r or {}).get("text", "") for r in (runs or []))
-
-    # Common path:
-    cues = []
-    try:
-        cues = (data["actions"][0]["updateEngagementPanelAction"]["content"]
-                    ["transcriptRenderer"]["body"]["transcriptBodyRenderer"]["cueGroups"])
-    except Exception:
-        pass
-
-    lines = []
-    for cg in cues or []:
-        # try several shapes seen in the wild
-        runs = None
+def _scroll_until(page, is_ready, max_steps=40, dy=3000, pause_ms=200):
+    """Scrolls until is_ready() returns True or steps exhausted."""
+    for _ in range(max_steps):
         try:
-            runs = (cg["transcriptCueGroupRenderer"]["cue"]["transcriptCueRenderer"]
-                        ["cue"]["simpleText"]["runs"])
+            if is_ready():
+                return True
         except Exception:
-            try:
-                runs = (cg["transcriptCueGroupRenderer"]["cues"][0]["transcriptCueRenderer"]
-                            ["cue"]["simpleText"]["runs"])
-            except Exception:
-                runs = None
-        text = join_runs(runs).strip() if runs else ""
-        if text:
-            lines.append(text)
-    return "\n".join(lines).strip()
+            pass
+        page.mouse.wheel(0, dy)
+        page.wait_for_timeout(pause_ms)
+    return False
 
 def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None, timeout_ms=60000) -> str:
     """
-    Open the watch page, trigger transcript, capture /youtubei/v1/get_transcript JSON, parse to text.
-    Returns '' if not available.
+    Open watch page (EN), scroll to the Transcript section, click 'Show transcript',
+    capture /youtubei/v1/get_transcript JSON, parse lines to plain text.
     """
     url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
     captured = {"json": None}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(**_playwright_launch_kwargs(proxy_manager))
-        context = browser.new_context(
+        browser = p.chromium.launch(**_launch_args_with_proxy(proxy_manager))
+        ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"),
             viewport={"width": 1366, "height": 900},
             locale="en-US"
         )
         if cookies:
-            context.add_cookies(cookies)
-        page = context.new_page()
+            ctx.add_cookies(cookies)
+        page = ctx.new_page()
+        page.set_default_navigation_timeout(15000)  # 15s
+        page.set_default_timeout(15000)
 
-        # Reduce weight
-        page.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
+        # Reduce weight (keep CSS/JS)
+        page.route("**/*", lambda r: r.abort()
+                   if r.request.resource_type in {"image","font","media"} else r.continue_())
 
         def on_response(resp):
             try:
@@ -192,26 +175,28 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
                 pass
 
         page.on("response", on_response)
-
-        # Navigate
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-        # Handle consent if present (best-effort)
+        # Handle consent (best effort)
         _try_click_any(page, [
-            "button:has-text('Accept all')",
-            "button:has-text('I agree')",
-            "button:has-text('Acepto todo')",
-            "button:has-text('Estoy de acuerdo')"
+            "button:has-text('Accept all')", "button:has-text('I agree')",
+            "button:has-text('Acepto todo')", "button:has-text('Estoy de acuerdo')"
         ], wait_after=1200)
 
-        # NEW path first: built-in "Transcript" section
+        # === NEW: scroll down to make the Transcript section render ===
+        def transcript_button_visible():
+            return page.locator("button:has-text('Show transcript')").first.is_visible()
+
+        _scroll_until(page, transcript_button_visible, max_steps=50, dy=3000, pause_ms=150)
+
+        # Try direct 'Show transcript' button first (new UI)
         opened = _try_click_any(page, [
             "ytd-transcript-renderer tp-yt-paper-button:has-text('Show transcript')",
-            "tp-yt-paper-button:has-text('Show transcript')",
             "button:has-text('Show transcript')",
+            "tp-yt-paper-button:has-text('Show transcript')",
         ], wait_after=1200)
 
-        # Fallback: old menu path
+        # Fallback: old ⋯ menu path
         if not opened:
             _try_click_any(page, [
                 "button[aria-label*='More actions']",
@@ -222,25 +207,53 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
                 "yt-formatted-string:has-text('Show transcript')",
             ], wait_after=1200)
 
-        # If still not opened, try m.youtube (lighter)
+        # If still closed, try m.youtube (lighter page)
         if not opened and not captured["json"]:
             page.goto(f"https://m.youtube.com/watch?v={video_id}&hl=en",
                       wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(1000)
+            _scroll_until(page, transcript_button_visible, max_steps=30, dy=4000, pause_ms=150)
             opened = _try_click_any(page, ["button:has-text('Show transcript')"], wait_after=1200)
 
-        # Give time for the network call to fire
+        # Give the request time to fire
         page.wait_for_timeout(2000)
 
         data = captured["json"]
         text = _parse_youtubei_transcript_json(data) if data else ""
-        browser.close()
-
         if text:
             logging.info("YouTubei transcript JSON captured & parsed.")
         else:
             logging.info("YouTubei transcript JSON not available.")
+        browser.close()
         return text
+
+def _parse_youtubei_transcript_json(data: dict) -> str:
+    """Extract transcript lines from YouTubei JSON (handles common shapes)."""
+    def runs_text(runs): return "".join((r or {}).get("text","") for r in (runs or []))
+
+    # Most common path:
+    cues = []
+    try:
+        cues = (data["actions"][0]["updateEngagementPanelAction"]["content"]
+                ["transcriptRenderer"]["body"]["transcriptBodyRenderer"]["cueGroups"])
+    except Exception:
+        pass
+
+    lines = []
+    for cg in cues or []:
+        runs = None
+        try:
+            runs = (cg["transcriptCueGroupRenderer"]["cue"]["transcriptCueRenderer"]
+                    ["cue"]["simpleText"]["runs"])
+        except Exception:
+            try:
+                runs = (cg["transcriptCueGroupRenderer"]["cues"][0]["transcriptCueRenderer"]
+                        ["cue"]["simpleText"]["runs"])
+            except Exception:
+                runs = None
+        t = runs_text(runs).strip() if runs else ""
+        if t:
+            lines.append(t)
+    return "\n".join(lines).strip()
 
 
 # --- Playwright Helper Functions ---
