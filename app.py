@@ -129,9 +129,9 @@ def _log_startup_dependencies():
     try:
         subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         subprocess.run(["ffprobe", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        logging.info("✅ ffmpeg/ffprobe execution test passed")
+        logging.info("[OK] ffmpeg/ffprobe execution test passed")
     except Exception as e:
-        logging.error(f"❌ FFMPEG_NOT_AVAILABLE: {e}")
+        logging.error(f"[ERROR] FFMPEG_NOT_AVAILABLE: {e}")
     
     dependencies = _check_dependencies()
     
@@ -139,10 +139,10 @@ def _log_startup_dependencies():
         if dep_info['available']:
             version = dep_info.get('version', 'unknown')
             path = dep_info.get('path', 'python module')
-            logging.info(f"✅ {dep_name}: {version} (at {path})")
+            logging.info(f"[OK] {dep_name}: {version} (at {path})")
         else:
             error = dep_info.get('error', 'unknown error')
-            logging.error(f"❌ {dep_name}: NOT AVAILABLE - {error}")
+            logging.error(f"[ERROR] {dep_name}: NOT AVAILABLE - {error}")
     
     # Check if critical dependencies are missing
     critical_missing = []
@@ -152,12 +152,12 @@ def _log_startup_dependencies():
         critical_missing.append('ffprobe')
     
     if critical_missing:
-        logging.error(f"🚨 CRITICAL: Missing dependencies {critical_missing} - ASR functionality will fail!")
-        logging.error("🔧 Install missing dependencies or check container build process")
+        logging.error(f"[CRITICAL] Missing dependencies {critical_missing} - ASR functionality will fail!")
+        logging.error("[CRITICAL] Install missing dependencies or check container build process")
         # Don't fail startup for missing dependencies - let health check handle it
         # This allows the service to start and report issues via /health endpoint
     else:
-        logging.info("✅ All critical dependencies available - ASR functionality ready")
+        logging.info("[OK] All critical dependencies available - ASR functionality ready")
     
     logging.info("=== End Dependency Check ===")
     
@@ -183,7 +183,7 @@ with app.app_context():
     config_valid = validate_startup_config()
     
     if not config_valid:
-        logging.warning("⚠️  Application starting with configuration issues - some features may not work properly")
+        logging.warning("[WARNING] Application starting with configuration issues - some features may not work properly")
     
     # Setup secure logging with credential redaction
     from security_manager import setup_secure_logging

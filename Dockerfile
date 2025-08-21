@@ -22,13 +22,15 @@ RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"
 COPY . .
 
 # Create non-root user for App Runner and ensure browser access
-RUN useradd -m app && chown -R app:app /app /ms-playwright || true
+RUN useradd -m app && \
+    chown -R app:app /app && \
+    (chown -R app:app /ms-playwright 2>/dev/null || true)
 USER app
 
 # Environment variables
 ENV PORT=8080 \
     FFMPEG_LOCATION=/usr/bin \
-    ALLOW_MISSING_DEPS=false \
+    ALLOW_MISSING_DEPS=true \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \

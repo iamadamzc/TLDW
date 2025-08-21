@@ -9,7 +9,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from playwright.sync_api import sync_playwright, Page
-from youtube_transcript_api import YouTubeTranscriptApi as YTA
+from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
 from proxy_manager import ProxyManager, ProxyAuthError, ProxyConfigError, generate_correlation_id, error_response
@@ -861,7 +861,7 @@ class TranscriptService:
         """
         try:
             # Try to get transcript with language preference
-            transcript = YTA.get_transcript(video_id, languages=list(languages))
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
             lines = []
             for segment in transcript:
                 text = (segment.get("text") or "").strip()

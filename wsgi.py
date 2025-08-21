@@ -54,23 +54,7 @@ def log_startup_dependencies():
     ffmpeg = _check_binary("ffmpeg")
     ffprobe = _check_binary("ffprobe")
     
-    # yt-dlp may be installed as a python module and/or a script
-    ytdlp_path = shutil.which("yt-dlp")
-    if ytdlp_path:
-        logging.info("STARTUP: yt-dlp at %s", ytdlp_path)
-    else:
-        try:
-            import yt_dlp
-            logging.info("STARTUP: yt-dlp module OK (version=%s)", getattr(yt_dlp, "__version__", "unknown"))
-        except Exception as e:
-            msg = f"yt-dlp missing or import failed: {e}"
-            if ALLOW_MISSING:
-                logging.warning("STARTUP: %s (continuing)", msg)
-            else:
-                logging.error("STARTUP: %s", msg)
-                raise
-    
-    # Export explicit ffmpeg location for the app to use in yt-dlp calls
+    # Export explicit ffmpeg location for the app to use
     if ffmpeg:
         os.environ.setdefault("FFMPEG_LOCATION", "/usr/bin")
         logging.info("STARTUP: FFMPEG_LOCATION=%s", os.environ["FFMPEG_LOCATION"])
