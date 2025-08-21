@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 from flask import Blueprint, render_template, request, jsonify, redirect, url_for, flash
 from flask_login import login_required, current_user
+from cookie_utils import parse_netscape_for_both
 from youtube_service import YouTubeService, AuthenticationError
 from transcript_service import TranscriptService
 from summarizer import VideoSummarizer
@@ -300,6 +301,7 @@ class JobManager:
         """
         Execute summarization job with per-video error isolation and concurrency control
         """
+        processed_count = 0  # ensure defined for job-level exception paths
         with self.job_semaphore:
             start_time = time.time()
             self.update_job_status(job_id, "processing")
@@ -318,11 +320,18 @@ class JobManager:
                     email_service = EmailService()
 
                     # Get user cookies if available
-                    user_cookies = self._get_user_cookies(user_id)
+                    raw_cookie_txt = self._get_user_cookies(user_id)
+                    requests_cookies = None
+                    playwright_cookies = None
+                    if isinstance(raw_cookie_txt, str) and raw_cookie_txt.strip():
+                        try:
+                            requests_cookies, playwright_cookies = parse_netscape_for_both(raw_cookie_txt)
+                        except Exception:
+                            logging.warning("Failed to parse Netscape cookies; continuing without cookies.")
+                            requests_cookies, playwright_cookies = None, None
 
                     # Process videos with per-video error isolation
                     email_items = []
-                    processed_count = 0
                     
                     for i, vid in enumerate(video_ids):
                         video_start_time = time.time()
@@ -340,7 +349,7 @@ class JobManager:
                             
                             # Get transcript using enhanced hierarchical fallback
                             transcript_start_time = time.time()
-                            text = ts.get_transcript(vid, user_cookies=user_cookies)
+                            text = ts.get_transcript(vid, user_cookies=requests_cookies, playwright_cookies=playwright_cookies)
                             transcript_duration_ms = int((time.time() - transcript_start_time) * 1000)
                             
                             # Determine transcript source from cache or logs
@@ -448,7 +457,7 @@ class JobManager:
             # Fallback to legacy cookie storage for backward compatibility
             legacy_path = _local_cookie_path(user_id)
             if os.path.exists(legacy_path):
-                self.logger.warning(f"Using legacy cookie storage for user {user_id} - consider migrating")
+                logging.warning(f"Using legacy cookie storage for user {user_id} - consider migrating")
                 # Don't log cookie content - just indicate presence
                 return {"legacy": True}
             

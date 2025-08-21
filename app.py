@@ -1,7 +1,8 @@
 import os
 import logging
 
-from flask import Flask
+from flask import Flask, jsonify
+from transcript_metrics import snapshot as transcript_metrics_snapshot
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import DeclarativeBase
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -272,54 +273,17 @@ def health_check_apprunner():
     
     # Detailed diagnostics only when explicitly enabled (default off for security)
     if os.getenv('EXPOSE_HEALTH_DIAGNOSTICS', 'false').lower() == 'true':
-        try:
-            import yt_dlp
-            yt_dlp_version = yt_dlp.version.__version__
-        except:
-            yt_dlp_version = "unknown"
         
         # Check ffmpeg availability (boolean only, no path exposure)
-        ffmpeg_available = os.path.exists("/usr/bin/ffmpeg")
-        
-        # Get proxy status from ProxyManager if available
-        proxy_in_use = False
-        try:
-            import json
-            from proxy_manager import ProxyManager
-            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
-            if raw_config:
-                secret_data = json.loads(raw_config)
-                proxy_manager = ProxyManager(secret_data, logging.getLogger(__name__))
-                proxy_in_use = proxy_manager.in_use
-        except:
-            proxy_in_use = False
-        
-        # Get last download metadata (without sensitive data)
-        last_download_meta = getattr(app, 'last_download_meta', {})
-        
-        # Get comprehensive download attempt metadata
-        download_attempt_meta = {}
-        try:
-            from download_attempt_tracker import get_download_health_metadata
-            download_attempt_meta = get_download_health_metadata()
-        except ImportError:
-            # download_attempt_tracker not available
-            pass
-        except Exception:
-            # Don't fail health check on tracking errors
-            pass
+        import shutil
+        ffmpeg_available = bool(shutil.which("ffmpeg"))
         
         basic_health.update({
-            "yt_dlp_version": yt_dlp_version,
             "ffmpeg_available": ffmpeg_available,
-            "proxy_in_use": proxy_in_use,
-            "last_download_used_cookies": last_download_meta.get("used_cookies", False),
-            "last_download_client": last_download_meta.get("client_used", "unknown"),
-            "download_attempts": download_attempt_meta,
-            "timestamp": datetime.utcnow().isoformat()
+            "transcript_metrics": transcript_metrics_snapshot(),
         })
     
-    return basic_health, 200
+    return jsonify(basic_health), 200
 
 
 @app.route('/health')

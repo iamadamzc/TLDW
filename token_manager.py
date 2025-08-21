@@ -4,7 +4,11 @@ import requests
 from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
-from app import db
+
+# Avoid circular imports: fetch db only when needed
+def _db():
+    from app import db  # local import to avoid app<->youtube_service loop
+    return db
 
 class TokenManager:
     """Centralized token management for OAuth2 credentials"""
@@ -61,7 +65,7 @@ class TokenManager:
                     logging.info(f"Updated refresh token for user {self.user.id}")
                 
                 # Commit changes to database
-                db.session.commit()
+                _db().session.commit()
                 
                 logging.info(f"Successfully refreshed access token for user {self.user.id}")
                 return True
@@ -148,7 +152,7 @@ class TokenManager:
         try:
             self.user.access_token = None
             self.user.refresh_token = None
-            db.session.commit()
+            _db().session.commit()
             logging.info(f"Cleared invalid tokens for user {self.user.id}")
         except Exception as e:
             logging.error(f"Error clearing tokens for user {self.user.id}: {str(e)}")

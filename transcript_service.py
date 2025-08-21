@@ -16,6 +16,7 @@ from proxy_manager import ProxyManager, ProxyAuthError, ProxyConfigError, genera
 from transcript_cache import TranscriptCache
 from shared_managers import shared_managers
 from error_handler import StructuredLogger, handle_transcript_error, log_performance_metrics, log_resource_cleanup
+from transcript_metrics import inc_success, inc_fail
 
 _CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
@@ -27,7 +28,7 @@ ENABLE_YOUTUBEI = os.getenv("ENABLE_YOUTUBEI", "0") == "1"
 ENABLE_ASR_FALLBACK = os.getenv("ENABLE_ASR_FALLBACK", "0") == "1"
 
 # Performance and safety controls
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "15000"))
+PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "45000"))
 USE_PROXY_FOR_TIMEDTEXT = os.getenv("USE_PROXY_FOR_TIMEDTEXT", "0") == "1"
 ASR_MAX_VIDEO_MINUTES = int(os.getenv("ASR_MAX_VIDEO_MINUTES", "20"))
 
@@ -47,16 +48,9 @@ def make_http_session():
 HTTP = make_http_session()
 
 def validate_config():
-    """Validate configuration for ASR and email services"""
-    if ENABLE_ASR_FALLBACK:
-        if not os.getenv("DEEPGRAM_API_KEY"):
-            raise ValueError("DEEPGRAM_API_KEY required when ENABLE_ASR_FALLBACK=1")
-    
-    # Validate email configuration
-    required_email_vars = ["RESEND_API_KEY", "SENDER_EMAIL"]
-    for var in required_email_vars:
-        if not os.getenv(var):
-            raise ValueError(f"{var} is required for email functionality")
+    """Validate configuration for ASR only (email is validated in EmailService)."""
+    if ENABLE_ASR_FALLBACK and not os.getenv("DEEPGRAM_API_KEY"):
+        raise ValueError("DEEPGRAM_API_KEY required when ENABLE_ASR_FALLBACK=1")
 
 # Validate configuration on module load (non-blocking)
 try:
@@ -296,8 +290,12 @@ class ASRAudioExtractor:
                         try:
                             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                             
-                            # Start playback to trigger audio stream
-                            page.keyboard.press("k")  # Play/pause shortcut
+                            # ensure the player has focus, then play
+                            try:
+                                page.click("video", timeout=3000)
+                            except Exception:
+                                pass
+                            page.keyboard.press("k")  # play
                             page.wait_for_timeout(3500)  # Wait for stream to start
                             
                             if captured_url["url"]:
@@ -700,7 +698,7 @@ def scrape_transcript_with_playwright(video_id: str, pm: Optional[ProxyManager] 
 
         page = context.new_page()
         page.route("**/*", lambda r: r.abort() if r.request.resource_type in
-                   {"image", "media", "font", "stylesheet"} else r.continue_())
+                   {"image", "media", "font"} else r.continue_())
 
         try:
             try:
@@ -752,7 +750,8 @@ class TranscriptService:
         self._video_locks = {}
         self.current_user_id: Optional[int] = None
 
-    def get_transcript(self, video_id: str, language: str = "en", user_cookies=None) -> str:
+    def get_transcript(self, video_id: str, language: str = "en",
+                       user_cookies=None, playwright_cookies=None) -> str:
         """
         Hierarchical transcript acquisition with comprehensive fallback.
         Returns transcript text or empty string if all methods fail.
@@ -780,7 +779,7 @@ class TranscriptService:
                     logging.warning(f"Proxy error, continuing without proxy: {e}")
 
             # Hierarchical fallback with feature flags
-            transcript_text, source = self._get_transcript_with_fallback(video_id, language, user_cookies)
+            transcript_text, source = self._get_transcript_with_fallback(video_id, language, user_cookies, playwright_cookies)
             
             # Cache successful result
             if transcript_text and transcript_text.strip():
@@ -796,7 +795,7 @@ class TranscriptService:
         finally:
             self._video_locks.pop(video_id, None)
 
-    def _get_transcript_with_fallback(self, video_id: str, language: str, user_cookies=None) -> Tuple[str, str]:
+    def _get_transcript_with_fallback(self, video_id: str, language: str, user_cookies=None, playwright_cookies=None) -> Tuple[str, str]:
         """
         Execute hierarchical fallback strategy.
         Returns (transcript_text, source) where source indicates which method succeeded.
@@ -817,8 +816,10 @@ class TranscriptService:
             try:
                 if source == "yt_api":
                     result = method(video_id, (language, "en", "en-US"))
-                else:
+                elif source == "timedtext":
                     result = method(video_id, language, user_cookies)
+                else:  # youtubei and asr use playwright cookies
+                    result = method(video_id, language, playwright_cookies)
                 
                 duration_ms = int((time.time() - start_time) * 1000)
                 
@@ -831,6 +832,7 @@ class TranscriptService:
                         transcript_length=len(result),
                         success=True
                     )
+                    inc_success(source)
                     return result, source
                 else:
                     # Log empty result
@@ -846,8 +848,10 @@ class TranscriptService:
                 duration_ms = int((time.time() - start_time) * 1000)
                 # Use structured error handling
                 handle_transcript_error(video_id, source, e, duration_ms)
+                inc_fail(source)
                 continue
         
+        inc_fail("none")
         return "", "none"
 
     def get_captions_via_api(self, video_id: str, languages=("en", "en-US", "es")) -> str:

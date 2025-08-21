@@ -7,8 +7,16 @@ import random
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+# NOTE: yt-dlp is not part of the no-yt-dl stack. This module is quarantined.
+# Import lazily and guard calls so importing this file never crashes.
+try:
+    from yt_dlp import YoutubeDL  # type: ignore
+    from yt_dlp.utils import DownloadError  # type: ignore
+    _YTDLP_AVAILABLE = True
+except Exception:
+    YoutubeDL = None  # type: ignore
+    DownloadError = Exception  # fallback type
+    _YTDLP_AVAILABLE = False
 
 
 def _file_ok(path: Optional[str]) -> bool:
@@ -170,6 +178,8 @@ def download_audio_with_fallback(
     logger: Optional[Callable[[str], None]] = None,
     cookiefile: Optional[str] = None,
 ) -> str:
+    if not _YTDLP_AVAILABLE:
+        raise RuntimeError("yt-dlp is not available in this build. The no-yt-dl stack disables this path.")
     """
     Downloads audio from a YouTube (or other) video URL using yt-dlp with a two-step strategy.
     Step 1: Direct audio download (m4a preferred, no re-encode).
@@ -383,6 +393,8 @@ def download_audio_with_retry(
     cookiefile: Optional[str] = None,
     user_id: Optional[int] = None,
 ) -> str:
+    if not _YTDLP_AVAILABLE:
+        raise RuntimeError("yt-dlp is not available in this build. The no-yt-dl stack disables this path.")
     """
     Enhanced download with mandatory A/B testing for extraction failures.
     
