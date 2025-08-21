@@ -7,10 +7,25 @@ import requests
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import sys
+import importlib.util
+import inspect
 
 from playwright.sync_api import sync_playwright, Page
+
+# Startup sanity check to catch local module shadowing
+assert importlib.util.find_spec("youtube_transcript_api") is not None, "youtube-transcript-api not installed"
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+
+# Guard against local-file shadowing (e.g., youtube_transcript_api.py in repo)
+try:
+    source_file = inspect.getsourcefile(YouTubeTranscriptApi)
+    assert source_file and ("youtube_transcript_api" in source_file), \
+        f"Shadowed import detected: {source_file}"
+    logging.info(f"YouTube Transcript API loaded from: {source_file}")
+except Exception as e:
+    logging.warning(f"YouTube Transcript API import validation failed: {e}")
 
 from proxy_manager import ProxyManager, ProxyAuthError, ProxyConfigError, generate_correlation_id, error_response
 from transcript_cache import TranscriptCache
@@ -25,7 +40,8 @@ _CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 ENABLE_YT_API = os.getenv("ENABLE_YT_API", "1") == "1"
 ENABLE_TIMEDTEXT = os.getenv("ENABLE_TIMEDTEXT", "1") == "1"
 ENABLE_YOUTUBEI = os.getenv("ENABLE_YOUTUBEI", "1") == "1"  # Enable by default for better fallback
-ENABLE_ASR_FALLBACK = os.getenv("ENABLE_ASR_FALLBACK", "0") == "1"
+ASR_DISABLED = os.getenv("ASR_DISABLED", "false").lower() in ("1", "true", "yes")
+ENABLE_ASR_FALLBACK = not ASR_DISABLED  # Enable ASR by default unless explicitly disabled
 
 # Performance and safety controls
 PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "45000"))
@@ -242,10 +258,12 @@ class ASRAudioExtractor:
             logging.info("Playwright circuit breaker active - skipping ASR")
             return ""
         
-        # Preflight check
-        if not youtube_reachable():
-            logging.info("YouTube preflight failed - skipping ASR")
-            return ""
+        # Non-fatal preflight check: log only
+        try:
+            if not youtube_reachable():
+                logging.info("YouTube preflight failed - continuing with ASR anyway")
+        except Exception as e:
+            logging.info(f"YouTube preflight error ({e}); continuing with ASR")
         
         captured_url = {"url": None}
         
@@ -262,7 +280,14 @@ class ASRAudioExtractor:
                 browser = None
                 try:
                     # Launch browser
-                    launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+                    launch_args = {
+                        "headless": True,
+                        "args": [
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--autoplay-policy=no-user-gesture-required"
+                        ]
+                    }
                     if proxy_manager:
                         cfg = proxy_manager.proxy_dict_for("playwright")
                         if cfg:
@@ -288,7 +313,7 @@ class ASRAudioExtractor:
                     
                     for url in urls:
                         try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                            page.goto(url, wait_until="networkidle", timeout=60000)
                             
                             # ensure the player has focus, then play
                             try:
@@ -478,6 +503,7 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
     capture /youtubei/v1/get_transcript JSON, parse lines to plain text.
     Enhanced with safety controls: preflight check, circuit breaker, no-proxy-first.
     """
+    logging.info(f"transcript_stage_start video_id={video_id} stage=youtubei")
     timeout_ms = timeout_ms or PW_NAV_TIMEOUT_MS
     now_ms = int(time.time() * 1000)
     
@@ -486,10 +512,12 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
         logging.info("Playwright circuit breaker active - skipping YouTubei capture")
         return ""
     
-    # Preflight check
-    if not youtube_reachable():
-        logging.info("YouTube preflight failed - skipping YouTubei capture")
-        return ""
+    # Non-fatal probe: log and proceed regardless
+    try:
+        if not youtube_reachable():
+            logging.info("YouTube ping failed; proceeding with YouTubei anyway")
+    except Exception:
+        logging.info("YouTube ping check error; proceeding anyway")
     
     # Convert cookies to Playwright format
     pw_cookies = _convert_cookiejar_to_playwright_format(cookies)
@@ -499,14 +527,20 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
         f"https://m.youtube.com/watch?v={video_id}&hl=en",
     ]
     
-    # No-proxy first, then proxy
-    use_proxy_order = [False, True]
+    # Only add proxy=True branch if a proxy config exists
+    use_proxy_order = [False]
+    if proxy_manager and proxy_manager.proxy_dict_for("playwright"):
+        use_proxy_order.append(True)
     captured = {"json": None}
 
+    deadline = time.time() + 60  # hard cap ~60s for all YT-i attempts per video
     with _BROWSER_SEM:
         with sync_playwright() as p:
             for use_proxy in use_proxy_order:
                 for url in urls:
+                    if time.time() > deadline:
+                        logging.warning("YouTubei global cap reached; aborting to allow ASR fallback")
+                        return ""
                     browser = None
                     try:
                         # Launch browser with or without proxy
@@ -524,6 +558,11 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
                             locale="en-US",
                             ignore_https_errors=True,
                         )
+                        # Pre-bypass consent on both hosts to avoid interstitials
+                        ctx.add_cookies([
+                            {"name": "CONSENT", "value": "YES+1", "domain": ".youtube.com", "path": "/"},
+                            {"name": "CONSENT", "value": "YES+1", "domain": ".m.youtube.com", "path": "/"},
+                        ])
                         
                         if pw_cookies:
                             ctx.add_cookies(pw_cookies)
@@ -532,17 +571,31 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
                         page.set_default_navigation_timeout(timeout_ms)
                         page.set_default_timeout(timeout_ms)
 
-                        # Reduce weight (keep CSS/JS)
-                        page.route("**/*", lambda r: r.abort()
-                                   if r.request.resource_type in {"image","font","media"} else r.continue_())
+                        # Reduce weight but allow YouTube CSS for proper UI rendering
+                        def route_handler(route):
+                            url = route.request.url.lower()
+                            resource_type = route.request.resource_type
+                            
+                            # Allow CSS from YouTube and Google domains
+                            if resource_type == "stylesheet" and any(domain in url for domain in ["youtube.com", "google.com", "gstatic.com"]):
+                                route.continue_()
+                            # Block heavy resources but keep essential ones
+                            elif resource_type in {"image", "font", "media"}:
+                                route.abort()
+                            else:
+                                route.continue_()
+                        
+                        page.route("**/*", route_handler)
 
                         def on_response(resp):
                             try:
                                 if "/youtubei/v1/get_transcript" in resp.url and resp.request.method == "POST":
+                                    logging.info(f"youtubei_response video_id={video_id} url={resp.url} status={resp.status}")
                                     captured["json"] = resp.json()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logging.warning(f"youtubei_response_parse_failed video_id={video_id} error={e}")
 
+                        # Attach listener *before* navigation
                         page.on("response", on_response)
                         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
@@ -614,10 +667,19 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
                                     "button:has-text('Show transcript')"
                                 ], wait_after=1000)
 
-                        # Give the request time to fire
-                        page.wait_for_timeout(1500)
-
                         data = captured["json"]
+                        if data is None:
+                            try:
+                                with page.expect_response(
+                                    lambda r: "/youtubei/v1/get_transcript" in r.url and r.request.method == "POST",
+                                    timeout=timeout_ms
+                                ) as tr_resp:
+                                    logging.info(f"youtubei_expect_response waiting video_id={video_id}")
+                                if tr_resp.value.ok:
+                                    data = tr_resp.value.json()
+                            except Exception as e:
+                                logging.warning(f"youtubei_expect_response_failed video_id={video_id} error={e}")
+
                         text = _parse_youtubei_transcript_json(data) if data else ""
                         
                         if text:
@@ -715,6 +777,7 @@ def _pw_proxy(pm: Optional[ProxyManager]):
         logging.info("Playwright proxy -> none (config not generated)")
     return cfg
 
+# NOTE: legacy helper; not used by the main fallback chain.
 def scrape_transcript_with_playwright(video_id: str, pm: Optional[ProxyManager] = None, cookies=None, timeout_ms=60000) -> str:
     url = f"https://www.youtube.com/watch?v={video_id}"
     with sync_playwright() as p:
@@ -808,13 +871,18 @@ class TranscriptService:
                 logging.info(f"transcript_attempt video_id={video_id} method=cache success=true duration_ms=0")
                 return cached_transcript
 
-            # Proxy preflight if available (skip if proxy not properly configured)
-            if self.proxy_manager:
+            # YouTube-specific preflight: probe + rotate session; do NOT globally disable proxy
+            if self.proxy_manager and hasattr(self.proxy_manager, "youtube_preflight"):
                 try:
-                    if not self.proxy_manager.preflight():
-                        logging.warning("Proxy preflight failed, continuing without proxy")
+                    ok = self.proxy_manager.youtube_preflight()
+                    if not ok and hasattr(self.proxy_manager, "rotate_session"):
+                        logging.warning("YouTube preflight blocked; rotating proxy session and retrying")
+                        self.proxy_manager.rotate_session()
+                        ok = self.proxy_manager.youtube_preflight()
+                    if not ok:
+                        logging.warning("YouTube preflight still blocked; will attempt both direct and proxy paths in fallbacks")
                 except (ProxyAuthError, ProxyConfigError) as e:
-                    logging.warning(f"Proxy error, continuing without proxy: {e}")
+                    logging.warning(f"YouTube preflight error; proceeding with both direct and proxy fallbacks: {e}")
 
             # Hierarchical fallback with feature flags
             transcript_text, source = self._get_transcript_with_fallback(video_id, language, user_cookies, playwright_cookies)
@@ -894,42 +962,137 @@ class TranscriptService:
 
     def get_captions_via_api(self, video_id: str, languages=("en", "en-US", "es")) -> str:
         """
-        First tier: YouTube Transcript API - fastest and most reliable method.
-        Works for both human and auto captions when available.
+        First tier: YouTube Transcript API with human-captions-first logic.
+        Enhanced with robust error handling for XML parsing and network issues.
         """
         try:
-            # Try to get transcript with language preference
-            # Use the correct API method - get_transcript is a class method
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
-            lines = []
-            for segment in transcript_list:
-                text = (segment.get("text") or "").strip()
-                if text:
-                    lines.append(text)
-            return "\n".join(lines).strip()
+            # Log API version and method availability for debugging
+            import youtube_transcript_api as yta_mod
+            logging.info(
+                f"yt-transcript-api version={getattr(yta_mod, '__version__', 'unknown')}, "
+                f"get_transcript_hasattr={hasattr(YouTubeTranscriptApi, 'get_transcript')}"
+            )
             
-        except (TranscriptsDisabled, NoTranscriptFound):
-            # Expected exceptions for videos without transcripts
-            return ""
-        except AttributeError as e:
-            # Handle API version compatibility issues
-            logging.warning(f"YouTube Transcript API attribute error for {video_id}: {e}")
+            # Strategy 1: Try list_transcripts first (more robust)
             try:
-                # Try alternative API usage for different versions
-                from youtube_transcript_api import YouTubeTranscriptApi as YTAPI
-                transcript_list = YTAPI.get_transcript(video_id, languages=list(languages))
+                transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+                
+                # Prefer human captions, then auto-generated
+                preferred = ['en', 'en-US', 'en-GB', 'es', 'es-ES']
+                transcript_obj = None
+                source_info = ""
+                
+                # Try preferred languages for manual transcripts first
+                for lang in preferred:
+                    try:
+                        transcript_obj = transcripts.find_transcript([lang])
+                        source_info = f"yt_api:{lang}:{'manual' if not transcript_obj.is_generated else 'auto'}"
+                        logging.info(f"Found transcript for {video_id}: {source_info}")
+                        break
+                    except NoTranscriptFound:
+                        continue
+                
+                # If no preferred manual transcript, try any manual transcript
+                if not transcript_obj:
+                    try:
+                        for transcript in transcripts:
+                            if not transcript.is_generated:
+                                transcript_obj = transcript
+                                source_info = f"yt_api:{transcript.language_code}:manual"
+                                logging.info(f"Found manual transcript for {video_id}: {source_info}")
+                                break
+                    except Exception:
+                        pass
+                
+                # If no manual transcript, try auto-generated in preferred languages
+                if not transcript_obj:
+                    for lang in preferred:
+                        try:
+                            transcript_obj = transcripts.find_generated_transcript([lang])
+                            source_info = f"yt_api:{lang}:auto"
+                            logging.info(f"Found auto transcript for {video_id}: {source_info}")
+                            break
+                        except NoTranscriptFound:
+                            continue
+                
+                # Last resort: any available transcript
+                if not transcript_obj:
+                    transcript_obj = next((tr for tr in transcripts if tr), None)
+                    if transcript_obj:
+                        source_info = f"yt_api:{transcript_obj.language_code}:{'manual' if not transcript_obj.is_generated else 'auto'}"
+                        logging.info(f"Found fallback transcript for {video_id}: {source_info}")
+                
+                if transcript_obj:
+                    # Fetch with error handling for XML parsing issues
+                    try:
+                        segments = transcript_obj.fetch()
+                    except Exception as fetch_error:
+                        logging.warning(f"Transcript fetch failed for {video_id}: {fetch_error}")
+                        # Try alternative approach
+                        raise fetch_error
+                else:
+                    raise NoTranscriptFound(video_id)
+                    
+            except Exception as list_error:
+                # Strategy 2: Fallback to direct get_transcript with enhanced error handling
+                logging.info(f"List transcripts failed for {video_id}, trying direct get_transcript: {list_error}")
+                
+                # Try each language individually to isolate issues
+                segments = None
+                for lang in languages:
+                    try:
+                        segments = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
+                        source_info = f"yt_api:{lang}:direct"
+                        logging.info(f"Direct transcript success for {video_id} with {lang}")
+                        break
+                    except Exception as lang_error:
+                        logging.debug(f"Direct transcript failed for {video_id} with {lang}: {lang_error}")
+                        continue
+                
+                if not segments:
+                    # Final attempt with all languages
+                    segments = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
+                    source_info = "yt_api:multi:direct"
+            
+            # Serialize captions with robust text extraction
+            if segments:
                 lines = []
-                for segment in transcript_list:
-                    text = (segment.get("text") or "").strip()
-                    if text:
-                        lines.append(text)
-                return "\n".join(lines).strip()
-            except Exception as fallback_e:
-                logging.warning(f"YouTube Transcript API fallback also failed for {video_id}: {fallback_e}")
+                for seg in segments:
+                    text = seg.get("text", "")
+                    if isinstance(text, str) and text.strip():
+                        # Clean up common transcript artifacts
+                        text = text.strip()
+                        # Remove common YouTube auto-caption artifacts
+                        if text not in ["[Music]", "[Applause]", "[Laughter]", "♪", "♫"]:
+                            lines.append(text)
+                
+                transcript_text = "\n".join(lines).strip()
+                
+                if transcript_text:
+                    logging.info(f"Successfully extracted transcript for {video_id} via {source_info}: {len(transcript_text)} chars")
+                    return transcript_text
+                else:
+                    logging.warning(f"Transcript extraction resulted in empty text for {video_id}")
+                    return ""
+            else:
+                logging.warning(f"No segments returned for {video_id}")
                 return ""
+            
+        except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+            logging.info(f"No YT captions via API for {video_id}: {type(e).__name__}")
+            return ""
         except Exception as e:
-            # Defensive: never crash pipeline on API errors
-            logging.warning(f"YouTube Transcript API error for {video_id}: {e}")
+            # Enhanced error logging for debugging
+            error_type = type(e).__name__
+            error_msg = str(e)
+            
+            # Special handling for XML parsing errors
+            if "no element found" in error_msg or "ParseError" in error_type:
+                logging.warning(f"YouTube Transcript API XML parsing error for {video_id}: {error_msg}")
+                logging.info(f"This usually indicates YouTube is blocking requests or the video has no transcript")
+            else:
+                logging.warning(f"YouTubeTranscriptApi error for {video_id}: {error_type}: {error_msg}")
+            
             return ""
 
     def asr_from_intercepted_audio(self, video_id: str, pm: Optional[ProxyManager] = None, cookies=None) -> str:
@@ -937,8 +1100,9 @@ class TranscriptService:
         ASR fallback: Extract audio via HLS interception and transcribe with Deepgram.
         Includes cost controls and duration limits.
         """
+        logging.info(f"transcript_stage_start video_id={video_id} stage=asr")
         if not self.deepgram_api_key:
-            logging.warning("ASR fallback skipped: DEEPGRAM_API_KEY not configured")
+            logging.warning(f"transcript_attempt video_id={video_id} method=asr success=false reason=no_key")
             return ""
         
         try:

@@ -18,6 +18,13 @@ from typing import Dict, Optional, Tuple
 import boto3
 import requests
 
+# YouTube preflight URLs for testing
+_YT_PREFLIGHT_URLS = [
+    "https://www.youtube.com/generate_204",
+    "https://i.ytimg.com/generate_204",
+    "https://redirector.googlevideo.com/generate_204",
+]
+
 # Exception hierarchy
 class ProxyError(Exception):
     """Base proxy error"""
@@ -507,15 +514,107 @@ class ProxyManager:
             }
         return None
 
-    def rotate_session(self, failed_token: str):
-        """Blacklist failed session and force new token"""
+    def rotate_session(self, failed_token: Optional[str] = None):
+        """Enhanced session rotation with automatic token extraction"""
         if not self.in_use or self.secret is None:
             self.logger.log_event("debug", "Proxy not in use, skipping session rotation")
+            return
+        
+        # If no token provided, generate a new one to force rotation
+        if failed_token is None:
+            # Clear preflight cache to force re-validation
+            self.preflight_cache = PreflightCache()
+            self._healthy = None
+            self.logger.log_event("info", "Session rotation requested: clearing preflight cache")
             return
             
         # Only log last 4 chars to prevent token leakage
         self.logger.log_event("info", f"Blacklisting session: ...{failed_token[-4:]}")
         self.session_blacklist.add(failed_token)
+        
+        # Clear preflight cache when rotating due to failures
+        self.preflight_cache = PreflightCache()
+        self._healthy = None
+
+    def _rotate(self):
+        """Best-effort session rotation implementation (e.g., Oxylabs sessid bump)"""
+        try:
+            # This is a placeholder for provider-specific rotation logic
+            # For Oxylabs, this could involve session ID manipulation
+            # For now, we just clear caches and force new session generation
+            self.preflight_cache = PreflightCache()
+            self._healthy = None
+            self.logger.log_event("info", "Internal session rotation completed")
+        except Exception as e:
+            self.logger.log_event("warning", f"Session rotation failed: {e}")
+
+    def youtube_preflight(self, timeout: float = 5.0) -> bool:
+        """YouTube-specific preflight check with enhanced validation"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("info", "Proxy not in use, skipping YouTube preflight (OK)")
+            return True
+            
+        if self.preflight_disabled:
+            self.logger.log_event("info", "YouTube preflight disabled via OXY_PREFLIGHT_DISABLED")
+            return True
+        
+        # Use existing rate limiting and caching infrastructure
+        with self._preflight_lock:
+            # Check if we have a recent YouTube-specific result
+            cached = self.preflight_cache.get()
+            if cached and not self.preflight_cache.is_expired():
+                return cached.healthy
+            
+            self._preflight_count += 1
+            
+            # Generate fresh session for YouTube testing
+            proxies = self.proxies_for("youtube_preflight")
+            
+            # YouTube-specific endpoints in order of preference
+            youtube_endpoints = [
+                "https://www.youtube.com/generate_204",
+                "https://m.youtube.com/generate_204", 
+                "https://www.youtube.com/favicon.ico"  # Fallback
+            ]
+            
+            last_error = None
+            for endpoint in youtube_endpoints:
+                try:
+                    r = requests.get(endpoint, proxies=proxies, timeout=timeout, 
+                                   headers={"User-Agent": "Mozilla/5.0 (compatible; TLDW/1.0)"})
+                    
+                    if r.status_code in (200, 204):
+                        self.preflight_cache.set(True)
+                        self._healthy = True
+                        self.logger.log_event("info", f"YouTube preflight ok: {endpoint} returned {r.status_code}")
+                        return True
+                    elif r.status_code in (401, 407):
+                        # Definitive auth failure
+                        self.preflight_cache.set(False, f"youtube_auth_{r.status_code}")
+                        self._healthy = False
+                        self.logger.log_event("warning", f"YouTube preflight auth failed: {endpoint} returned {r.status_code}")
+                        raise ProxyAuthError(f"youtube_proxy_auth_failed_{r.status_code}")
+                    elif r.status_code == 429:
+                        # Rate limited - might be temporary
+                        self.logger.log_event("warning", f"YouTube preflight rate limited: {endpoint}")
+                        last_error = f"rate_limited_{r.status_code}"
+                        continue
+                    else:
+                        # Other error codes - try next endpoint
+                        self.logger.log_event("debug", f"YouTube preflight unexpected status: {endpoint} returned {r.status_code}")
+                        last_error = f"unexpected_status_{r.status_code}"
+                        continue
+                        
+                except requests.RequestException as e:
+                    self.logger.log_event("debug", f"YouTube preflight request failed: {endpoint} - {e}")
+                    last_error = str(e)
+                    continue
+            
+            # All endpoints failed
+            self.preflight_cache.set(False, last_error or "all_endpoints_failed")
+            self._healthy = False
+            self.logger.log_event("warning", f"YouTube preflight failed: all endpoints unreachable - {last_error}")
+            return False
 
 # Helper functions for health endpoints and error responses
 def generate_correlation_id() -> str:

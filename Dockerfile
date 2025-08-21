@@ -1,5 +1,5 @@
 # Use Playwright’s Python image that includes OS deps
-FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
 # Set up working dir early
 WORKDIR /app
@@ -14,6 +14,9 @@ RUN apt-get update && \
 # Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright browsers (ensure Chromium is available)
+RUN playwright install --with-deps chromium
 
 # Verify FFmpeg is available during build
 RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"
