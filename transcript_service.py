@@ -24,7 +24,7 @@ _CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 # Feature flags for operational safety
 ENABLE_YT_API = os.getenv("ENABLE_YT_API", "1") == "1"
 ENABLE_TIMEDTEXT = os.getenv("ENABLE_TIMEDTEXT", "1") == "1"
-ENABLE_YOUTUBEI = os.getenv("ENABLE_YOUTUBEI", "0") == "1"
+ENABLE_YOUTUBEI = os.getenv("ENABLE_YOUTUBEI", "1") == "1"  # Enable by default for better fallback
 ENABLE_ASR_FALLBACK = os.getenv("ENABLE_ASR_FALLBACK", "0") == "1"
 
 # Performance and safety controls
@@ -554,27 +554,65 @@ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None,
 
                         # Scroll down to make the Transcript section render
                         def transcript_button_visible():
-                            return page.locator("button:has-text('Show transcript')").first.is_visible()
+                            # Check for multiple possible transcript button selectors
+                            selectors = [
+                                "button:has-text('Show transcript')",
+                                "[aria-label*='Show transcript']",
+                                "ytd-transcript-renderer button",
+                                "#transcript button",
+                                "button[aria-label*='transcript']"
+                            ]
+                            for sel in selectors:
+                                try:
+                                    if page.locator(sel).first.is_visible():
+                                        return True
+                                except Exception:
+                                    continue
+                            return False
 
                         _scroll_until(page, transcript_button_visible, max_steps=50, dy=3000, pause_ms=120)
 
-                        # Try direct 'Show transcript' button first (new UI)
+                        # Enhanced transcript button detection with more selectors
                         opened = _try_click_any(page, [
+                            # New YouTube UI selectors
                             "ytd-transcript-renderer tp-yt-paper-button:has-text('Show transcript')",
                             "button:has-text('Show transcript')",
                             "tp-yt-paper-button:has-text('Show transcript')",
+                            "[aria-label*='Show transcript']",
+                            "ytd-transcript-renderer button",
+                            "#transcript button",
+                            "button[aria-label*='transcript']",
+                            # Alternative text variations
+                            "button:has-text('Transcript')",
+                            "button:has-text('Show Transcript')",
+                            "[role='button']:has-text('Show transcript')",
+                            # Mobile selectors
+                            ".transcript-button",
+                            "[data-target-id='transcript']"
                         ], wait_after=1000)
 
-                        # Fallback: old ⋯ menu path
+                        # Fallback: old ⋯ menu path with enhanced selectors
                         if not opened:
-                            _try_click_any(page, [
+                            # Try to open the more actions menu
+                            menu_opened = _try_click_any(page, [
                                 "button[aria-label*='More actions']",
                                 "button[aria-label*='More options']",
-                            ], wait_after=300)
-                            opened = _try_click_any(page, [
-                                "tp-yt-paper-item:has-text('Show transcript')",
-                                "yt-formatted-string:has-text('Show transcript')",
-                            ], wait_after=1000)
+                                "button[aria-label*='Show more']",
+                                "#menu-button",
+                                ".dropdown-trigger",
+                                "[role='button'][aria-haspopup='true']"
+                            ], wait_after=500)
+                            
+                            if menu_opened:
+                                # Try to click transcript option in menu
+                                opened = _try_click_any(page, [
+                                    "tp-yt-paper-item:has-text('Show transcript')",
+                                    "yt-formatted-string:has-text('Show transcript')",
+                                    "[role='menuitem']:has-text('transcript')",
+                                    ".menu-item:has-text('transcript')",
+                                    "a:has-text('Show transcript')",
+                                    "button:has-text('Show transcript')"
+                                ], wait_after=1000)
 
                         # Give the request time to fire
                         page.wait_for_timeout(1500)
@@ -861,9 +899,10 @@ class TranscriptService:
         """
         try:
             # Try to get transcript with language preference
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
+            # Use the correct API method - get_transcript is a class method
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
             lines = []
-            for segment in transcript:
+            for segment in transcript_list:
                 text = (segment.get("text") or "").strip()
                 if text:
                     lines.append(text)
@@ -872,6 +911,22 @@ class TranscriptService:
         except (TranscriptsDisabled, NoTranscriptFound):
             # Expected exceptions for videos without transcripts
             return ""
+        except AttributeError as e:
+            # Handle API version compatibility issues
+            logging.warning(f"YouTube Transcript API attribute error for {video_id}: {e}")
+            try:
+                # Try alternative API usage for different versions
+                from youtube_transcript_api import YouTubeTranscriptApi as YTAPI
+                transcript_list = YTAPI.get_transcript(video_id, languages=list(languages))
+                lines = []
+                for segment in transcript_list:
+                    text = (segment.get("text") or "").strip()
+                    if text:
+                        lines.append(text)
+                return "\n".join(lines).strip()
+            except Exception as fallback_e:
+                logging.warning(f"YouTube Transcript API fallback also failed for {video_id}: {fallback_e}")
+                return ""
         except Exception as e:
             # Defensive: never crash pipeline on API errors
             logging.warning(f"YouTube Transcript API error for {video_id}: {e}")
