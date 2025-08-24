@@ -138,20 +138,24 @@ class YouTubeTranscriptApiCompat:
             # Note: The new API fetch method signature is different
             # fetch(video_id, languages, preserve_formatting=False)
             
-            # WARNING: The new API (1.2.2) does not appear to support cookies and proxies
-            # in the same way as the old API. Log this limitation.
-            if cookies or proxies:
-                self.logger.warning(
-                    "Cookies and proxies were provided, but youtube-transcript-api 1.2.2 "
-                    "may not support them in the same way as the old API. "
-                    "Attempting to fetch transcript without these parameters."
-                )
+            # Pass cookies and proxies to the new API if supported
+            fetch_kwargs = {}
+            if cookies:
+                fetch_kwargs['cookies'] = cookies
+                self.logger.debug("Adding cookies to API request")
+            if proxies:
+                fetch_kwargs['proxies'] = proxies
+                self.logger.debug(f"Adding proxies to API request: {proxies}")
             
             self.logger.debug(f"Fetching transcript for language: {best_language}")
             
             try:
-                # Try with the best language
-                fetched_transcript = self.api_instance.fetch(video_id, [best_language])
+                # Try with the best language and proxy/cookie parameters
+                if fetch_kwargs:
+                    self.logger.info(f"Calling API with additional parameters: {list(fetch_kwargs.keys())}")
+                    fetched_transcript = self.api_instance.fetch(video_id, [best_language], **fetch_kwargs)
+                else:
+                    fetched_transcript = self.api_instance.fetch(video_id, [best_language])
                 self.logger.debug(f"Got fetched transcript object: {type(fetched_transcript)}")
                 
                 # Convert FetchedTranscript to list of dicts for compatibility
@@ -176,7 +180,22 @@ class YouTubeTranscriptApiCompat:
                             'duration': snippet.duration
                         })
                 except Exception as fallback_error:
-                    raise TranscriptApiError(f"Both specific and default language fetch failed: {fallback_error}")
+                    # Try fallback with proxy/cookie parameters if they were provided
+                    if fetch_kwargs:
+                        try:
+                            self.logger.debug("Trying fallback with proxy/cookie parameters")
+                            fetched_transcript = self.api_instance.fetch(video_id, **fetch_kwargs)
+                            transcript = []
+                            for snippet in fetched_transcript:
+                                transcript.append({
+                                    'text': snippet.text,
+                                    'start': snippet.start,
+                                    'duration': snippet.duration
+                                })
+                        except Exception as final_error:
+                            raise TranscriptApiError(f"All fetch attempts failed. Last error: {final_error}")
+                    else:
+                        raise TranscriptApiError(f"Both specific and default language fetch failed: {fallback_error}")
             
             self.logger.info(f"Successfully retrieved transcript: {len(transcript)} segments")
             return transcript
