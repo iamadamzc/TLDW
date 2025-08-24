@@ -3,18 +3,12 @@ import logging
 
 from flask import Flask, jsonify
 from transcript_metrics import snapshot as transcript_metrics_snapshot
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.orm import DeclarativeBase
+from database import db
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_login import LoginManager
 
 # Set up logging for debugging
 logging.basicConfig(level=logging.DEBUG)
-
-class Base(DeclarativeBase):
-    pass
-
-db = SQLAlchemy(model_class=Base)
 
 # create the app
 app = Flask(__name__)
