@@ -18,6 +18,10 @@ import logging
 import os
 import time
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
