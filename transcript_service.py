@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import tempfile
 from datetime import datetime
+from http.cookies import SimpleCookie
 
 from playwright.sync_api import sync_playwright, Page
 
@@ -1837,6 +1838,43 @@ class TranscriptService:
         self.current_user_id = user_id
         logging.debug(f"Set current user ID to {user_id}")
 
+    def _get_cookies_for_api(self):
+        """
+        Retrieves and formats cookies for the YouTubeTranscriptApi.
+        
+        This method first attempts to get user-specific cookies from S3. If found,
+        it parses the cookie header string into the dictionary format required by
+        the API. If no S3 cookies are available, it falls back to the instance's
+        file-based cookies_path.
+        
+        Returns:
+            dict or str or None: A dictionary of cookies, a string file path, 
+                               or None if no cookies are available.
+        """
+        # First, try to get the user's cookie header string from S3
+        if self.current_user_id:
+            cookie_header = get_user_cookies_with_fallback(self.current_user_id)
+            if cookie_header:
+                logging.info(f"Using user-specific cookies from S3 for user {self.current_user_id}")
+                try:
+                    # Use SimpleCookie to safely parse the header string into a dictionary
+                    cookie = SimpleCookie()
+                    cookie.load(cookie_header)
+                    cookies_dict = {key: morsel.value for key, morsel in cookie.items()}
+                    logging.debug(f"Parsed {len(cookies_dict)} cookies from S3 for user {self.current_user_id}")
+                    return cookies_dict
+                except Exception as e:
+                    logging.warning(f"Failed to parse S3 cookies for user {self.current_user_id}: {e}")
+                    # Continue to fallback options
+        
+        # Fallback to the file-based cookie path if it exists
+        if self.cookies_path:
+            logging.info(f"Falling back to file-based cookies: {self.cookies_path}")
+            return self.cookies_path
+        
+        logging.warning("No cookies available for API request")
+        return None
+
     def get_transcript(
         self,
         video_id: str,
@@ -2019,8 +2057,11 @@ class TranscriptService:
             logging.info(f"yt-transcript-api version={getattr(yta_mod, '__version__', 'unknown')}")
 
             try:
-                # Try list_transcripts approach
-                transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+                # Get cookies for API calls
+                cookie_path = self._get_cookies_for_api()
+                
+                # List transcripts with cookies
+                transcripts = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_path)
                 
                 # Find the best available transcript
                 transcript_obj = None
@@ -2057,8 +2098,8 @@ class TranscriptService:
                         logging.info(f"Found fallback transcript for {video_id}: {source_info}")
                 
                 if transcript_obj:
-                    # Fetch transcript segments (this should work without cookies for public videos)
-                    segments = transcript_obj.fetch()
+                    # Fetch transcript segments with cookies
+                    segments = transcript_obj.fetch(cookies=cookie_path)
                     
                     if segments:
                         # Convert to text
@@ -2078,7 +2119,7 @@ class TranscriptService:
                 
                 # Strategy 3: Try direct get_transcript as final fallback
                 try:
-                    segments = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
+                    segments = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages), cookies=cookie_path)
                     if segments:
                         lines = [seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()]
                         transcript_text = "\n".join(lines).strip()
