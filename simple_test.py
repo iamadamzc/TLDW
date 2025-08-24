@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Test configuration
 VIDEO_ID = 'rNxC16mlO60'  # Original video
 BACKUP_VIDEO_ID = 'dQw4w9WgXcQ'  # Rick Roll as backup
-PROXY_URL = 'http://customer-new_user_LDKZF319z8jZt4KkHgR:update@pr.oxylabs.io:7777'
+PROXY_URL = 'http://customer-new_user_LDKZF-sessid-0322886770-sesstime-10:Change_Password1@pr.oxylabs.io:7777'
 
 def test_simple_transcript():
     """Simple test of the transcript API using compatibility layer"""

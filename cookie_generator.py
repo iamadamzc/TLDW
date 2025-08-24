@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- CONFIGURE THESE ---
 # This must be a STICKY session proxy URL for consistent IP
-PROXY_URL = os.getenv("STICKY_PROXY_URL", "http://user-session123:password@pr.oxylabs.io:7777")
+PROXY_URL = os.getenv("STICKY_PROXY_URL", "http://customer-new_user_LDKZF-sessid-0322886770-sesstime-10:Change_Password1@pr.oxylabs.io:7777")
 SESSION_FILE_PATH = "youtube_session.json"
 # ---
 

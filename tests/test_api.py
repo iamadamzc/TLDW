@@ -34,7 +34,7 @@ VIDEO_ID = 'rNxC16mlO60'  # A video that definitely has a transcript
 COOKIE_FILE = '/path/to/your/cookies.txt' # The full path to your cookie file
 # If you are using Oxylabs, format your proxy URL like this:
 # Using correct credentials
-PROXY_URL = 'http://customer-new_user_LDKZF319z8jZt4KkHgR:update@pr.oxylabs.io:7777' 
+PROXY_URL = 'http://customer-new_user_LDKZF-sessid-0322886770-sesstime-10:Change_Password1@pr.oxylabs.io:7777'
 # --- END CONFIGURATION ---
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

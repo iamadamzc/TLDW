@@ -1951,10 +1951,17 @@ class TranscriptService:
         """
         
         # PRIORITY 1: Try high-quality session cookies from cookie_generator.py
-        session_file_path = os.path.join(os.getcwd(), "youtube_session.json")
+        # --- THIS IS THE FIX ---
+        # Get the absolute path to the directory containing this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Join it with the filename to create a foolproof absolute path
+        session_file_path = os.path.join(script_dir, 'youtube_session.json')
+        # -----------------------
+        
         if os.path.exists(session_file_path):
             try:
-                logging.info(f"🍪 Loading high-quality session cookies from: {session_file_path}")
+                logging.info(f"Attempting to load cookies from session file: {session_file_path}")
+                # Use the new absolute path variable to open the file
                 with open(session_file_path, 'r') as f:
                     session_state = json.load(f)
                 
