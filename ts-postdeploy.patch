@@ -1,0 +1,295 @@
+*** a/transcript_service.py
+--- b/transcript_service.py
+@@
+ import os
+ import logging
+ from typing import Optional, Tuple
+@@
+ _CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+@@
+ PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "45000"))
+ USE_PROXY_FOR_TIMEDTEXT = os.getenv("USE_PROXY_FOR_TIMEDTEXT", "0") == "1"
+ ASR_MAX_VIDEO_MINUTES = int(os.getenv("ASR_MAX_VIDEO_MINUTES", "20"))
+ 
++def _resolve_cookie_file_path() -> Optional[str]:
++    """Prefer COOKIE_DIR/cookies.txt, then latest .txt in COOKIE_DIR, then legacy COOKIE_LOCAL_DIR, finally COOKIES_FILE_PATH."""
++    explicit = os.getenv("COOKIES_FILE_PATH")
++    if explicit and os.path.exists(explicit):
++        return explicit
++    for envvar in ("COOKIE_DIR", "COOKIE_LOCAL_DIR"):
++        d = os.getenv(envvar)
++        if d and os.path.isdir(d):
++            cand = os.path.join(d, "cookies.txt")
++            if os.path.isfile(cand):
++                return cand
++            try:
++                txts = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".txt")]
++                if txts:
++                    return sorted(txts, key=lambda p: os.path.getmtime(p), reverse=True)[0]
++            except Exception:
++                pass
++    return None
++
++def _cookie_header_from_env_or_file() -> Optional[str]:
++    """
++    Return a 'name=value; name2=value2' cookie string from COOKIES_HEADER (preferred) or cookies.txt.
++    """
++    hdr = os.getenv("COOKIES_HEADER")
++    if hdr:
++        val = hdr.strip()
++        if val.lower().startswith("cookie:"):
++            val = val.split(":", 1)[1].strip()
++        return val or None
++    path = _resolve_cookie_file_path()
++    if not path or not os.path.exists(path):
++        return None
++    try:
++        pairs = []
++        with open(path, "r", encoding="utf-8", errors="ignore") as f:
++            for line in f:
++                line = line.strip()
++                if not line or line.startswith(("#", " ")):
++                    continue
++                parts = line.split("\t")
++                if len(parts) >= 7:
++                    name, val = parts[5], parts[6]
++                    if name and val:
++                        pairs.append(f"{name}={val}")
++        return "; ".join(pairs) if pairs else None
++    except Exception:
++        return None
++
+@@
+ def _fetch_timedtext_json3(video_id: str, proxy_manager=None) -> str:
+-    """Enhanced timedtext with cookie header and file support."""
+-    headers = {"Accept-Language": "en-US,en;q=0.8"}
+-    
+-    # Get cookies from TranscriptService instance if available
+-    cookies_path = os.getenv("COOKIES_FILE_PATH")
+-    cookie_header = os.getenv("COOKIES_HEADER")
+-    
+-    # Fallback: auto-discover from COOKIE_LOCAL_DIR
+-    if not cookies_path:
+-        cookie_dir = os.getenv("COOKIE_LOCAL_DIR")
+-        if cookie_dir and os.path.isdir(cookie_dir):
+-            try:
+-                candidate = os.path.join(cookie_dir, "cookies.txt")
+-                if os.path.isfile(candidate):
+-                    cookies_path = candidate
+-                else:
+-                    txts = [os.path.join(cookie_dir, f) for f in os.listdir(cookie_dir) if f.endswith(".txt")]
+-                    if txts:
+-                        cookies_path = sorted(txts, key=lambda p: os.path.getmtime(p), reverse=True)[0]
+-            except Exception:
+-                pass
+-    
+-    # Set up cookie header
+-    if cookie_header:
+-        ck = cookie_header
+-        if ck.lower().startswith("cookie:"):
+-            ck = ck.split(":",1)[1].strip()
+-        headers["Cookie"] = ck
+-    elif cookies_path and os.path.exists(cookies_path):
+-        try:
+-            hdr = []
+-            with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+-                for line in f:
+-                    if line.strip() and not line.startswith(("#"," ")):
+-                        parts = line.strip().split("\t")
+-                        if len(parts) >= 7:
+-                            name, val = parts[5], parts[6]
+-                            hdr.append(f"{name}={val}")
+-            if hdr:
+-                headers["Cookie"] = "; ".join(hdr)
+-        except Exception:
+-            pass
+-    
+-    # Try different endpoints and languages
+-    languages = ["en", "en-US", "es", "es-419"]
++    """Timedtext with Cookie header first, json3 parse; falls back by lang/kind."""
++    headers = {"Accept-Language": "en-US,en;q=0.8"}
++    ck = _cookie_header_from_env_or_file()
++    if ck:
++        headers["Cookie"] = ck
++
++    languages = ["en", "en-US", "en-GB", "es", "es-ES", "es-419"]
+     kinds = [None, "asr"]
+     proxies = proxy_manager.proxy_dict_for("requests") if (proxy_manager and USE_PROXY_FOR_TIMEDTEXT) else None
+@@
+                 if r.status_code == 200 and r.text.strip():
+@@
+                             if hdr:
+                                 headers["Cookie"] = "; ".join(hdr)
+                         except Exception:
+                             pass
+@@
+     return ""
+ 
+ def get_captions_via_timedtext(video_id: str, proxy_manager=None, cookie_jar=None) -> str:
+-    """Robust timed-text with no-proxy-first strategy and backoff."""
+-    languages = ["en", "en-US", "es", "es-419"]
++    """Robust timed-text: try json3+Cookie header first; then no-proxy, then proxy."""
++    languages = ["en", "en-US", "en-GB", "es", "es-ES", "es-419"]
+     kinds = [None, "asr"]  # prefer official, then auto
+     proxies = proxy_manager.proxy_dict_for("requests") if (proxy_manager and USE_PROXY_FOR_TIMEDTEXT) else None
++
++    # First: a quick json3 pass with Cookie header (often bypasses 'disabled' false negatives)
++    try:
++        txt0 = _fetch_timedtext_json3(video_id, proxy_manager=proxy_manager)
++        if txt0:
++            logging.info("Timedtext hit via json3+Cookie header")
++            return txt0
++    except Exception:
++        pass
++
++    # If caller didn't give a requests cookie_jar, derive one from header for next attempts
++    if cookie_jar is None:
++        ck = _cookie_header_from_env_or_file()
++        if ck:
++            cookie_jar = {p.split('=',1)[0]: p.split('=',1)[1] for p in ck.split('; ') if '=' in p}
+@@
+     # No-proxy first (2 attempts with backoff)
+@@
+     logging.info("Timedtext: no captions found")
+     return ""
+@@
+ def get_transcript_via_youtubei(video_id: str, proxy_manager=None, cookies=None, timeout_ms: int = None) -> str:
+@@
+-    urls = [
+-        f"https://www.youtube.com/watch?v={video_id}&hl=en",
+-        f"https://m.youtube.com/watch?v={video_id}&hl=en",
+-    ]
++    urls = [
++        f"https://www.youtube.com/watch?v={video_id}&hl=en",
++        f"https://m.youtube.com/watch?v={video_id}&hl=en",
++        f"https://www.youtube.com/embed/{video_id}?autoplay=1&hl=en",
++    ]
+@@
+-    deadline = time.time() + 60  # hard cap ~60s for all YT-i attempts per video
++    deadline = time.time() + 90  # extend hard cap ~90s for all YT‑i attempts per video
+@@
+-                        page = ctx.new_page()
++                        page = ctx.new_page()
+                         page.set_default_navigation_timeout(timeout_ms)
+                         page.set_default_timeout(timeout_ms)
+@@
+-                        def route_handler(route):
++                        def route_handler(route):
+                             url = route.request.url.lower()
+                             resource_type = route.request.resource_type
+@@
+                             elif resource_type in {"image", "font", "media"}:
+                                 route.abort()
+                             else:
+                                 route.continue_()
+@@
+                         def on_response(resp):
+                             try:
+                                 if (("get_transcript" in resp.url) or ("timedtext" in resp.url)) and resp.request.method in ("POST","GET"):
+                                     captured["json"] = resp.json()
+                                     logging.info(f"youtubei_response video_id={video_id} status={resp.status} url={resp.url}")
+@@
+                         # Explicitly trigger the transcript panel so the XHR fires
+@@
+                         _scroll_until(page, transcript_button_visible, max_steps=50, dy=3000, pause_ms=120)
+@@
+                         if not opened:
+@@
+                         data = captured["json"]
+                         if data is None:
+                             try:
+                                 with page.expect_response(
+                                     lambda r: (("get_transcript" in r.url) or ("timedtext" in r.url)) and r.request.method in ("POST","GET"),
+                                     timeout=timeout_ms
+                                 ) as tr_resp:
+                                     page.wait_for_timeout(400)  # tiny nudge
+                                 if tr_resp.value.ok:
+                                     data = tr_resp.value.json()
+                             except Exception as e:
+                                 logging.warning(f"youtubei_expect_response_failed video_id={video_id} error={e}")
+@@
+ class ASRAudioExtractor:
+@@
+-    def _extract_hls_audio_url(self, video_id: str, proxy_manager=None, cookies=None) -> str:
++    def _extract_hls_audio_url(self, video_id: str, proxy_manager=None, cookies=None) -> str:
+         """Use Playwright to capture HLS audio stream URL"""
+         timeout_ms = PW_NAV_TIMEOUT_MS
+@@
+-        def capture_m3u8_response(response):
+-            """Capture HLS audio stream URLs"""
+-            url = response.url.lower()
+-            if url.endswith(".m3u8") or ".m3u8?" in url:
+-                if ("audio" in url) or ("mime=audio" in url):
+-                    captured_url["url"] = response.url
+-                    logging.info(f"Captured HLS audio URL: {response.url[:100]}...")
++        def capture_m3u8_response(response):
++            """Capture audio stream URLs: HLS (.m3u8), DASH (.mpd), or direct videoplayback?mime=audio."""
++            url = response.url.lower()
++            if (url.endswith(".m3u8") or ".m3u8?" in url) and ("audio" in url or "mime=audio" in url):
++                captured_url["url"] = response.url
++                logging.info(f"Captured HLS audio URL: {response.url[:140]}...")
++            elif url.endswith(".mpd") or ".mpd?" in url:
++                if "audio" in url or "mime=audio" in url:
++                    captured_url["url"] = response.url
++                    logging.info(f"Captured DASH audio MPD: {response.url[:140]}...")
++            elif "videoplayback" in url and ("mime=audio" in url or "mime=audio%2F" in url):
++                captured_url["url"] = response.url
++                logging.info(f"Captured direct audio stream: {response.url[:140]}...")
+@@
+-                    page = ctx.new_page()
++                    page = ctx.new_page()
+                     page.set_default_navigation_timeout(timeout_ms)
+-                    page.on("response", capture_m3u8_response)
++                    page.on("response", capture_m3u8_response)
+@@
+-                    urls = [
+-                        f"https://www.youtube.com/watch?v={video_id}&hl=en",
+-                        f"https://m.youtube.com/watch?v={video_id}&hl=en"
+-                    ]
++                    urls = [
++                        f"https://www.youtube.com/watch?v={video_id}&hl=en",
++                        f"https://m.youtube.com/watch?v={video_id}&hl=en",
++                        f"https://www.youtube.com/embed/{video_id}?autoplay=1&hl=en"
++                    ]
+@@
+-                            # ensure the player has focus, then play
++                            # ensure the player has focus, then play (muted to satisfy autoplay policies)
+                             try:
+                                 page.click("video", timeout=3000)
+                             except Exception:
+                                 pass
+-                            page.keyboard.press("k")  # play
+-                            page.wait_for_timeout(3500)  # Wait for stream to start
++                            try:
++                                page.keyboard.press("k")
++                            except Exception:
++                                pass
++                            try:
++                                page.evaluate("""() => { const v = document.querySelector('video'); if (v){ v.muted=true; v.play().catch(()=>{});} }""")
++                            except Exception:
++                                pass
++                            page.wait_for_timeout(5000)
+@@
+-    def _extract_audio_to_wav(self, audio_url: str, wav_path: str) -> bool:
++    def _extract_audio_to_wav(self, audio_url: str, wav_path: str) -> bool:
+         """Extract audio from HLS stream to WAV using ffmpeg"""
+         try:
+-            cmd = [
+-                "ffmpeg", "-y", "-loglevel", "error",
+-                "-i", audio_url,
++            # Pass UA/Referer/Cookie headers to avoid 403 from googlevideo
++            headers = [f"User-Agent: {_CHROME_UA}", "Referer: https://www.youtube.com/"]
++            ck = _cookie_header_from_env_or_file()
++            if ck:
++                headers.append(f"Cookie: {ck}")
++            headers_arg = "\\r\\n".join(headers) + "\\r\\n"
++            cmd = [
++                "ffmpeg", "-y", "-loglevel", "error",
++                "-headers", headers_arg,
++                "-i", audio_url,
+                 "-vn",  # No video
+                 "-ac", "1",  # Mono
+                 "-ar", "16000",  # 16kHz sample rate
+                 wav_path
+             ]
