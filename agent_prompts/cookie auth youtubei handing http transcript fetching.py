@@ -31,66 +31,59 @@ def get_captions_via_api(self, video_id: str, languages=("en", "en-US", "es")) -
         logging.info(f"yt-transcript-api version={getattr(yta_mod, '__version__', 'unknown')}")
 
         try:
-            # Try list_transcripts approach
-            transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+            # Import compatibility layer
+            from youtube_transcript_api_compat import list_transcripts, get_transcript
             
-            # Find the best available transcript
-            transcript_obj = None
-            source_info = ""
+            # Try list_transcripts approach using compatibility layer
+            transcript_list = list_transcripts(video_id)
             
-            # Prefer manual transcripts in preferred languages
-            for lang in languages:
-                try:
-                    transcript_obj = transcripts.find_transcript([lang])
-                    if not transcript_obj.is_generated:
-                        source_info = f"yt_api:{lang}:manual"
-                        logging.info(f"Found manual transcript for {video_id}: {source_info}")
-                        break
-                except NoTranscriptFound:
-                    continue
-            
-            # If no manual transcript found, try auto-generated
-            if not transcript_obj:
-                for lang in languages:
-                    try:
-                        transcript_obj = transcripts.find_generated_transcript([lang])
-                        source_info = f"yt_api:{lang}:auto"
-                        logging.info(f"Found auto transcript for {video_id}: {source_info}")
-                        break
-                    except NoTranscriptFound:
-                        continue
-            
-            # If still no transcript, take any available
-            if not transcript_obj:
-                available = list(transcripts)
-                if available:
-                    transcript_obj = available[0]
-                    source_info = f"yt_api:{transcript_obj.language_code}:{'auto' if transcript_obj.is_generated else 'manual'}"
-                    logging.info(f"Found fallback transcript for {video_id}: {source_info}")
-            
-            if transcript_obj:
-                # Fetch transcript segments (this should work without cookies for public videos)
-                segments = transcript_obj.fetch()
+            if transcript_list:
+                logging.info(f"Found {len(transcript_list)} available transcripts for {video_id}")
                 
-                if segments:
-                    # Convert to text
-                    lines = []
-                    for seg in segments:
-                        text = seg.get("text", "").strip()
-                        if text and text not in ["[Music]", "[Applause]", "[Laughter]"]:
-                            lines.append(text)
+                # Find the best language match
+                best_lang = None
+                for lang in languages:
+                    for transcript_info in transcript_list:
+                        if transcript_info.get('language_code') == lang:
+                            best_lang = lang
+                            is_auto = transcript_info.get('is_generated', False)
+                            source_info = f"yt_api:{lang}:{'auto' if is_auto else 'manual'}"
+                            logging.info(f"Found transcript for {video_id}: {source_info}")
+                            break
+                    if best_lang:
+                        break
+                
+                # If no exact match, use first available
+                if not best_lang and transcript_list:
+                    first_transcript = transcript_list[0]
+                    best_lang = first_transcript.get('language_code', 'en')
+                    is_auto = first_transcript.get('is_generated', False)
+                    source_info = f"yt_api:{best_lang}:{'auto' if is_auto else 'manual'}"
+                    logging.info(f"Using fallback transcript for {video_id}: {source_info}")
+                
+                if best_lang:
+                    # Get transcript using compatibility layer
+                    segments = get_transcript(video_id, languages=[best_lang])
                     
-                    transcript_text = "\n".join(lines).strip()
-                    if transcript_text:
-                        logging.info(f"Library transcript success for {video_id}: {len(transcript_text)} chars")
-                        return transcript_text
+                    if segments:
+                        # Convert to text
+                        lines = []
+                        for seg in segments:
+                            text = seg.get("text", "").strip()
+                            if text and text not in ["[Music]", "[Applause]", "[Laughter]"]:
+                                lines.append(text)
+                        
+                        transcript_text = "\n".join(lines).strip()
+                        if transcript_text:
+                            logging.info(f"Library transcript success for {video_id}: {len(transcript_text)} chars")
+                            return transcript_text
                         
         except Exception as library_error:
             logging.info(f"Library approach failed for {video_id}: {library_error}")
             
-            # Strategy 3: Try direct get_transcript as final fallback
+            # Strategy 3: Try direct get_transcript as final fallback using compatibility layer
             try:
-                segments = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages))
+                segments = get_transcript(video_id, languages=list(languages))
                 if segments:
                     lines = [seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()]
                     transcript_text = "\n".join(lines).strip()

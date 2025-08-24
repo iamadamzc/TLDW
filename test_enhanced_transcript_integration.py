@@ -323,10 +323,10 @@ class TestEnhancedTranscriptAPI(unittest.TestCase):
         with patch('transcript_service.get_transcript_with_cookies_fixed') as mock_strategy1:
             mock_strategy1.return_value = ""  # Strategy 1 fails
             
-            with patch('transcript_service.YouTubeTranscriptApi.list_transcripts') as mock_strategy2:
+            with patch('transcript_service.list_transcripts') as mock_strategy2:
                 mock_strategy2.side_effect = Exception("Library failed")  # Strategy 2 fails
                 
-                with patch('transcript_service.YouTubeTranscriptApi.get_transcript') as mock_strategy3:
+                with patch('transcript_service.get_transcript') as mock_strategy3:
                     # Strategy 3 succeeds
                     mock_strategy3.return_value = [
                         {"text": "Hello world"},

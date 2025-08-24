@@ -25,7 +25,27 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
+    # New error types in API 1.2.2
+    AgeRestricted,
+    CookieError,
+    CookieInvalid,
+    CookiePathInvalid,
+    CouldNotRetrieveTranscript,
+    FailedToCreateConsentCookie,
+    HTTPError,
+    InvalidVideoId,
+    IpBlocked,
+    NotTranslatable,
+    PoTokenRequired,
+    RequestBlocked,
+    TranslationLanguageNotAvailable,
+    VideoUnplayable,
+    YouTubeDataUnparsable,
+    YouTubeRequestFailed,
+    YouTubeTranscriptApiException,
 )
+# Import our compatibility layer
+from youtube_transcript_api_compat import get_transcript, list_transcripts, TranscriptApiError
 
 # Guard against local-file shadowing (e.g., youtube_transcript_api.py in repo)
 try:
@@ -176,32 +196,110 @@ def handle_timeout_error(video_id: str, elapsed_time: float, method: str) -> Non
     logging.info(f"timeout_event video_id={video_id} method={method} elapsed_time={elapsed_time:.1f}")
 
 
+def get_user_friendly_error_message(error_classification: str, video_id: str) -> str:
+    """Get user-friendly error message for different error types."""
+    error_messages = {
+        "no_transcript": f"No transcript is available for video {video_id}. The video may not have captions enabled.",
+        "video_unavailable": f"Video {video_id} is unavailable. It may be private, deleted, or have an invalid ID.",
+        "age_restricted": f"Video {video_id} is age-restricted and requires authentication to access transcripts.",
+        "cookie_error": f"Authentication failed for video {video_id}. Please check your cookies or login credentials.",
+        "request_blocked": f"Request blocked for video {video_id}. YouTube may be limiting access.",
+        "po_token_required": f"Video {video_id} requires additional authentication (PoToken) that is not currently supported.",
+        "http_error": f"Network error occurred while accessing video {video_id}. Please try again later.",
+        "api_migration_error": f"Internal API error for video {video_id}. Please report this issue.",
+        "youtube_blocking": f"YouTube is blocking transcript requests for video {video_id}. Trying alternative methods.",
+        "timeout": f"Request timed out for video {video_id}. Trying alternative methods.",
+        "translation_error": f"Translation not available for video {video_id} in the requested language.",
+        "parsing_error": f"Failed to parse transcript data for video {video_id}. The video format may not be supported.",
+        "retrieval_error": f"Could not retrieve transcript for video {video_id}. The transcript may be corrupted or inaccessible.",
+        "compat_error": f"Compatibility layer error for video {video_id}. Trying alternative methods.",
+        "unknown": f"Unknown error occurred for video {video_id}. Trying alternative methods."
+    }
+    
+    return error_messages.get(error_classification, f"Error processing video {video_id}.")
+
+
 def classify_transcript_error(error: Exception, video_id: str, method: str) -> str:
-    """Classify transcript errors for better debugging and monitoring."""
+    """Classify transcript errors for better debugging and monitoring with API 1.2.2 support."""
     error_type = type(error).__name__
     error_msg = str(error)
     
-    # Timeout errors
+    # Handle new API 1.2.2 specific errors first
+    if isinstance(error, (TranscriptsDisabled, NoTranscriptFound)):
+        logging.info(f"No transcript available for {video_id} in {method}: {error_msg}")
+        return "no_transcript"
+    
+    elif isinstance(error, (VideoUnavailable, VideoUnplayable, InvalidVideoId)):
+        logging.info(f"Video unavailable for {video_id} in {method}: {error_msg}")
+        return "video_unavailable"
+    
+    elif isinstance(error, AgeRestricted):
+        logging.warning(f"Age-restricted video {video_id} in {method}: {error_msg}")
+        return "age_restricted"
+    
+    elif isinstance(error, (CookieError, CookieInvalid, CookiePathInvalid, FailedToCreateConsentCookie)):
+        logging.warning(f"Cookie issue for {video_id} in {method}: {error_msg}")
+        return "cookie_error"
+    
+    elif isinstance(error, (IpBlocked, RequestBlocked)):
+        logging.warning(f"Request blocked for {video_id} in {method}: {error_msg}")
+        return "request_blocked"
+    
+    elif isinstance(error, PoTokenRequired):
+        logging.warning(f"PoToken required for {video_id} in {method}: {error_msg}")
+        return "po_token_required"
+    
+    elif isinstance(error, (HTTPError, YouTubeRequestFailed)):
+        logging.warning(f"HTTP/Request error for {video_id} in {method}: {error_msg}")
+        return "http_error"
+    
+    elif isinstance(error, (NotTranslatable, TranslationLanguageNotAvailable)):
+        logging.info(f"Translation issue for {video_id} in {method}: {error_msg}")
+        return "translation_error"
+    
+    elif isinstance(error, YouTubeDataUnparsable):
+        logging.warning(f"YouTube data parsing error for {video_id} in {method}: {error_msg}")
+        return "parsing_error"
+    
+    elif isinstance(error, CouldNotRetrieveTranscript):
+        logging.warning(f"Could not retrieve transcript for {video_id} in {method}: {error_msg}")
+        return "retrieval_error"
+    
+    elif isinstance(error, YouTubeTranscriptApiException):
+        logging.warning(f"General API error for {video_id} in {method}: {error_msg}")
+        return "api_error"
+    
+    # Handle compatibility layer errors
+    from youtube_transcript_api_compat import TranscriptApiError
+    if isinstance(error, TranscriptApiError):
+        if "Old API method" in error_msg:
+            logging.error(f"API migration issue for {video_id} in {method}: {error_msg}")
+            return "api_migration_error"
+        else:
+            logging.warning(f"Compatibility layer error for {video_id} in {method}: {error_msg}")
+            return "compat_error"
+    
+    # Timeout errors (legacy handling)
     if "TimeoutError" in error_type or "timeout" in error_msg.lower():
         handle_timeout_error(video_id, 0.0, method)  # elapsed_time would need to be passed in
         return "timeout"
     
-    # YouTube blocking detection
+    # YouTube blocking detection (legacy handling)
     if detect_youtube_blocking(error_msg):
         logging.warning(f"YouTube blocking detected for {video_id} in {method}: {error_msg}")
         return "youtube_blocking"
     
-    # Authentication issues
+    # Authentication issues (legacy handling)
     if any(auth_indicator in error_msg.lower() for auth_indicator in ["unauthorized", "forbidden", "401", "403"]):
         logging.warning(f"Authentication issue for {video_id} in {method}: {error_msg}")
         return "auth_failure"
     
-    # Network issues
+    # Network issues (legacy handling)
     if any(net_indicator in error_msg.lower() for net_indicator in ["connection", "network", "dns", "resolve"]):
         logging.warning(f"Network issue for {video_id} in {method}: {error_msg}")
         return "network_error"
     
-    # Content issues
+    # Content issues (legacy handling)
     if any(content_indicator in error_msg.lower() for content_indicator in ["not found", "unavailable", "private", "deleted"]):
         logging.info(f"Content issue for {video_id} in {method}: {error_msg}")
         return "content_unavailable"
@@ -1840,7 +1938,7 @@ class TranscriptService:
 
     def _get_cookies_for_api(self):
         """
-        Retrieves and formats cookies for the YouTubeTranscriptApi.
+        Retrieves and formats cookies for the YouTube Transcript API (v1.2.2 compatible).
         
         This method first attempts to get user-specific cookies from S3. If found,
         it parses the cookie header string into the dictionary format required by
@@ -2022,18 +2120,44 @@ class TranscriptService:
 
             except Exception as e:
                 duration_ms = int((time.time() - start_time) * 1000)
+                
+                # Classify and handle the error
+                error_classification = classify_transcript_error(e, video_id, source)
+                
                 # Use structured error handling
                 handle_transcript_error(video_id, source, e, duration_ms)
                 inc_fail(source)
+                
+                # Log user-friendly error message for certain error types
+                if error_classification in ["no_transcript", "video_unavailable", "age_restricted"]:
+                    user_message = get_user_friendly_error_message(error_classification, video_id)
+                    logging.info(f"transcript_user_message video_id={video_id} method={source} message='{user_message}'")
+                
                 continue
 
         inc_fail("none")
+        
+        # Log comprehensive failure message with guidance
+        logging.warning(f"All transcript methods failed for {video_id}")
+        logging.info(f"transcript_failure_summary video_id={video_id} methods_attempted={len([m for m, enabled, _ in methods if enabled])}")
+        
+        # Provide guidance based on common failure patterns
+        guidance_messages = [
+            "Verify the video ID is correct and the video exists",
+            "Check if the video has captions enabled",
+            "For age-restricted videos, ensure proper authentication",
+            "For private videos, verify access permissions"
+        ]
+        
+        for msg in guidance_messages:
+            logging.info(f"transcript_guidance video_id={video_id} suggestion='{msg}'")
+        
         return "", "none"
 
     def get_captions_via_api(self, video_id: str, languages=("en", "en-US", "es")) -> str:
         """
-        Enhanced YouTube Transcript API with proper cookie support.
-        Uses direct HTTP method when library fails due to cookie limitations.
+        Enhanced YouTube Transcript API with proper cookie support (v1.2.2 compatible).
+        Uses compatibility layer for API v1.2.2 and direct HTTP method as fallback.
         """
         try:
             # Strategy 1: Try direct HTTP with user cookies first
@@ -2053,53 +2177,40 @@ class TranscriptService:
             logging.info(f"Attempting library-based transcript fetch for {video_id}")
             
             # Log API version for debugging
-            import youtube_transcript_api as yta_mod
-            logging.info(f"yt-transcript-api version={getattr(yta_mod, '__version__', 'unknown')}")
+            from youtube_transcript_api_compat import check_api_migration_status
+            api_status = check_api_migration_status()
+            logging.info(f"yt-transcript-api {api_status['api_version']} (using compatibility layer)")
 
             try:
                 # Get cookies for API calls
                 cookie_path = self._get_cookies_for_api()
                 
-                # List transcripts with cookies
-                transcripts = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookie_path)
+                # Get proxy configuration if available
+                proxies = None
+                if self.proxy_manager:
+                    proxies = self.proxy_manager.proxy_dict_for("requests")
                 
-                # Find the best available transcript
-                transcript_obj = None
-                source_info = ""
+                # Strategy 2A: Use compatibility layer get_transcript (preferred)
+                logging.info(f"Attempting compatibility layer transcript fetch for {video_id}")
                 
-                # Prefer manual transcripts in preferred languages
-                for lang in languages:
-                    try:
-                        transcript_obj = transcripts.find_transcript([lang])
-                        if not transcript_obj.is_generated:
-                            source_info = f"yt_api:{lang}:manual"
-                            logging.info(f"Found manual transcript for {video_id}: {source_info}")
-                            break
-                    except NoTranscriptFound:
-                        continue
+                # Log cookie and proxy status
+                if cookie_path:
+                    logging.info(f"Using cookies for transcript fetch: {type(cookie_path)}")
+                else:
+                    logging.info("No cookies available for transcript fetch")
                 
-                # If no manual transcript found, try auto-generated
-                if not transcript_obj:
-                    for lang in languages:
-                        try:
-                            transcript_obj = transcripts.find_generated_transcript([lang])
-                            source_info = f"yt_api:{lang}:auto"
-                            logging.info(f"Found auto transcript for {video_id}: {source_info}")
-                            break
-                        except NoTranscriptFound:
-                            continue
+                if proxies:
+                    logging.info("Using proxy configuration for transcript fetch")
+                else:
+                    logging.info("No proxy configuration for transcript fetch")
                 
-                # If still no transcript, take any available
-                if not transcript_obj:
-                    available = list(transcripts)
-                    if available:
-                        transcript_obj = available[0]
-                        source_info = f"yt_api:{transcript_obj.language_code}:{'auto' if transcript_obj.is_generated else 'manual'}"
-                        logging.info(f"Found fallback transcript for {video_id}: {source_info}")
-                
-                if transcript_obj:
-                    # Fetch transcript segments with cookies
-                    segments = transcript_obj.fetch(cookies=cookie_path)
+                try:
+                    segments = get_transcript(
+                        video_id, 
+                        languages=list(languages), 
+                        cookies=cookie_path,
+                        proxies=proxies
+                    )
                     
                     if segments:
                         # Convert to text
@@ -2111,34 +2222,93 @@ class TranscriptService:
                         
                         transcript_text = "\n".join(lines).strip()
                         if transcript_text:
-                            logging.info(f"Library transcript success for {video_id}: {len(transcript_text)} chars")
+                            logging.info(f"Compatibility layer transcript success for {video_id}: {len(transcript_text)} chars")
                             return transcript_text
                             
-            except Exception as library_error:
-                logging.info(f"Library approach failed for {video_id}: {library_error}")
+                except TranscriptApiError as compat_error:
+                    error_classification = classify_transcript_error(compat_error, video_id, "compat_layer")
+                    
+                    if error_classification == "api_migration_error":
+                        logging.error(f"API migration issue detected for {video_id}: {compat_error}")
+                        logging.error("The compatibility layer detected incomplete API migration")
+                    else:
+                        logging.info(f"Compatibility layer failed for {video_id}: {compat_error}")
+                        logging.info("Falling back to alternative transcript methods")
                 
-                # Strategy 3: Try direct get_transcript as final fallback
+                # Strategy 2B: Fallback to list_transcripts approach if available
                 try:
-                    segments = YouTubeTranscriptApi.get_transcript(video_id, languages=list(languages), cookies=cookie_path)
-                    if segments:
-                        lines = [seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()]
-                        transcript_text = "\n".join(lines).strip()
-                        if transcript_text:
-                            logging.info(f"Direct get_transcript success for {video_id}")
-                            return transcript_text
-                except Exception as direct_error:
-                    logging.warning(f"Direct get_transcript also failed for {video_id}: {direct_error}")
+                    logging.info(f"Attempting list_transcripts fallback for {video_id}")
+                    transcript_list = list_transcripts(video_id)
+                    
+                    if transcript_list:
+                        logging.info(f"Found {len(transcript_list)} available transcripts")
+                        # Use the first available transcript as fallback
+                        # The compatibility layer already handles language preference
+                        segments = get_transcript(
+                            video_id,
+                            languages=['en'],  # Simplified fallback
+                            cookies=cookie_path,
+                            proxies=proxies
+                        )
+                        
+                        if segments:
+                            lines = [seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip()]
+                            transcript_text = "\n".join(lines).strip()
+                            if transcript_text:
+                                logging.info(f"List transcripts fallback success for {video_id}")
+                                return transcript_text
+                                
+                except Exception as list_error:
+                    logging.info(f"List transcripts fallback failed for {video_id}: {list_error}")
+                            
+            except Exception as library_error:
+                error_classification = classify_transcript_error(library_error, video_id, "library_api")
+                
+                if error_classification == "api_migration_error":
+                    logging.error(f"API version compatibility issue detected for {video_id}: {library_error}")
+                    logging.error("This suggests the code needs to be fully migrated to the new API")
+                elif error_classification in ["no_transcript", "video_unavailable"]:
+                    logging.info(f"Library approach failed for {video_id} ({error_classification}): {library_error}")
+                else:
+                    logging.warning(f"Library approach failed for {video_id} ({error_classification}): {library_error}")
+                    logging.info("Falling back to alternative transcript methods")
 
             return ""
 
         except Exception as e:
             error_classification = classify_transcript_error(e, video_id, "transcript_api")
             
-            if error_classification == "youtube_blocking":
-                logging.warning(f"YouTube Transcript API blocking detected for {video_id}: {str(e)}")
-                logging.info("This usually indicates YouTube is blocking requests or the video has no transcript")
+            # Provide specific guidance based on error type
+            if error_classification == "no_transcript":
+                logging.info(f"No transcript available for {video_id}: {str(e)}")
+                logging.info("This video may not have captions or transcripts enabled")
+            elif error_classification == "video_unavailable":
+                logging.info(f"Video unavailable for {video_id}: {str(e)}")
+                logging.info("The video may be private, deleted, or have an invalid ID")
+            elif error_classification == "age_restricted":
+                logging.warning(f"Age-restricted video {video_id}: {str(e)}")
+                logging.info("Age-restricted videos may require authentication or cookies")
+            elif error_classification == "cookie_error":
+                logging.warning(f"Cookie issue for {video_id}: {str(e)}")
+                logging.info("Try updating cookies or using different authentication method")
+            elif error_classification == "request_blocked":
+                logging.warning(f"Request blocked for {video_id}: {str(e)}")
+                logging.info("YouTube may be blocking requests - consider using proxy or different approach")
+            elif error_classification == "po_token_required":
+                logging.warning(f"PoToken required for {video_id}: {str(e)}")
+                logging.info("This video requires a PoToken for access - may need updated authentication")
+            elif error_classification == "http_error":
+                logging.warning(f"HTTP error for {video_id}: {str(e)}")
+                logging.info("Network or server error - may be temporary")
+            elif error_classification == "api_migration_error":
+                logging.error(f"API migration issue for {video_id}: {str(e)}")
+                logging.error("This indicates incomplete migration to youtube-transcript-api 1.2.2")
+            elif error_classification == "youtube_blocking":
+                logging.warning(f"YouTube blocking detected for {video_id}: {str(e)}")
+                logging.info("YouTube is blocking requests - fallback methods will be attempted")
             elif error_classification == "timeout":
                 logging.warning(f"YouTube Transcript API timeout for {video_id}: {str(e)}")
+                logging.info("Request timed out - fallback methods will be attempted")
             else:
                 logging.warning(f"YouTube Transcript API error for {video_id} ({error_classification}): {type(e).__name__}: {str(e)}")
             
