@@ -21,8 +21,10 @@ RUN playwright install --with-deps chromium
 # Verify FFmpeg is available during build
 RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"
 
-# Copy application code
-COPY . .
+# Copy all Python application files
+COPY *.py ./
+COPY templates/ templates/
+COPY static/ static/
 
 # Create non-root user for App Runner and ensure browser access
 RUN useradd -m app && \
