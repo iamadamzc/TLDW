@@ -160,7 +160,18 @@ def _log_startup_dependencies():
 with app.app_context():
     # Import models to ensure tables are created
     import models  # noqa: F401
-    db.create_all()
+    
+    # Safe database initialization to prevent race conditions between gunicorn workers
+    try:
+        db.create_all()
+        logging.info("Database tables created successfully")
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "already exists" in error_msg or "duplicate" in error_msg:
+            logging.info("Database tables already exist, skipping creation")
+        else:
+            logging.error(f"Database initialization failed: {e}")
+            raise
     
     # Initialize download metadata tracking
     app.last_download_meta = {

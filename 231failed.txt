@@ -1,0 +1,138 @@
+timestamp,message
+1756063704166,[2025-08-24 19:28:24 +0000] [7] [INFO] Starting gunicorn 23.0.0
+1756063704169,[2025-08-24 19:28:24 +0000] [7] [INFO] Listening at: http://0.0.0.0:8080 (7)
+1756063704169,[2025-08-24 19:28:24 +0000] [7] [INFO] Using worker: gthread
+1756063704174,[2025-08-24 19:28:24 +0000] [8] [INFO] Booting worker with pid: 8
+1756063704183,[2025-08-24 19:28:24 +0000] [8] [INFO] TL;DW Startup Dependency Check
+1756063704184,[2025-08-24 19:28:24 +0000] [9] [INFO] Booting worker with pid: 9
+1756063704189,[2025-08-24 19:28:24 +0000] [9] [INFO] TL;DW Startup Dependency Check
+1756063704396,[2025-08-24 19:28:24 +0000] [9] [INFO] STARTUP: ffmpeg at /usr/bin/ffmpeg
+1756063704397,[2025-08-24 19:28:24 +0000] [8] [INFO] STARTUP: ffmpeg at /usr/bin/ffmpeg
+1756063704468,[2025-08-24 19:28:24 +0000] [8] [INFO] STARTUP: ffprobe at /usr/bin/ffprobe
+1756063704468,[2025-08-24 19:28:24 +0000] [8] [INFO] STARTUP: FFMPEG_LOCATION=/usr/bin
+1756063704468,[2025-08-24 19:28:24 +0000] [8] [INFO] STARTUP: ALLOW_MISSING_DEPS=True
+1756063704468,[2025-08-24 19:28:24 +0000] [8] [INFO] STARTUP: Environment ready for application startup
+1756063704470,[2025-08-24 19:28:24 +0000] [9] [INFO] STARTUP: ffprobe at /usr/bin/ffprobe
+1756063704470,[2025-08-24 19:28:24 +0000] [9] [INFO] STARTUP: FFMPEG_LOCATION=/usr/bin
+1756063704470,[2025-08-24 19:28:24 +0000] [9] [INFO] STARTUP: ALLOW_MISSING_DEPS=True
+1756063704470,[2025-08-24 19:28:24 +0000] [9] [INFO] STARTUP: Environment ready for application startup
+1756063705395,[2025-08-24 19:28:25 +0000] [9] [INFO] === TL;DW Startup Dependency Check ===
+1756063705395,[2025-08-24 19:28:25 +0000] [9] [INFO] Python executable: /usr/bin/python3
+1756063705395,[2025-08-24 19:28:25 +0000] [9] [INFO] Working directory: /app
+1756063705395,[2025-08-24 19:28:25 +0000] [9] [INFO] ffmpeg: /usr/bin/ffmpeg
+1756063705395,[2025-08-24 19:28:25 +0000] [9] [INFO] ffprobe: /usr/bin/ffprobe
+1756063705410,[2025-08-24 19:28:25 +0000] [8] [ERROR] Exception in worker process
+1756063705410,Traceback (most recent call last):
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 1967, in _exec_single_context"
+1756063705410,    self.dialect.do_execute(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/default.py"", line 951, in do_execute"
+1756063705410,"    cursor.execute(statement, parameters)"
+1756063705410,sqlite3.OperationalError: table user already exists
+1756063705410,The above exception was the direct cause of the following exception:
+1756063705410,Traceback (most recent call last):
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/arbiter.py"", line 608, in spawn_worker"
+1756063705410,    worker.init_process()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/gthread.py"", line 94, in init_process"
+1756063705410,    super().init_process()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/base.py"", line 135, in init_process"
+1756063705410,    self.load_wsgi()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/base.py"", line 147, in load_wsgi"
+1756063705410,    self.wsgi = self.app.wsgi()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/base.py"", line 66, in wsgi"
+1756063705410,    self.callable = self.load()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/wsgiapp.py"", line 57, in load"
+1756063705410,    return self.load_wsgiapp()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/wsgiapp.py"", line 47, in load_wsgiapp"
+1756063705410,    return util.import_app(self.app_uri)
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/util.py"", line 370, in import_app"
+1756063705410,    mod = importlib.import_module(module)
+1756063705410,"  File ""/usr/lib/python3.10/importlib/__init__.py"", line 126, in import_module"
+1756063705410,"    return _bootstrap._gcd_import(name[level:], package, level)"
+1756063705410,"  File ""<frozen importlib._bootstrap>"", line 1050, in _gcd_import"
+1756063705410,"  File ""<frozen importlib._bootstrap>"", line 1027, in _find_and_load"
+1756063705410,"  File ""<frozen importlib._bootstrap>"", line 1006, in _find_and_load_unlocked"
+1756063705410,"  File ""<frozen importlib._bootstrap>"", line 688, in _load_unlocked"
+1756063705410,"  File ""<frozen importlib._bootstrap_external>"", line 883, in exec_module"
+1756063705410,"  File ""<frozen importlib._bootstrap>"", line 241, in _call_with_frames_removed"
+1756063705410,"  File ""/app/wsgi.py"", line 74, in <module>"
+1756063705410,    from app import app
+1756063705410,"  File ""/app/app.py"", line 163, in <module>"
+1756063705410,    db.create_all()
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/flask_sqlalchemy/extension.py"", line 900, in create_all"
+1756063705410,"    self._call_for_binds(bind_key, ""create_all"")"
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/flask_sqlalchemy/extension.py"", line 881, in _call_for_binds"
+1756063705410,"    getattr(metadata, op_name)(bind=engine)"
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/schema.py"", line 5924, in create_all"
+1756063705410,    bind._run_ddl_visitor(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 3252, in _run_ddl_visitor"
+1756063705410,"    conn._run_ddl_visitor(visitorcallable, element, **kwargs)"
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 2459, in _run_ddl_visitor"
+1756063705410,    ).traverse_single(element)
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/visitors.py"", line 661, in traverse_single"
+1756063705410,"    return meth(obj, **kw)"
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/ddl.py"", line 984, in visit_metadata"
+1756063705410,    self.traverse_single(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/visitors.py"", line 661, in traverse_single"
+1756063705410,"    return meth(obj, **kw)"
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/ddl.py"", line 1022, in visit_table"
+1756063705410,    )._invoke_with(self.connection)
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/ddl.py"", line 321, in _invoke_with"
+1756063705410,    return bind.execute(self)
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 1419, in execute"
+1756063705410,    return meth(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/sql/ddl.py"", line 187, in _execute_on_connection"
+1756063705410,    return connection._execute_ddl(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 1530, in _execute_ddl"
+1756063705410,    ret = self._execute_context(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 1846, in _execute_context"
+1756063705410,    return self._exec_single_context(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 1986, in _exec_single_context"
+1756063705410,    self._handle_dbapi_exception(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 2355, in _handle_dbapi_exception"
+1756063705410,    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/base.py"", line 1967, in _exec_single_context"
+1756063705410,    self.dialect.do_execute(
+1756063705410,"  File ""/usr/local/lib/python3.10/dist-packages/sqlalchemy/engine/default.py"", line 951, in do_execute"
+1756063705410,"    cursor.execute(statement, parameters)"
+1756063705410,sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) table user already exists
+1756063705410,[SQL: 
+1756063705410,CREATE TABLE user (
+1756063705410,"	id INTEGER NOT NULL, "
+1756063705410,"	username VARCHAR(64) NOT NULL, "
+1756063705410,"	email VARCHAR(120) NOT NULL, "
+1756063705410,"	google_id VARCHAR(100) NOT NULL, "
+1756063705410,"	access_token TEXT, "
+1756063705410,"	refresh_token TEXT, "
+1756063705410,"	selected_playlist_id VARCHAR(100), "
+1756063705410,"	PRIMARY KEY (id), "
+1756063705410,"	UNIQUE (username), "
+1756063705410,"	UNIQUE (email), "
+1756063705410,	UNIQUE (google_id)
+1756063705410,)
+1756063705410,]
+1756063705410,(Background on this error at: https://sqlalche.me/e/20/e3q8)
+1756063705410,[2025-08-24 19:28:25 +0000] [8] [INFO] Worker exiting (pid: 8)
+1756063705640,[2025-08-24 19:28:25 +0000] [9] [INFO] [OK] ffmpeg/ffprobe execution test passed
+1756063705677,[2025-08-24 19:28:25 +0000] [7] [ERROR] Worker (pid:8) exited with code 3
+1756063705779,[2025-08-24 19:28:25 +0000] [9] [INFO] [OK] ffmpeg: ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers (at /usr/bin/ffmpeg)
+1756063705779,[2025-08-24 19:28:25 +0000] [9] [INFO] [OK] ffprobe: ffprobe version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2007-2021 the FFmpeg developers (at /usr/bin/ffprobe)
+1756063705779,[2025-08-24 19:28:25 +0000] [9] [INFO] [OK] All critical dependencies available - ASR functionality ready
+1756063705779,[2025-08-24 19:28:25 +0000] [9] [INFO] === End Dependency Check ===
+1756063705783,[2025-08-24 19:28:25 +0000] [9] [WARNING] === Configuration Warnings ===
+1756063705783,[2025-08-24 19:28:25 +0000] [9] [WARNING] ⚠️  ENABLE_ASR_FALLBACK set to 1 (non-default for ASR fallback system)
+1756063705783,[2025-08-24 19:28:25 +0000] [9] [WARNING] ⚠️  ASR fallback enabled without YouTubei - may have limited effectiveness
+1756063705783,[2025-08-24 19:28:25 +0000] [9] [WARNING] ⚠️  USE_PROXY_FOR_TIMEDTEXT=1 may increase latency and error rates
+1756063705783,[2025-08-24 19:28:25 +0000] [9] [INFO] ✅ Configuration validation passed
+1756063705855,[2025-08-24 19:28:25 +0000] [9] [INFO] Secure logging with data redaction enabled
+1756063705989,To make Google authentication work:
+1756063705989,1. Go to https://console.cloud.google.com/apis/credentials
+1756063705989,2. Create a new OAuth 2.0 Client ID
+1756063705989,3. Add https://localhost:5000/google_login/callback to Authorized redirect URIs
+1756063705989,4. Enable YouTube Data API v3 in your Google Cloud Console
+1756063705989,"For detailed instructions, see:"
+1756063705989,https://docs.replit.com/additional-resources/google-auth-in-flask#set-up-your-oauth-app--client
+1756063706207,[2025-08-24 19:28:26 +0000] [9] [INFO] YouTube Transcript API loaded from: /usr/local/lib/python3.10/dist-packages/youtube_transcript_api/_api.py
+1756063706334,[2025-08-24 19:28:26 +0000] [9] [INFO] Configuration validation passed
+1756063706803,[2025-08-24 19:28:26 +0000] [9] [INFO] Worker exiting (pid: 9)
+1756063707181,[2025-08-24 19:28:27 +0000] [7] [ERROR] Shutting down: Master
+1756063707181,[2025-08-24 19:28:27 +0000] [7] [ERROR] Reason: Worker failed to boot.
