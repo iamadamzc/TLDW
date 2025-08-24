@@ -602,29 +602,36 @@ class ASRAudioExtractor:
                 captured_url["url"] = response.url
                 logging.info(f"Captured direct audio stream: {response.url[:140]}...")
 
+        # ASR strategy: try direct first, then proxy if available
+        proxy_strategies = [None]  # Start with no proxy
+        if proxy_manager:
+            try:
+                pw_proxy_config = proxy_manager.proxy_dict_for("playwright")
+                if pw_proxy_config:
+                    proxy_strategies.append(pw_proxy_config)  # Add proxy as fallback
+            except Exception:
+                pass
+
         with _BROWSER_SEM:
             with sync_playwright() as p:
-                browser = None
-                try:
-                    # Use proxy at launch if available
-                    pw_proxy = None
+                for strategy_index, pw_proxy in enumerate(proxy_strategies):
+                    browser = None
                     try:
-                        if proxy_manager:
-                            pw_proxy = proxy_manager.proxy_dict_for("playwright")
-                    except Exception:
-                        pw_proxy = None
-                    browser = p.chromium.launch(
-                        headless=True,
-                        proxy=pw_proxy if pw_proxy else None,
-                        args=[
-                            "--no-sandbox",
-                            "--autoplay-policy=no-user-gesture-required",
-                        ],
-                    )
-                    ctx = browser.new_context(locale="en-US")
-                    # Pre-bypass consent wall
-                    try:
-                        ctx.add_cookies(
+                        strategy_name = "direct" if pw_proxy is None else "proxy"
+                        logging.info(f"ASR attempting {strategy_name} strategy for {video_id}")
+                        
+                        browser = p.chromium.launch(
+                            headless=True,
+                            proxy=pw_proxy,
+                            args=[
+                                "--no-sandbox",
+                                "--autoplay-policy=no-user-gesture-required",
+                            ],
+                        )
+                        ctx = browser.new_context(locale="en-US")
+                        # Pre-bypass consent wall
+                        try:
+                            ctx.add_cookies(
                             [
                                 {
                                     "name": "CONSENT",
@@ -640,73 +647,132 @@ class ASRAudioExtractor:
                                 },
                             ]
                         )
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
 
-                    if cookies:
-                        pw_cookies = _convert_cookiejar_to_playwright_format(cookies)
-                        if pw_cookies:
-                            ctx.add_cookies(pw_cookies)
+                        if cookies:
+                            pw_cookies = _convert_cookiejar_to_playwright_format(cookies)
+                            if pw_cookies:
+                                ctx.add_cookies(pw_cookies)
 
-                    page = ctx.new_page()
-                    page.set_default_navigation_timeout(timeout_ms)
-                    page.on("response", capture_m3u8_response)
+                        page = ctx.new_page()
+                        page.set_default_navigation_timeout(timeout_ms)
+                        page.on("response", capture_m3u8_response)
 
-                    # Try desktop first, then mobile, then embed
-                    urls = [
-                        f"https://www.youtube.com/watch?v={video_id}&hl=en",
-                        f"https://m.youtube.com/watch?v={video_id}&hl=en",
-                        f"https://www.youtube.com/embed/{video_id}?autoplay=1&hl=en",
-                    ]
+                        # Try desktop first, then mobile, then embed with retry logic
+                        urls = [
+                            f"https://www.youtube.com/watch?v={video_id}&hl=en",
+                            f"https://m.youtube.com/watch?v={video_id}&hl=en",
+                            f"https://www.youtube.com/embed/{video_id}?autoplay=1&hl=en",
+                        ]
 
-                    for url in urls:
+                        for url_index, url in enumerate(urls):
+                            max_retries = 2
+                            for retry in range(max_retries):
+                                try:
+                                    # Exponential backoff for retries
+                                    if retry > 0:
+                                        backoff_time = (2 ** retry) * 1000  # 2s, 4s, etc.
+                                        logging.info(f"ASR retry {retry + 1} for {url} after {backoff_time}ms backoff")
+                                        page.wait_for_timeout(backoff_time)
+                                    
+                                    # YouTube rarely reaches "networkidle"; use domcontentloaded to avoid timeouts
+                                    page.goto(url, wait_until="domcontentloaded", timeout=90000)  # Increased timeout
+
+                                # Handle consent dialog immediately after page load
+                                try:
+                                    consent_selectors = [
+                                        'button:has-text("Accept all")',
+                                        'button:has-text("I agree")',
+                                        'button:has-text("Acepto todo")',
+                                        '[aria-label*="Accept"]'
+                                    ]
+                                    for selector in consent_selectors:
+                                        try:
+                                            if page.locator(selector).first.is_visible(timeout=3000):
+                                                page.locator(selector).first.click()
+                                                page.wait_for_timeout(2000)
+                                                logging.info(f"ASR: Accepted consent with {selector}")
+                                                break
+                                        except:
+                                            continue
+                                except Exception:
+                                    pass  # Consent handling is optional
+
+                                # ensure the player has focus, then play (muted to satisfy any policy)
+                                try:
+                                    page.click("video", timeout=5000)  # Increased timeout
+                                except Exception:
+                                    pass
+                                try:
+                                    page.keyboard.press("k")  # toggle play
+                                except Exception:
+                                    pass
+                                try:
+                                    page.evaluate(
+                                        """() => {
+                                        const v = document.querySelector('video');
+                                        if (v) { v.muted = true; v.play().catch(()=>{}); }
+                                    }"""
+                                    )
+                                except Exception:
+                                    pass
+                                
+                                # Give more time for stream/manifest to load
+                                page.wait_for_timeout(8000)  # Increased from 5s to 8s
+
+                                if captured_url["url"]:
+                                    _pw_register_success()
+                                    logging.info(f"ASR audio URL captured successfully on attempt {retry + 1}")
+                                    return captured_url["url"]
+                                
+                                # If no URL captured, this attempt failed
+                                if retry < max_retries - 1:
+                                    logging.warning(f"ASR attempt {retry + 1} failed to capture audio URL for {url}, retrying...")
+                                    continue
+                                else:
+                                    logging.warning(f"ASR failed to capture audio URL for {url} after {max_retries} attempts")
+                                    break
+
+                            except Exception as e:
+                                error_type = type(e).__name__
+                                if "TimeoutError" in error_type:
+                                    logging.warning(f"ASR timeout on attempt {retry + 1} for {url}: {e}")
+                                    if retry < max_retries - 1:
+                                        continue
+                                    else:
+                                        _pw_register_timeout(now_ms)
+                                else:
+                                    logging.warning(f"ASR error on attempt {retry + 1} for {url}: {e}")
+                                    if retry < max_retries - 1:
+                                        continue
+                                break
+
+                        # If we captured a URL with this strategy, return it
+                        if captured_url["url"]:
+                            _pw_register_success()
+                            logging.info(f"ASR audio URL captured using {strategy_name} strategy")
+                            return captured_url["url"]
+
+                    except Exception as e:
+                        strategy_name = "direct" if pw_proxy is None else "proxy"
+                        if "TimeoutError" in str(type(e)):
+                            logging.warning(f"ASR {strategy_name} strategy timeout: {e}")
+                            _pw_register_timeout(now_ms)
+                        else:
+                            logging.warning(f"ASR {strategy_name} strategy error: {e}")
+
+                    finally:
                         try:
-                            # YouTube rarely reaches "networkidle"; use domcontentloaded to avoid timeouts
-                            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-                            # ensure the player has focus, then play (muted to satisfy any policy)
-                            try:
-                                page.click("video", timeout=3000)
-                            except Exception:
-                                pass
-                            try:
-                                page.keyboard.press("k")  # toggle play
-                            except Exception:
-                                pass
-                            try:
-                                page.evaluate(
-                                    """() => {
-                                    const v = document.querySelector('video');
-                                    if (v) { v.muted = true; v.play().catch(()=>{}); }
-                                }"""
-                                )
-                            except Exception:
-                                pass
-                            page.wait_for_timeout(
-                                5000
-                            )  # give time for stream/manifest to load
-
-                            if captured_url["url"]:
-                                _pw_register_success()
-                                return captured_url["url"]
-
-                        except Exception as e:
-                            logging.warning(
-                                f"ASR audio extraction failed for {url}: {e}"
-                            )
-                            continue
-
-                except Exception as e:
-                    if "TimeoutError" in str(type(e)):
-                        _pw_register_timeout(now_ms)
-                    logging.error(f"ASR Playwright error: {e}")
-
-                finally:
-                    try:
-                        if browser:
-                            browser.close()
-                    except Exception:
-                        pass
+                            if browser:
+                                browser.close()
+                        except Exception:
+                            pass
+                    
+                    # If this wasn't the last strategy, continue to next one
+                    if strategy_index < len(proxy_strategies) - 1:
+                        logging.info(f"ASR {strategy_name} strategy failed, trying next strategy")
+                        continue
 
         return ""
 
@@ -911,13 +977,14 @@ def _pw_allowed(now_ms):
 
 
 def _pw_register_timeout(now_ms):
-    """Register Playwright timeout for circuit breaker"""
+    """Register Playwright timeout for circuit breaker with exponential backoff"""
     _PW_FAILS["count"] += 1
     if _PW_FAILS["count"] >= 3:
-        _PW_FAILS["until"] = now_ms + 10 * 60 * 1000  # 10 minutes
+        # Skip YouTubei for 1 hour after 3 consecutive failures
+        _PW_FAILS["until"] = now_ms + 60 * 60 * 1000  # 1 hour
         _PW_FAILS["count"] = 0
         logging.warning(
-            "Playwright circuit breaker activated - skipping for 10 minutes"
+            "YouTubei circuit breaker activated - skipping for 1 hour after 3 consecutive failures"
         )
 
 
@@ -1076,9 +1143,65 @@ def get_transcript_via_youtubei(
 
                         # Attach listener *before* navigation
                         page.on("response", on_response)
+                        
+                        # Session warming - anti-detection strategy
+                        try:
+                            # Visit YouTube homepage first to establish realistic browsing patterns
+                            logging.info(f"YouTubei session warming for {video_id}")
+                            page.goto("https://www.youtube.com", wait_until="domcontentloaded", timeout=30000)
+                            
+                            # Handle consent dialog immediately
+                            try:
+                                consent_button = page.wait_for_selector('button:has-text("Accept all")', timeout=5000)
+                                if consent_button:
+                                    consent_button.click()
+                                    page.wait_for_timeout(2000)
+                                    logging.info("Accepted consent dialog during session warming")
+                            except:
+                                # Try other consent patterns
+                                consent_selectors = [
+                                    'button:has-text("I agree")',
+                                    'button:has-text("Acepto todo")',
+                                    'button:has-text("Estoy de acuerdo")',
+                                    '[aria-label*="Accept"]',
+                                    '[data-testid="accept-button"]'
+                                ]
+                                for selector in consent_selectors:
+                                    try:
+                                        if page.locator(selector).first.is_visible(timeout=2000):
+                                            page.locator(selector).first.click()
+                                            page.wait_for_timeout(2000)
+                                            logging.info(f"Accepted consent with selector: {selector}")
+                                            break
+                                    except:
+                                        continue
+                            
+                            # Human-like pause
+                            import random
+                            page.wait_for_timeout(random.randint(2000, 5000))
+                            
+                            # Visit trending to further establish browsing pattern
+                            page.goto("https://www.youtube.com/trending", wait_until="domcontentloaded", timeout=30000)
+                            page.wait_for_timeout(random.randint(1000, 3000))
+                            
+                        except Exception as warming_error:
+                            logging.warning(f"Session warming failed for {video_id}: {warming_error}")
+                            # Continue anyway - warming is optional
+                        
+                        # Now navigate to target video
                         page.goto(
                             url, wait_until="domcontentloaded", timeout=timeout_ms
                         )
+                        
+                        # Handle consent dialog on video page if still present
+                        try:
+                            consent_button = page.wait_for_selector('button:has-text("Accept all")', timeout=3000)
+                            if consent_button:
+                                consent_button.click()
+                                page.wait_for_timeout(2000)
+                                logging.info("Accepted consent dialog on video page")
+                        except:
+                            pass
 
                         # Explicitly trigger the transcript panel so the XHR fires
                         try:
@@ -1528,6 +1651,11 @@ class TranscriptService:
                 ),
             ),
         ]
+        
+        # Log proxy strategy optimization
+        proxy_available = self.proxy_manager is not None
+        logging.info(f"Transcript pipeline for {video_id}: proxy_available={proxy_available}, "
+                    f"yt_api=direct_first, timedtext=proxy_preferred, youtubei=proxy_preferred, asr=direct_first")
 
         for source, enabled, method in methods:
             if not enabled:
@@ -1668,16 +1796,22 @@ class TranscriptService:
                     try:
                         # Prepare cookies for direct HTTP request
                         cookies = None
+                        proxies = None
+                        
                         if self.cookies_path and os.path.exists(self.cookies_path):
                             cookies = _cookie_header_from_env_or_file()
                         elif self.cookie_header:
                             cookies = self.cookie_header
                         
+                        # For youtube-transcript-api: try direct first (usually works better without proxy)
+                        proxies = None  # Start without proxy for better success rate
+                        
                         # Use direct HTTP transcript fetching
                         transcript_text = get_transcript_with_cookies(
                             video_id, 
                             [transcript_obj.language_code], 
-                            cookies=cookies
+                            cookies=cookies, 
+                            proxies=proxies
                         )
                         
                         if transcript_text:
@@ -1705,53 +1839,73 @@ class TranscriptService:
                     f"List transcripts failed for {video_id}, trying direct get_transcript: {list_error}"
                 )
 
-                # Try each language individually to isolate issues
+                # Try each language individually using direct HTTP method
                 segments = None
+                transcript_text = ""
+                
+                # Prepare cookies for direct HTTP request
+                cookies = None
+                proxies = None
+                
+                if self.cookies_path and os.path.exists(self.cookies_path):
+                    cookies = _cookie_header_from_env_or_file()
+                elif self.cookie_header:
+                    cookies = self.cookie_header
+                
+                # For youtube-transcript-api: try direct first (usually works better without proxy)
+                proxies = None  # Start without proxy for better success rate
+                
                 for lang in languages:
                     try:
-                        if self.cookies_path and os.path.exists(self.cookies_path):
-                            segments = YouTubeTranscriptApi.get_transcript(
-                                video_id, languages=[lang], cookies=self.cookies_path
-                            )
-                        elif self.cookie_header:
-                            segments = YouTubeTranscriptApi.get_transcript(
-                                video_id, languages=[lang], cookies=self.cookie_header
-                            )
+                        # Use direct HTTP transcript fetching
+                        transcript_text = get_transcript_with_cookies(
+                            video_id, 
+                            [lang], 
+                            cookies=cookies, 
+                            proxies=proxies
+                        )
+                        
+                        if transcript_text:
+                            source_info = f"yt_api:{lang}:direct_http"
+                            logging.info(f"Direct HTTP transcript success for {video_id} with {lang}")
+                            return transcript_text
                         else:
+                            # Fallback to original API without cookies
                             segments = YouTubeTranscriptApi.get_transcript(
                                 video_id, languages=[lang]
                             )
-                        source_info = f"yt_api:{lang}:direct"
-                        logging.info(
-                            f"Direct transcript success for {video_id} with {lang}"
-                        )
-                        break
+                            source_info = f"yt_api:{lang}:direct"
+                            logging.info(f"Direct transcript success for {video_id} with {lang}")
+                            break
+                            
                     except Exception as lang_error:
-                        logging.debug(
-                            f"Direct transcript failed for {video_id} with {lang}: {lang_error}"
-                        )
+                        logging.debug(f"Direct transcript failed for {video_id} with {lang}: {lang_error}")
                         continue
 
-                if not segments:
-                    # Final attempt with all languages
-                    if self.cookies_path and os.path.exists(self.cookies_path):
-                        segments = YouTubeTranscriptApi.get_transcript(
-                            video_id,
-                            languages=list(languages),
-                            cookies=self.cookies_path,
-                        )
-                    elif self.cookie_header:
-                        segments = YouTubeTranscriptApi.get_transcript(
-                            video_id,
-                            languages=list(languages),
-                            cookies=self.cookie_header,
-                        )
+                if not segments and not transcript_text:
+                    # Final attempt with all languages using direct HTTP first
+                    transcript_text = get_transcript_with_cookies(
+                        video_id, 
+                        list(languages), 
+                        cookies=cookies, 
+                        proxies=proxies
+                    )
+                    
+                    if transcript_text:
+                        source_info = "yt_api:multi:direct_http"
+                        logging.info(f"Final direct HTTP transcript success for {video_id}")
+                        return transcript_text
                     else:
+                        # Fallback to original API without cookies
                         segments = YouTubeTranscriptApi.get_transcript(
                             video_id, languages=list(languages)
                         )
-                    source_info = "yt_api:multi:direct"
+                        source_info = "yt_api:multi:direct"
 
+            # Return transcript_text if already found via direct HTTP
+            if transcript_text:
+                return transcript_text
+            
             # Serialize captions with robust text extraction
             if segments:
                 lines = []

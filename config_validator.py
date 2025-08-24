@@ -110,7 +110,7 @@ class ConfigValidator:
         # Performance settings with validation
         settings = {
             "WORKER_CONCURRENCY": (2, 1, 10, "Background worker threads"),
-            "PW_NAV_TIMEOUT_MS": (15000, 5000, 60000, "Playwright navigation timeout"),
+            "PW_NAV_TIMEOUT_MS": (120000, 30000, 300000, "Playwright navigation timeout"),
             "ASR_MAX_VIDEO_MINUTES": (20, 1, 120, "ASR maximum video duration")
         }
         
@@ -265,7 +265,7 @@ class ConfigValidator:
             },
             "performance_settings": {
                 "worker_concurrency": result.config.get("WORKER_CONCURRENCY", 2),
-                "pw_timeout_ms": result.config.get("PW_NAV_TIMEOUT_MS", 15000),
+                "pw_timeout_ms": result.config.get("PW_NAV_TIMEOUT_MS", 120000),
                 "asr_max_minutes": result.config.get("ASR_MAX_VIDEO_MINUTES", 20)
             }
         }
