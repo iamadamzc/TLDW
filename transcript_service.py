@@ -2205,6 +2205,8 @@ class TranscriptService:
                     logging.info("No proxy configuration for transcript fetch")
                 
                 try:
+                    # CRITICAL LOGGING FOR PROXY VERIFICATION
+                    logging.critical(f"CRITICAL_CHECK --- TranscriptService calling get_transcript with proxies: {proxies}")
                     segments = get_transcript(
                         video_id, 
                         languages=list(languages), 
@@ -2244,6 +2246,8 @@ class TranscriptService:
                         logging.info(f"Found {len(transcript_list)} available transcripts")
                         # Use the first available transcript as fallback
                         # The compatibility layer already handles language preference
+                        # CRITICAL LOGGING FOR FALLBACK PROXY VERIFICATION
+                        logging.critical(f"CRITICAL_CHECK --- TranscriptService FALLBACK calling get_transcript with proxies: {proxies}")
                         segments = get_transcript(
                             video_id,
                             languages=['en'],  # Simplified fallback

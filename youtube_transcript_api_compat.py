@@ -153,8 +153,14 @@ class YouTubeTranscriptApiCompat:
                 # Try with the best language and proxy/cookie parameters
                 if fetch_kwargs:
                     self.logger.info(f"Calling API with additional parameters: {list(fetch_kwargs.keys())}")
+                    # CRITICAL LOGGING FOR PROXY VERIFICATION
+                    if 'proxies' in fetch_kwargs:
+                        logging.critical(f"CRITICAL_CHECK --- Calling youtube-transcript-api fetch with proxies: {fetch_kwargs['proxies']}")
+                    else:
+                        logging.critical(f"CRITICAL_CHECK --- Calling youtube-transcript-api fetch WITHOUT proxies (fetch_kwargs: {fetch_kwargs})")
                     fetched_transcript = self.api_instance.fetch(video_id, [best_language], **fetch_kwargs)
                 else:
+                    logging.critical(f"CRITICAL_CHECK --- Calling youtube-transcript-api fetch with NO additional parameters (no proxies, no cookies)")
                     fetched_transcript = self.api_instance.fetch(video_id, [best_language])
                 self.logger.debug(f"Got fetched transcript object: {type(fetched_transcript)}")
                 
@@ -184,6 +190,11 @@ class YouTubeTranscriptApiCompat:
                     if fetch_kwargs:
                         try:
                             self.logger.debug("Trying fallback with proxy/cookie parameters")
+                            # CRITICAL LOGGING FOR FALLBACK PROXY VERIFICATION
+                            if 'proxies' in fetch_kwargs:
+                                logging.critical(f"CRITICAL_CHECK --- FALLBACK: Calling youtube-transcript-api fetch with proxies: {fetch_kwargs['proxies']}")
+                            else:
+                                logging.critical(f"CRITICAL_CHECK --- FALLBACK: Calling youtube-transcript-api fetch WITHOUT proxies (fetch_kwargs: {fetch_kwargs})")
                             fetched_transcript = self.api_instance.fetch(video_id, **fetch_kwargs)
                             transcript = []
                             for snippet in fetched_transcript:
