@@ -7,6 +7,9 @@ from database import db
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_login import LoginManager
 
+# Import version marker
+from transcript_service import APP_VERSION
+
 # Set up logging for debugging
 logging.basicConfig(level=logging.DEBUG)
 
@@ -179,6 +182,9 @@ with app.app_context():
         "client_used": "unknown",
         "timestamp": None
     }
+    
+    # Log application version on startup
+    logging.info(f"App boot version: {APP_VERSION}")
     
     # Log dependency status on startup
     _log_startup_dependencies()

@@ -29,7 +29,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- CONFIGURE THESE ---
 # This must be a STICKY session proxy URL for consistent IP
 PROXY_URL = os.getenv("STICKY_PROXY_URL", "http://customer-new_user_LDKZF-sessid-0322886770-sesstime-10:Change_Password1@pr.oxylabs.io:7777")
-SESSION_FILE_PATH = "youtube_session.json"
+
+# Use COOKIE_DIR environment variable for storage state location
+import os
+from pathlib import Path
+COOKIE_DIR = Path(os.getenv("COOKIE_DIR", "/app/cookies"))
+SESSION_FILE_PATH = str(COOKIE_DIR / "youtube_session.json")
 # ---
 
 def generate_youtube_session():
@@ -167,8 +172,12 @@ def generate_youtube_session():
             # Step 5: Save the Complete Session State
             logging.info(f"💾 Saving browser session state to {SESSION_FILE_PATH}...")
             
+            # Ensure the cookies directory exists
+            COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+            
             try:
                 context.storage_state(path=SESSION_FILE_PATH)
+                print(f"[cookie_generator] wrote storage_state at {SESSION_FILE_PATH}")
                 logging.info("✅ Session state saved successfully")
                 
                 # Verify the file was created and has content

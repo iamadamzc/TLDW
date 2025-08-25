@@ -514,6 +514,27 @@ class ProxyManager:
             }
         return None
 
+    def playwright_proxy(self) -> dict | None:
+        """
+        Returns Playwright proxy dict: {"server": "...", "username": "...", "password": "..."}
+        or None if proxies disabled.
+        """
+        proxy_url = self.proxy_url()
+        if not proxy_url:
+            return None
+        # Parse URL to components for Playwright
+        from urllib.parse import urlparse
+        u = urlparse(proxy_url)
+        auth = u.username, u.password
+        return {
+            "server": f"{u.scheme}://{u.hostname}:{u.port}",
+            **({"username": auth[0], "password": auth[1]} if all(auth) else {})
+        }
+
+    def is_production_environment(self) -> bool:
+        """Detect if running in production environment."""
+        return os.getenv('ENVIRONMENT') == 'production' or os.getenv('AWS_REGION') is not None
+
     def rotate_session(self, failed_token: Optional[str] = None):
         """Enhanced session rotation with automatic token extraction"""
         if not self.in_use or self.secret is None:

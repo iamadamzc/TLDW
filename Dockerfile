@@ -39,7 +39,11 @@ ENV PORT=8080 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    COOKIE_DIR=/app/cookies
+
+# Ensure cookies directory exists at runtime
+RUN mkdir -p ${COOKIE_DIR}
 
 # Health check script
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
