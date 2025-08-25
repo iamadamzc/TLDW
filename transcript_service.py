@@ -989,11 +989,11 @@ def _try_click_any(page, selectors, wait_after=0):
     for sel in selectors:
         try:
             loc = page.locator(sel).first
-            if loc.is_visible():
-                loc.click()
-                if wait_after:
-                    page.wait_for_timeout(wait_after)
-                return True
+            loc.wait_for(state="visible", timeout=3000)
+            loc.click()
+            if wait_after:
+                page.wait_for_timeout(wait_after)
+            return True
         except Exception:
             continue
     return False
@@ -1204,12 +1204,13 @@ class ASRAudioExtractor:
                                         ]
                                         for selector in consent_selectors:
                                             try:
-                                                if page.locator(selector).first.is_visible(timeout=3000):
-                                                    page.locator(selector).first.click()
-                                                    page.wait_for_timeout(2000)
-                                                    logging.info(f"ASR: Accepted consent with {selector}")
-                                                    break
-                                            except:
+                                                loc = page.locator(selector).first
+                                                loc.wait_for(state="visible", timeout=3000)
+                                                loc.click()
+                                                page.wait_for_timeout(2000)
+                                                logging.info(f"ASR: Accepted consent with {selector}")
+                                                break
+                                            except Exception:
                                                 continue
                                     except Exception:
                                         pass  # Consent handling is optional
@@ -1510,24 +1511,63 @@ def _pw_register_success():
 
 
 def _convert_cookiejar_to_playwright_format(cookie_jar):
-    """Convert cookie header string or dict into a Playwright cookies list."""
+    """
+    Convert a cookie header string or dict into a Playwright cookies list.
+    Handles host-only cookies (__Host-*) by using 'url' instead of 'domain'.
+    Drops malformed pairs and names/values with illegal chars.
+    """
     if not cookie_jar:
         return None
-    pairs: List[Tuple[str, str]] = []
-    if isinstance(cookie_jar, dict):
-        pairs = list(cookie_jar.items())
-    elif isinstance(cookie_jar, str):
-        for kv in cookie_jar.split(";"):
+
+    def _pairs_from_header(header: str):
+        pairs = []
+        for kv in header.split(";"):
             kv = kv.strip()
-            if "=" in kv:
-                name, value = kv.split("=", 1)
-                pairs.append((name.strip(), value.strip()))
+            if not kv or "=" not in kv:
+                continue
+            name, value = kv.split("=", 1)
+            name, value = name.strip(), value.strip()
+            # basic sanitation: drop illegal cookie name/value chars
+            if not name or any(c in name for c in [';', ',', ' ', '\n', '\r']):
+                continue
+            if any(c in value for c in ['\n', '\r']):
+                continue
+            pairs.append((name, value))
+        return pairs
+
+    if isinstance(cookie_jar, dict):
+        pairs = [(k, v) for k, v in cookie_jar.items() if isinstance(k, str)]
+    elif isinstance(cookie_jar, str):
+        pairs = _pairs_from_header(cookie_jar)
     else:
         return None
+
     cookies = []
     for name, value in pairs:
+        # Host-only cookies must NOT include 'domain'. Use url+path instead.
+        if name.startswith("__Host-"):
+            cookies.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "url": "https://www.youtube.com/",
+                    "path": "/",
+                    "secure": True,
+                }
+            )
+            continue
+        # Default: set on common YT domains
         for domain in [".youtube.com", ".m.youtube.com"]:
-            cookies.append({"name": name, "value": value, "domain": domain, "path": "/"})
+            cookies.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": "/",
+                    # Be permissive; __Secure- prefers secure, set it if name hints it
+                    "secure": name.startswith("__Secure-"),
+                }
+            )
     return cookies or None
 
 
@@ -1981,8 +2021,8 @@ class TranscriptService:
             # 1) youtube_transcript_api (manual captions preferred)
             try:
                 if ENABLE_YT_API:
-                    # Note: the compat layer may not accept cookies; leave as-is.
-                    txt = get_transcript(video_id, language_codes=language_codes)
+                    # youtube_transcript_api_compat expects 'languages', not 'language_codes'
+                    txt = get_transcript(video_id, languages=language_codes)
                     if txt:
                         return txt
             except Exception as e:
