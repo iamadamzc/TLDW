@@ -1884,68 +1884,106 @@ class TranscriptService:
     def get_transcript(
         self,
         video_id: str,
-        language: str = "en",
-        user_cookies=None,
-        playwright_cookies=None,
+        *,
+        language_codes: Optional[list] = None,
+        proxy_manager=None,
+        cookies=None,
+        user_id: Optional[int] = None,   # NEW: allow caller to provide user_id for S3 cookies
     ) -> str:
         """
-        Hierarchical transcript acquisition with comprehensive fallback.
-        Returns transcript text or empty string if all methods fail.
+        Orchestrate the transcript pipeline:
+        youtube_transcript_api -> timedtext -> YouTubei -> ASR (Deepgram)
         """
+        # Resolve cookie header once:
+        cookie_header: Optional[str]
+        if isinstance(cookies, str):
+            cookie_header = cookies.strip() or None
+        elif isinstance(cookies, dict):
+            cookie_header = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+        else:
+            # Try S3-first if user_id provided, else env/file
+            cookie_header = get_user_cookies_with_fallback(user_id)
+
+        # Convenience: dict form for libs expecting cookie jar/dict
+        cookie_dict = None
+        if cookie_header:
+            try:
+                cookie_dict = {
+                    p.split("=", 1)[0].strip(): p.split("=", 1)[1].strip()
+                    for p in cookie_header.split(";")
+                    if "=" in p
+                }
+            except Exception:
+                cookie_dict = None
         correlation_id = generate_correlation_id()
         start_time = time.time()
+        
+        # Use provided proxy_manager or fall back to instance proxy_manager
+        effective_proxy_manager = proxy_manager or self.proxy_manager
+        
+        # Set default language_codes if not provided
+        if language_codes is None:
+            language_codes = ["en", "en-US", "en-GB"]
 
         if video_id in self._video_locks:
             logging.info(f"Video {video_id} already being processed, waiting...")
 
         self._video_locks[video_id] = True
         try:
-            # Check cache first
-            cached_transcript = self.cache.get(video_id, language)
+            # Check cache first (use first language for cache key)
+            primary_language = language_codes[0] if language_codes else "en"
+            cached_transcript = self.cache.get(video_id, primary_language)
             if cached_transcript:
                 logging.info(
                     f"transcript_attempt video_id={video_id} method=cache success=true duration_ms=0"
                 )
                 return cached_transcript
 
-            # YouTube-specific preflight: probe + rotate session; do NOT globally disable proxy
-            if self.proxy_manager and hasattr(self.proxy_manager, "youtube_preflight"):
+            # 1) youtube_transcript_api (manual captions preferred)
+            try:
+                if ENABLE_YT_API:
+                    # Note: the compat layer may not accept cookies; leave as-is.
+                    txt = get_transcript(video_id, language_codes=language_codes)
+                    if txt:
+                        return txt
+            except Exception as e:
+                logging.info(f"YouTube Transcript API failed for {video_id}: {e}")
+
+            # 2) timedtext (json3, xml, then alternate host)
+            txt = get_captions_via_timedtext(
+                video_id,
+                proxy_manager=effective_proxy_manager,
+                cookie_jar=cookie_dict  # pass cookies to requests where supported
+            )
+            if txt:
+                return txt
+
+            # 3) YouTubei via Playwright network capture
+            txt = get_transcript_via_youtubei_with_timeout(
+                video_id,
+                proxy_manager=effective_proxy_manager,
+                cookies=cookie_dict or cookie_header  # function accepts cookie jar OR header; internal converter present
+            )
+            if txt:
+                return txt
+
+            # 4) ASR fallback (Deepgram)
+            if ENABLE_ASR_FALLBACK:
                 try:
-                    ok = self.proxy_manager.youtube_preflight()
-                    if not ok and hasattr(self.proxy_manager, "rotate_session"):
-                        logging.warning(
-                            "YouTube preflight blocked; rotating proxy session and retrying"
+                    dg_key = os.getenv("DEEPGRAM_API_KEY", "")
+                    if dg_key:
+                        asr = ASRAudioExtractor(dg_key)
+                        txt = asr.extract_and_transcribe(
+                            video_id,
+                            proxy_manager=effective_proxy_manager,
+                            cookies=cookie_dict or cookie_header
                         )
-                        self.proxy_manager.rotate_session()
-                        ok = self.proxy_manager.youtube_preflight()
-                    if not ok:
-                        logging.warning(
-                            "YouTube preflight still blocked; will attempt both direct and proxy paths in fallbacks"
-                        )
-                except (ProxyAuthError, ProxyConfigError) as e:
-                    logging.warning(
-                        f"YouTube preflight error; proceeding with both direct and proxy fallbacks: {e}"
-                    )
+                        if txt:
+                            return txt
+                except Exception as e:
+                    logging.error(f"ASR fallback failed for {video_id}: {e}")
 
-            # Hierarchical fallback with feature flags
-            transcript_text, source = self._get_transcript_with_fallback(
-                video_id, language, user_cookies, playwright_cookies
-            )
-
-            # Cache successful result
-            if transcript_text and transcript_text.strip():
-                self.cache.set(
-                    video_id, transcript_text, language, source=source, ttl_days=7
-                )
-
-            # Log final result
-            total_duration_ms = int((time.time() - start_time) * 1000)
-            logging.info(
-                f"transcript_final video_id={video_id} source={source} "
-                f"success={bool(transcript_text)} duration_ms={total_duration_ms}"
-            )
-
-            return transcript_text
+            return ""
 
         finally:
             self._video_locks.pop(video_id, None)
