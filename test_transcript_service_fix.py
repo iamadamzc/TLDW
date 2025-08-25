@@ -37,6 +37,7 @@ def test_transcript_service_signature():
         # Check required parameters
         assert 'video_id' in params, "Missing video_id parameter"
         assert 'user_id' in params, "Missing user_id parameter"
+        assert 'user_cookies' in params, "Missing user_cookies parameter"
         assert 'language_codes' in params, "Missing language_codes parameter"
         assert 'proxy_manager' in params, "Missing proxy_manager parameter"
         assert 'cookies' in params, "Missing cookies parameter"
@@ -47,6 +48,11 @@ def test_transcript_service_signature():
         user_id_param = sig.parameters['user_id']
         assert user_id_param.default is None, f"user_id default should be None, got {user_id_param.default}"
         print("✓ user_id parameter has correct default (None)")
+        
+        # Check that user_cookies has correct default
+        user_cookies_param = sig.parameters['user_cookies']
+        assert user_cookies_param.default is None, f"user_cookies default should be None, got {user_cookies_param.default}"
+        print("✓ user_cookies parameter has correct default (None)")
         
         return True
         

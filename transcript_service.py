@@ -1510,13 +1510,25 @@ def _pw_register_success():
 
 
 def _convert_cookiejar_to_playwright_format(cookie_jar):
-    """Convert cookie jar to Playwright format"""
+    """Convert cookie header string or dict into a Playwright cookies list."""
     if not cookie_jar:
         return None
-
-    # This is a placeholder - implement based on your cookie format
-    # For now, assume cookies are already in the right format
-    return cookie_jar
+    pairs: List[Tuple[str, str]] = []
+    if isinstance(cookie_jar, dict):
+        pairs = list(cookie_jar.items())
+    elif isinstance(cookie_jar, str):
+        for kv in cookie_jar.split(";"):
+            kv = kv.strip()
+            if "=" in kv:
+                name, value = kv.split("=", 1)
+                pairs.append((name.strip(), value.strip()))
+    else:
+        return None
+    cookies = []
+    for name, value in pairs:
+        for domain in [".youtube.com", ".m.youtube.com"]:
+            cookies.append({"name": name, "value": value, "domain": domain, "path": "/"})
+    return cookies or None
 
 
 def get_transcript_via_youtubei(
@@ -1888,24 +1900,51 @@ class TranscriptService:
         language_codes: Optional[list] = None,
         proxy_manager=None,
         cookies=None,
-        user_id: Optional[int] = None,   # NEW: allow caller to provide user_id for S3 cookies
+        user_id: Optional[int] = None,   # S3/env cookie fallback
+        user_cookies: Optional[object] = None,  # NEW: explicit cookies from caller (header str or dict)
+        **kwargs,  # absorb future/alias kwargs without crashing
     ) -> str:
         """
         Orchestrate the transcript pipeline:
         youtube_transcript_api -> timedtext -> YouTubei -> ASR (Deepgram)
         """
-        # Resolve cookie header once:
-        cookie_header: Optional[str]
-        if isinstance(cookies, str):
-            cookie_header = cookies.strip() or None
-        elif isinstance(cookies, dict):
-            cookie_header = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+        # ---- Cookie resolution (single source of truth) ----
+        # Accept multiple inputs and aliases without breaking callers.
+        # Precedence:
+        #   1) user_cookies (explicit from caller)
+        #   2) cookies (legacy kw)
+        #   3) alias kwargs: cookies_header / cookie_header (header string)
+        #   4) S3/env fallback via user_id / env files
+        alias_cookie_header = None
+        if "cookies_header" in kwargs and isinstance(kwargs["cookies_header"], str):
+            alias_cookie_header = kwargs["cookies_header"].strip() or None
+        elif "cookie_header" in kwargs and isinstance(kwargs["cookie_header"], str):
+            alias_cookie_header = kwargs["cookie_header"].strip() or None
+        # log any extra kwargs we're ignoring to aid future cleanup (but don't fail)
+        if kwargs:
+            extra_keys = [k for k in kwargs.keys() if k not in ("cookies_header", "cookie_header")]
+            if extra_keys:
+                logging.info(f"Ignoring extra kwargs in get_transcript: {extra_keys}")
+
+        cookie_header: Optional[str] = None
+        if user_cookies is not None:
+            if isinstance(user_cookies, str):
+                cookie_header = (user_cookies or "").strip() or None
+            elif isinstance(user_cookies, dict):
+                cookie_header = "; ".join(f"{k}={v}" for k, v in user_cookies.items()) or None
+        elif cookies is not None:
+            if isinstance(cookies, str):
+                cookie_header = (cookies or "").strip() or None
+            elif isinstance(cookies, dict):
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items()) or None
+        elif alias_cookie_header:
+            cookie_header = alias_cookie_header
         else:
             # Try S3-first if user_id provided, else env/file
             cookie_header = get_user_cookies_with_fallback(user_id)
 
-        # Convenience: dict form for libs expecting cookie jar/dict
-        cookie_dict = None
+        # Dict form for libs expecting cookie jar/dict
+        cookie_dict: Optional[Dict[str, str]] = None
         if cookie_header:
             try:
                 cookie_dict = {
