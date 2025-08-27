@@ -301,9 +301,20 @@ class JobManager:
         """
         Execute summarization job with per-video error isolation and concurrency control
         """
+        # Import logging setup and lifecycle events
+        from logging_setup import set_job_ctx, clear_job_ctx
+        from log_events import evt, job_received, job_finished, job_failed, video_processed, classify_error_type
+        
         processed_count = 0  # ensure defined for job-level exception paths
         with self.job_semaphore:
             start_time = time.time()
+            
+            # Set job context at the start of processing
+            set_job_ctx(job_id=job_id)
+            
+            # Emit job_received event
+            job_received(video_count=len(video_ids), user_id=user_id)
+            
             self.update_job_status(job_id, "processing")
             
             try:
@@ -336,6 +347,9 @@ class JobManager:
                     for i, vid in enumerate(video_ids):
                         video_start_time = time.time()
                         transcript_source = "none"
+                        
+                        # Set video context for this iteration
+                        set_job_ctx(job_id=job_id, video_id=vid)
                         
                         try:
                             # Get video details with error handling
@@ -383,20 +397,32 @@ class JobManager:
                             processed_count += 1
                             self.update_job_status(job_id, "processing", processed_count=processed_count)
                             
-                            # Enhanced logging with timing and source attribution
+                            # Emit video_processed event with structured data
                             video_duration_ms = int((time.time() - video_start_time) * 1000)
-                            logging.info(f"job_video_processed job_id={job_id} video_id={vid} "
-                                       f"transcript_source={transcript_source} "
-                                       f"transcript_duration_ms={transcript_duration_ms} "
-                                       f"total_duration_ms={video_duration_ms} "
-                                       f"progress={i+1}/{len(video_ids)}")
+                            video_processed(
+                                video_id=vid,
+                                outcome="success",
+                                duration_ms=video_duration_ms,
+                                transcript_source=transcript_source,
+                                transcript_duration_ms=transcript_duration_ms,
+                                progress=f"{i+1}/{len(video_ids)}"
+                            )
                             
                         except Exception as e:
                             # Per-video error isolation - don't stop entire job
                             video_duration_ms = int((time.time() - video_start_time) * 1000)
-                            logging.error(f"job_video_failed job_id={job_id} video_id={vid} "
-                                        f"transcript_source={transcript_source} "
-                                        f"duration_ms={video_duration_ms} error={str(e)}")
+                            error_type = classify_error_type(e)
+                            
+                            # Emit video_processed event for failed video
+                            video_processed(
+                                video_id=vid,
+                                outcome="error",
+                                duration_ms=video_duration_ms,
+                                transcript_source=transcript_source,
+                                error_type=error_type,
+                                error_detail=str(e)[:200],  # Truncate for logging
+                                progress=f"{i+1}/{len(video_ids)}"
+                            )
                             
                             # Add error item to email with safe fallback
                             email_items.append({
@@ -418,25 +444,56 @@ class JobManager:
                         email_sent = email_service.send_digest_email(user_email, email_items)
                         
                         if email_sent:
-                            logging.info(f"job_email_sent job_id={job_id} recipient={user_email} "
-                                       f"items_count={len(email_items)}")
+                            evt("email_sent", recipient=user_email, items_count=len(email_items))
                         else:
-                            logging.error(f"job_email_failed job_id={job_id} recipient={user_email} "
-                                        f"items_count={len(email_items)}")
+                            evt("email_failed", recipient=user_email, items_count=len(email_items), outcome="error")
                     except Exception as e:
                         email_sent = handle_email_error(user_email, e, len(email_items))
+                        evt("email_failed", recipient=user_email, items_count=len(email_items), 
+                            outcome="error", error_type=classify_error_type(e), detail=str(e)[:200])
 
-                    # Job completed successfully
+                    # Determine job outcome
                     total_duration_ms = int((time.time() - start_time) * 1000)
-                    logging.info(f"job_completed job_id={job_id} videos={len(video_ids)} "
-                               f"successes={processed_count} duration_ms={total_duration_ms}")
+                    error_count = len(video_ids) - processed_count
+                    
+                    if processed_count == len(video_ids):
+                        outcome = "success"
+                    elif processed_count > 0:
+                        outcome = "partial_success"
+                    else:
+                        outcome = "error"
+                    
+                    # Emit job_finished event
+                    job_finished(
+                        total_duration_ms=total_duration_ms,
+                        processed_count=processed_count,
+                        video_count=len(video_ids),
+                        outcome=outcome,
+                        email_sent=email_sent,
+                        error_count=error_count
+                    )
                     
                     self.update_job_status(job_id, "done")
 
             except Exception as e:
-                # Critical job-level error - use structured error handling
+                # Critical job-level error - emit job_failed event
+                total_duration_ms = int((time.time() - start_time) * 1000)
+                error_type = classify_error_type(e)
+                
+                job_failed(
+                    total_duration_ms=total_duration_ms,
+                    processed_count=processed_count,
+                    video_count=len(video_ids),
+                    error_type=error_type,
+                    error_detail=str(e)
+                )
+                
+                # Use structured error handling for backward compatibility
                 handle_job_error(job_id, e, len(video_ids), processed_count)
                 self.update_job_status(job_id, "error", str(e))
+            finally:
+                # Clear job context on completion or failure
+                clear_job_ctx()
     
     def _get_user_cookies(self, user_id: int):
         """Get user cookies for restricted video access using secure storage"""

@@ -8,7 +8,8 @@ that bypass YouTube's anti-bot fingerprinting. The primary goal is to create a
 "warmed-up" session state that includes the critical CONSENT cookie.
 
 Usage:
-    python cookie_generator.py
+    python cookie_generator.py                           # Generate new session
+    python cookie_generator.py --from-netscape cookies.txt  # Convert Netscape cookies
 
 Output:
     youtube_session.json - Complete browser session state with cookies
@@ -17,6 +18,9 @@ Output:
 import logging
 import os
 import time
+import json
+import argparse
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 from dotenv import load_dotenv
 
@@ -180,6 +184,9 @@ def generate_youtube_session():
                 print(f"[cookie_generator] wrote storage_state at {SESSION_FILE_PATH}")
                 logging.info("✅ Session state saved successfully")
                 
+                # Inject SOCS/CONSENT cookies if missing after warm-up session
+                inject_consent_cookies_after_generation(SESSION_FILE_PATH)
+                
                 # Verify the file was created and has content
                 if os.path.exists(SESSION_FILE_PATH):
                     file_size = os.path.getsize(SESSION_FILE_PATH)
@@ -236,6 +243,263 @@ def generate_youtube_session():
     logging.info(f"📁 Session file ready at: {os.path.abspath(SESSION_FILE_PATH)}")
     logging.info("💡 Next step: Update your TranscriptService to use this session file")
 
+def convert_netscape_to_storage_state(netscape_path: str) -> bool:
+    """
+    Convert Netscape cookies.txt to Playwright storage_state.json format.
+    Returns True if conversion successful, False otherwise.
+    """
+    logging.info(f"🔄 Converting Netscape cookies from {netscape_path}...")
+    
+    try:
+        # Validate input file exists
+        if not os.path.exists(netscape_path):
+            logging.error(f"❌ Netscape cookies file not found: {netscape_path}")
+            return False
+        
+        # Read and validate Netscape cookies
+        with open(netscape_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        if not validate_netscape_format(content):
+            logging.error(f"❌ Invalid Netscape cookie format in {netscape_path}")
+            return False
+        
+        # Parse Netscape cookies
+        cookies = []
+        for line_num, line in enumerate(content.strip().split('\n'), 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            parts = line.split('\t')
+            if len(parts) < 7:
+                logging.warning(f"⚠️  Skipping malformed line {line_num}: insufficient fields")
+                continue
+            
+            domain, flag, path, secure, expiry, name, value = parts[:7]
+            
+            # Skip empty names or values
+            if not name or not value:
+                logging.warning(f"⚠️  Skipping line {line_num}: empty name or value")
+                continue
+            
+            # Convert to Playwright cookie format
+            cookie = {
+                "name": name,
+                "value": value,
+                "domain": domain if not domain.startswith('.') else domain[1:],
+                "path": path,
+                "secure": secure.lower() == 'true',
+                "httpOnly": False,  # Default for Netscape format
+            }
+            
+            # Handle expiry (convert to seconds since epoch)
+            try:
+                if expiry and expiry != '0':
+                    cookie["expires"] = int(expiry)
+            except (ValueError, TypeError):
+                logging.debug(f"⚠️  Invalid expiry for cookie {name}: {expiry}")
+            
+            # Sanitize __Host- cookies for Playwright compatibility
+            if name.startswith('__Host-'):
+                cookie = sanitize_host_cookie(cookie)
+            
+            cookies.append(cookie)
+        
+        if not cookies:
+            logging.error("❌ No valid cookies found in Netscape file")
+            return False
+        
+        # Create storage state structure
+        storage_state = {
+            "cookies": cookies,
+            "origins": create_minimal_origins_structure(cookies),
+            "localStorage": []
+        }
+        
+        # Inject SOCS/CONSENT cookies if missing
+        storage_state = inject_consent_cookies_if_missing(storage_state)
+        
+        # Ensure cookie directory exists
+        COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Write storage state file
+        with open(SESSION_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(storage_state, f, indent=2)
+        
+        logging.info(f"✅ Successfully converted {len(cookies)} cookies to storage state")
+        logging.info(f"📁 Storage state saved to: {SESSION_FILE_PATH}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to convert Netscape cookies: {e}")
+        return False
+
+
+def validate_netscape_format(content: str) -> bool:
+    """Validate Netscape format before parsing."""
+    if not content.strip():
+        return False
+    
+    lines = content.strip().split('\n')
+    # Check for Netscape format indicators
+    has_comment = any(line.startswith('#') for line in lines[:5])
+    has_tabs = any('\t' in line for line in lines if not line.startswith('#'))
+    
+    return has_comment and has_tabs
+
+
+def sanitize_host_cookie(cookie: dict) -> dict:
+    """
+    Sanitize __Host- cookies for Playwright compatibility.
+    
+    __Host- cookies have strict requirements:
+    - Must have secure=True
+    - Must have path="/"
+    - Must NOT have domain field (use url field instead)
+    
+    This prevents Playwright __Host- cookie validation errors.
+    """
+    # Requirement 12.1: Normalize with secure=True
+    cookie["secure"] = True
+    
+    # Requirement 12.2: Normalize with path="/"
+    cookie["path"] = "/"
+    
+    # Requirement 12.3: Remove domain field and use url field instead
+    if "domain" in cookie:
+        domain = cookie["domain"]
+        # Remove leading dot if present (common in cookie files)
+        if domain.startswith('.'):
+            domain = domain[1:]
+        # Store original domain as url for Playwright
+        cookie["url"] = f"https://{domain}/"
+        del cookie["domain"]
+    
+    return cookie
+
+
+def create_minimal_origins_structure(cookies: list) -> list:
+    """Create minimal origins structure for Playwright compatibility."""
+    origins = set()
+    
+    # Extract unique domains from cookies
+    for cookie in cookies:
+        domain = cookie.get("domain", "")
+        if domain:
+            # Add both www and non-www variants for YouTube
+            if "youtube" in domain.lower():
+                origins.add("https://www.youtube.com")
+                origins.add("https://youtube.com")
+                origins.add("https://m.youtube.com")
+            else:
+                origins.add(f"https://{domain}")
+    
+    # Ensure YouTube origins are always present
+    origins.update([
+        "https://www.youtube.com",
+        "https://youtube.com",
+        "https://m.youtube.com"
+    ])
+    
+    return [{"origin": origin, "localStorage": []} for origin in sorted(origins)]
+
+
+def inject_consent_cookies_if_missing(storage_state: dict) -> dict:
+    """Inject SOCS/CONSENT cookies if missing to prevent consent dialogs."""
+    cookies = storage_state.get("cookies", [])
+    
+    # Check if SOCS or CONSENT cookies already exist
+    has_consent = any(
+        cookie.get("name") in ["SOCS", "CONSENT"] 
+        for cookie in cookies
+    )
+    
+    if not has_consent:
+        logging.info("🍪 Injecting CONSENT cookie to prevent consent dialogs")
+        
+        # Requirement 13.2: Synthesize safe "accepted" values when missing
+        # Requirement 13.3: Scope synthesized cookies to .youtube.com with long expiry
+        consent_cookie = {
+            "name": "CONSENT",
+            "value": "YES+cb.20210328-17-p0.en+FX+1",  # Safe accepted value
+            "domain": ".youtube.com",  # Scoped to .youtube.com
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "expires": int(time.time()) + (365 * 24 * 60 * 60)  # Long expiry (1 year)
+        }
+        
+        cookies.append(consent_cookie)
+        storage_state["cookies"] = cookies
+        
+        logging.info("✅ CONSENT cookie injected successfully")
+    else:
+        logging.info("ℹ️  CONSENT/SOCS cookie already present")
+    
+    return storage_state
+
+
+def inject_consent_cookies_after_generation(session_file_path: str) -> bool:
+    """
+    Inject SOCS/CONSENT cookies after session generation if missing.
+    
+    This function implements Requirements 13.1-13.6:
+    - 13.1: Check for SOCS/CONSENT cookie presence after generation
+    - 13.2: Synthesize safe "accepted" values when missing
+    - 13.3: Scope synthesized cookies to .youtube.com with long expiry
+    - 13.4: Ensure storage_state always includes consent cookies
+    - 13.5: Implement synthesis after generation/conversion only
+    - 13.6: Not at runtime
+    
+    Returns True if injection was successful or not needed, False on error.
+    """
+    try:
+        # Load existing storage state
+        with open(session_file_path, 'r', encoding='utf-8') as f:
+            storage_state = json.load(f)
+        
+        cookies = storage_state.get("cookies", [])
+        
+        # Requirement 13.1: Check for SOCS/CONSENT cookie presence
+        has_socs = any(cookie.get("name") == "SOCS" for cookie in cookies)
+        has_consent = any(cookie.get("name") == "CONSENT" for cookie in cookies)
+        
+        if has_socs or has_consent:
+            logging.info("ℹ️  SOCS/CONSENT cookie already present - no injection needed")
+            return True
+        
+        logging.info("🍪 No SOCS/CONSENT cookies found - injecting safe consent cookie")
+        
+        # Requirement 13.2: Synthesize safe "accepted" values when missing
+        # Requirement 13.3: Scope synthesized cookies to .youtube.com with long expiry
+        consent_cookie = {
+            "name": "CONSENT",
+            "value": "YES+cb.20210328-17-p0.en+FX+1",  # Safe accepted value
+            "domain": ".youtube.com",  # Scoped to .youtube.com
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "expires": int(time.time()) + (365 * 24 * 60 * 60)  # Long expiry (1 year)
+        }
+        
+        # Add the consent cookie to the storage state
+        cookies.append(consent_cookie)
+        storage_state["cookies"] = cookies
+        
+        # Requirement 13.4: Ensure storage_state always includes consent cookies
+        # Write the updated storage state back to file
+        with open(session_file_path, 'w', encoding='utf-8') as f:
+            json.dump(storage_state, f, indent=2)
+        
+        logging.info("✅ CONSENT cookie injected successfully after session generation")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to inject consent cookies after generation: {e}")
+        return False
+
+
 def verify_session_file():
     """Verify the generated session file is valid and contains expected data."""
     
@@ -244,7 +508,6 @@ def verify_session_file():
         return False
     
     try:
-        import json
         with open(SESSION_FILE_PATH, 'r') as f:
             session_data = json.load(f)
         
@@ -266,25 +529,67 @@ def verify_session_file():
         logging.error(f"❌ Session file verification failed: {e}")
         return False
 
-if __name__ == "__main__":
+def main():
+    """Main function with CLI argument parsing."""
+    parser = argparse.ArgumentParser(
+        description="Generate or convert YouTube session cookies for Playwright",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python cookie_generator.py                           # Generate new session
+  python cookie_generator.py --from-netscape cookies.txt  # Convert Netscape cookies
+        """
+    )
+    
+    parser.add_argument(
+        "--from-netscape",
+        metavar="COOKIES_FILE",
+        help="Convert Netscape cookies.txt file to storage_state.json"
+    )
+    
+    args = parser.parse_args()
+    
     try:
-        generate_youtube_session()
-        
-        # Verify the generated session
-        if verify_session_file():
-            logging.info("🎉 Session generation and verification completed successfully!")
-            print("\n" + "="*60)
-            print("✅ SUCCESS: High-quality YouTube session generated!")
-            print(f"📁 Session file: {os.path.abspath(SESSION_FILE_PATH)}")
-            print("💡 Next: Update TranscriptService to use this session file")
-            print("="*60)
-        else:
-            logging.error("❌ Session verification failed")
-            exit(1)
+        if args.from_netscape:
+            # Convert Netscape cookies
+            logging.info("🔄 Converting Netscape cookies to storage state...")
+            success = convert_netscape_to_storage_state(args.from_netscape)
             
+            if success and verify_session_file():
+                logging.info("🎉 Netscape conversion completed successfully!")
+                print("\n" + "="*60)
+                print("✅ SUCCESS: Netscape cookies converted to storage state!")
+                print(f"📁 Input file: {os.path.abspath(args.from_netscape)}")
+                print(f"📁 Output file: {os.path.abspath(SESSION_FILE_PATH)}")
+                print("💡 Storage state ready for Playwright use")
+                print("="*60)
+            else:
+                logging.error("❌ Netscape conversion failed")
+                exit(1)
+        else:
+            # Generate new session
+            logging.info("🚀 Generating new YouTube session...")
+            generate_youtube_session()
+            
+            # Verify the generated session
+            if verify_session_file():
+                logging.info("🎉 Session generation and verification completed successfully!")
+                print("\n" + "="*60)
+                print("✅ SUCCESS: High-quality YouTube session generated!")
+                print(f"📁 Session file: {os.path.abspath(SESSION_FILE_PATH)}")
+                print("💡 Next: Update TranscriptService to use this session file")
+                print("="*60)
+            else:
+                logging.error("❌ Session verification failed")
+                exit(1)
+                
     except KeyboardInterrupt:
-        logging.info("⏹️  Session generation interrupted by user")
+        logging.info("⏹️  Operation interrupted by user")
         exit(1)
     except Exception as e:
-        logging.error(f"❌ Session generation failed: {e}")
+        logging.error(f"❌ Operation failed: {e}")
         exit(1)
+
+
+if __name__ == "__main__":
+    main()

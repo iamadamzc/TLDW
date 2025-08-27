@@ -281,10 +281,12 @@ def setup_logging(log_level: str = None, log_format: str = None):
 
 
 def log_performance_metrics(operation: str, duration_ms: int, **metrics):
-    """Log performance metrics in structured format"""
-    logger = StructuredLogger("performance")
-    logger.info(
-        f"performance_metric operation={operation}",
+    """Log performance metrics in structured format using dedicated performance channel"""
+    from log_events import perf_evt
+    
+    # Use the new performance event function with dedicated channel
+    perf_evt(
+        operation=operation,
         duration_ms=duration_ms,
         **metrics
     )

@@ -10,8 +10,12 @@ from flask_login import LoginManager
 # Import version marker
 from transcript_service import APP_VERSION
 
-# Set up logging for debugging
-logging.basicConfig(level=logging.DEBUG)
+# Configure minimal JSON logging
+from logging_setup import configure_logging
+configure_logging(
+    log_level=os.getenv("LOG_LEVEL", "INFO"),
+    use_json=os.getenv("USE_MINIMAL_LOGGING", "true").lower() == "true"
+)
 
 # create the app
 app = Flask(__name__)
@@ -208,6 +212,25 @@ from cookies_routes import bp_cookies
 app.register_blueprint(google_auth)
 app.register_blueprint(main_routes)
 app.register_blueprint(bp_cookies)
+
+# Register dashboard integration
+try:
+    from dashboard_integration import register_dashboard_routes
+    register_dashboard_routes(app)
+    logging.info("Dashboard integration registered successfully")
+except Exception as e:
+    logging.warning(f"Failed to register dashboard integration: {e}")
+
+# Structured logging is now initialized via configure_logging() at startup
+# Backward compatibility maintained through feature flag USE_MINIMAL_LOGGING
+
+# Initialize performance monitoring
+try:
+    from performance_monitor import get_performance_monitor
+    performance_monitor = get_performance_monitor()
+    logging.info("Performance monitoring initialized")
+except Exception as e:
+    logging.warning(f"Failed to initialize performance monitoring: {e}")
 
 # Add new health endpoints for proxy monitoring
 @app.route('/health/live')
@@ -463,6 +486,60 @@ def health_check_detailed():
     health_info['status'] = 'healthy'
     health_info['message'] = 'All dependencies available - ASR functionality ready'
     return health_info, 200
+
+
+@app.route('/metrics')
+def metrics_endpoint():
+    """Comprehensive metrics endpoint with stage durations, percentiles, and circuit breaker events"""
+    try:
+        from transcript_metrics import get_comprehensive_metrics
+        from transcript_service import get_circuit_breaker_status
+        
+        # Get comprehensive metrics including percentiles and recent events
+        metrics = get_comprehensive_metrics()
+        
+        # Add circuit breaker status
+        metrics['circuit_breaker_status'] = get_circuit_breaker_status()
+        
+        # Add timestamp for metrics collection
+        from datetime import datetime
+        metrics['timestamp'] = datetime.utcnow().isoformat()
+        
+        return jsonify(metrics), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': 'Failed to collect metrics',
+            'details': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
+
+
+@app.route('/metrics/percentiles')
+def metrics_percentiles():
+    """Stage duration percentiles for dashboard integration"""
+    try:
+        from transcript_metrics import get_stage_percentiles
+        
+        # Calculate percentiles for all known stages
+        stages = ["yt_api", "timedtext", "youtubei", "asr"]
+        percentiles = {}
+        
+        for stage in stages:
+            percentiles[stage] = get_stage_percentiles(stage)
+        
+        return jsonify({
+            'stage_percentiles': percentiles,
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': 'Failed to calculate percentiles',
+            'details': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
+
 
 @app.errorhandler(Exception)
 def handle_exc(e):

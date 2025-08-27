@@ -8,17 +8,25 @@ import subprocess
 import logging
 import sys
 
-# Configure logging for container startup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+# Initialize minimal JSON logging early
+from logging_setup import configure_logging
+configure_logging(
+    log_level=os.getenv("LOG_LEVEL", "INFO"),
+    use_json=os.getenv("USE_MINIMAL_LOGGING", "true").lower() == "true"
 )
 
-# Align with gunicorn handlers if present
+# Align with gunicorn handlers if present (after our configuration)
 _guni = logging.getLogger('gunicorn.error')
 if _guni.handlers:
-    logging.root.handlers = _guni.handlers
-    logging.root.setLevel(_guni.level)
+    # Preserve our formatter but use gunicorn's handlers
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        formatter = root_logger.handlers[0].formatter
+        for handler in _guni.handlers:
+            if formatter:
+                handler.setFormatter(formatter)
+        root_logger.handlers = _guni.handlers
+        root_logger.setLevel(_guni.level)
 
 ALLOW_MISSING = os.getenv("ALLOW_MISSING_DEPS", "false").lower() == "true"
 

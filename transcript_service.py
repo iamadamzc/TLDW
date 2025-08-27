@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
 import xml.etree.ElementTree as ET
 import json
 import requests
@@ -13,11 +13,19 @@ import inspect
 import tempfile
 from datetime import datetime
 from http.cookies import SimpleCookie
+from pathlib import Path
+from dataclasses import dataclass
+import tenacity
+
+# Import new structured logging components
+from log_events import evt, StageTimer
+from logging_setup import set_job_ctx, get_job_ctx
 
 from playwright.sync_api import sync_playwright, Page
+from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "playwright-fix-2025-08-24T1"
+APP_VERSION = "playwright-fix-2025-08-24T2"
 
 # Startup sanity check to catch local module shadowing
 assert (
@@ -56,9 +64,9 @@ try:
     assert source_file and (
         "youtube_transcript_api" in source_file
     ), f"Shadowed import detected: {source_file}"
-    logging.info(f"YouTube Transcript API loaded from: {source_file}")
+    evt("yt_api_import", outcome="success", source_file=source_file)
 except Exception as e:
-    logging.warning(f"YouTube Transcript API import validation failed: {e}")
+    evt("yt_api_import", outcome="validation_failed", detail=str(e))
 
 from proxy_manager import (
     ProxyManager,
@@ -75,12 +83,38 @@ from error_handler import (
     log_performance_metrics,
     log_resource_cleanup,
 )
-from transcript_metrics import inc_success, inc_fail
+from transcript_metrics import inc_success, inc_fail, record_stage_metrics, record_circuit_breaker_event, log_successful_transcript_method
+from performance_monitor import get_optimized_browser_context, emit_performance_metric
+from logging_setup import get_logger
+from log_events import job_context as log_context, StageTimer
 
 _CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
+
+
+@dataclass
+class ClientProfile:
+    """Client profile configuration for multi-client support."""
+    name: str
+    user_agent: str
+    viewport: Dict[str, int]
+
+
+# Multi-client profile configurations
+PROFILES = {
+    "desktop": ClientProfile(
+        name="desktop",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport={"width": 1920, "height": 1080}
+    ),
+    "mobile": ClientProfile(
+        name="mobile", 
+        user_agent="Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        viewport={"width": 390, "height": 844}
+    )
+}
 
 # Feature flags for operational safety
 ENABLE_YT_API = os.getenv("ENABLE_YT_API", "1") == "1"
@@ -96,6 +130,8 @@ ENABLE_ASR_FALLBACK = (
 # Performance and safety controls
 PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "120000"))  # Increased to 120s for better reliability
 USE_PROXY_FOR_TIMEDTEXT = os.getenv("USE_PROXY_FOR_TIMEDTEXT", "1") == "1"  # Default to using proxy for timedtext
+# When set, force ALL network to go through proxy: requests, Playwright, and ffmpeg.
+ENFORCE_PROXY_ALL = os.getenv("ENFORCE_PROXY_ALL", "0") in ("1", "true", "yes")
 ASR_MAX_VIDEO_MINUTES = int(os.getenv("ASR_MAX_VIDEO_MINUTES", "20"))
 
 # Timeout configuration
@@ -105,20 +141,23 @@ CIRCUIT_BREAKER_RECOVERY = 600  # 10 minutes circuit breaker timeout
 
 
 class PlaywrightCircuitBreaker:
-    """Circuit breaker pattern for Playwright operations."""
+    """Enhanced circuit breaker pattern for Playwright operations with structured logging."""
     
     def __init__(self):
         self.failure_count = 0
         self.last_failure_time = None
         self.FAILURE_THRESHOLD = 3
         self.RECOVERY_TIME_SECONDS = CIRCUIT_BREAKER_RECOVERY
+        self._last_state = "closed"  # Track state changes for logging
     
     def is_open(self) -> bool:
         """Check if circuit breaker is open (blocking operations)."""
         if self.failure_count < self.FAILURE_THRESHOLD:
+            self._emit_state_change("closed")
             return False
         
         if self.last_failure_time is None:
+            self._emit_state_change("closed")
             return False
         
         time_since_failure = time.time() - self.last_failure_time
@@ -126,35 +165,320 @@ class PlaywrightCircuitBreaker:
             # Reset circuit breaker after recovery time
             self.failure_count = 0
             self.last_failure_time = None
-            logging.info("Playwright circuit breaker reset after recovery period")
+            self._emit_state_change("closed")
+            evt("circuit_breaker_reset", 
+                reason="recovery_timeout",
+                recovery_time_seconds=self.RECOVERY_TIME_SECONDS)
             return False
+        
+        # Check if we're in half-open state (near recovery)
+        if time_since_failure > (self.RECOVERY_TIME_SECONDS * 0.8):
+            self._emit_state_change("half-open")
+        else:
+            self._emit_state_change("open")
         
         return True
     
+    def get_state(self) -> str:
+        """Get current circuit breaker state for monitoring."""
+        if self.failure_count < self.FAILURE_THRESHOLD:
+            return "closed"
+        
+        if self.last_failure_time is None:
+            return "closed"
+        
+        time_since_failure = time.time() - self.last_failure_time
+        if time_since_failure > self.RECOVERY_TIME_SECONDS:
+            return "closed"
+        elif time_since_failure > (self.RECOVERY_TIME_SECONDS * 0.8):
+            return "half-open"
+        else:
+            return "open"
+    
+    def get_recovery_time_remaining(self) -> Optional[int]:
+        """Get remaining recovery time in seconds, None if not in recovery."""
+        if not self.is_open():
+            return None
+        
+        time_since_failure = time.time() - self.last_failure_time
+        remaining = self.RECOVERY_TIME_SECONDS - time_since_failure
+        return max(0, int(remaining))
+    
+    def _emit_state_change(self, new_state: str) -> None:
+        """Emit structured log when circuit breaker state changes."""
+        if new_state != self._last_state:
+            # Use enhanced metrics system for structured logging
+            from transcript_metrics import record_circuit_breaker_event
+            
+            record_circuit_breaker_event(
+                event_type="state_change",
+                previous_state=self._last_state,
+                new_state=new_state,
+                failure_count=self.failure_count,
+                threshold=self.FAILURE_THRESHOLD
+            )
+            self._last_state = new_state
+    
     def record_success(self) -> None:
-        """Reset failure count on successful operation."""
-        if self.failure_count > 0:
-            logging.info("Playwright circuit breaker reset due to successful operation")
+        """Reset failure count on successful operation with structured logging."""
+        previous_count = self.failure_count
+        previous_state = self.get_state()
+        
         self.failure_count = 0
         self.last_failure_time = None
+        
+        if previous_count > 0:
+            # Use enhanced metrics system for structured logging
+            from transcript_metrics import record_circuit_breaker_event
+            
+            record_circuit_breaker_event(
+                event_type="success_reset",
+                previous_failure_count=previous_count,
+                previous_state=previous_state
+            )
+        
+        self._emit_state_change("closed")
 
     def record_failure(self) -> None:
-        """Increment failure count and activate if threshold reached."""
+        """Increment failure count and activate if threshold reached with structured logging."""
         self.failure_count += 1
         self.last_failure_time = time.time()
+        current_state = self.get_state()
+
+        # Use enhanced metrics system for structured logging
+        from transcript_metrics import record_circuit_breaker_event
 
         if self.failure_count >= self.FAILURE_THRESHOLD:
-            logging.warning(
-                "Playwright circuit breaker activated - skipping for 10 minutes"
+            record_circuit_breaker_event(
+                event_type="activated",
+                failure_count=self.failure_count,
+                threshold=self.FAILURE_THRESHOLD,
+                recovery_time_seconds=self.RECOVERY_TIME_SECONDS,
+                state=current_state
             )
         else:
-            logging.info(
-                f"Playwright failure recorded: {self.failure_count}/{self.FAILURE_THRESHOLD}"
+            record_circuit_breaker_event(
+                event_type="failure_recorded",
+                failure_count=self.failure_count,
+                threshold=self.FAILURE_THRESHOLD,
+                state=current_state
             )
+        
+        self._emit_state_change(current_state)
 
 
 # Global circuit breaker instance
 _playwright_circuit_breaker = PlaywrightCircuitBreaker()
+
+
+def get_circuit_breaker_status() -> Dict[str, Any]:
+    """Get current circuit breaker status for monitoring and health checks."""
+    return {
+        "state": _playwright_circuit_breaker.get_state(),
+        "failure_count": _playwright_circuit_breaker.failure_count,
+        "failure_threshold": _playwright_circuit_breaker.FAILURE_THRESHOLD,
+        "recovery_time_remaining": _playwright_circuit_breaker.get_recovery_time_remaining(),
+        "last_failure_time": _playwright_circuit_breaker.last_failure_time,
+        "recovery_time_seconds": _playwright_circuit_breaker.RECOVERY_TIME_SECONDS
+    }
+
+
+def _should_retry_youtubei_error(exception):
+    """
+    Determine if a YouTubei error should trigger a retry.
+    
+    Implements requirement 17.1 and 17.2:
+    - Retry on Playwright navigation timeouts
+    - Retry on Playwright interception failures
+    - Use exponential backoff with jitter for transient errors
+    """
+    error_str = str(exception).lower()
+    error_type = type(exception).__name__
+    
+    # Retry on timeout and navigation errors (Requirement 17.1)
+    timeout_conditions = [
+        "timeout" in error_str,
+        "timeouterror" in error_type.lower(),
+        "asyncio.timeouterror" in error_type.lower(),
+        "concurrent.futures.timeouterror" in error_type.lower(),
+        "navigation timeout" in error_str,
+        "page.goto" in error_str and "timeout" in error_str,
+    ]
+    
+    # Retry on navigation errors (Requirement 17.1)
+    navigation_conditions = [
+        "navigation" in error_str,
+        "navigationerror" in error_type.lower(),
+        "page navigation" in error_str,
+        "failed to navigate" in error_str,
+        "navigation failed" in error_str,
+    ]
+    
+    # Retry on interception failures (Requirement 17.2)
+    interception_conditions = [
+        "route" in error_str and ("failed" in error_str or "error" in error_str),
+        "interception" in error_str,
+        "route handler" in error_str,
+        "route.fetch" in error_str,
+        "route.fulfill" in error_str,
+        "route.continue" in error_str,
+    ]
+    
+    # Retry on network errors that are likely transient
+    network_conditions = [
+        "net::" in error_str,  # Chromium network errors
+        "connection" in error_str,
+        "connection refused" in error_str,
+        "connection reset" in error_str,
+        "connection aborted" in error_str,
+        "dns" in error_str,
+        "resolve" in error_str,
+    ]
+    
+    # Retry on blocking that might be transient
+    blocking_conditions = [
+        "blocked" in error_str,
+        "rate limit" in error_str,
+        "too many requests" in error_str,
+        "service unavailable" in error_str,
+    ]
+    
+    # Combine all retry conditions
+    all_conditions = (
+        timeout_conditions + 
+        navigation_conditions + 
+        interception_conditions + 
+        network_conditions + 
+        blocking_conditions
+    )
+    
+    should_retry = any(all_conditions)
+    
+    if should_retry:
+        evt("youtubei_retry_decision", decision="retry", error_type=error_type, error_preview=error_str[:100])
+    else:
+        evt("youtubei_retry_decision", decision="no_retry", error_type=error_type, error_preview=error_str[:100])
+    
+    return should_retry
+
+
+def _log_retry_attempt(retry_state, video_id: str):
+    """Log retry attempt with detailed information for monitoring."""
+    exception = retry_state.outcome.exception()
+    next_sleep = retry_state.next_action.sleep if retry_state.next_action else 0
+    
+    evt("youtubei_retry_attempt", 
+        attempt_number=retry_state.attempt_number,
+        error_type=type(exception).__name__,
+        error_message=str(exception)[:100],
+        next_sleep=next_sleep,
+        total_attempts=retry_state.attempt_number)
+    
+    # Use enhanced metrics system for structured logging
+    from transcript_metrics import record_circuit_breaker_event
+    
+    record_circuit_breaker_event(
+        event_type="retry_attempt",
+        video_id=video_id,
+        attempt_number=retry_state.attempt_number,
+        error_type=type(exception).__name__,
+        next_sleep_seconds=next_sleep
+    )
+
+
+def _log_retry_completion(retry_state, video_id: str):
+    """Log retry completion statistics."""
+    if retry_state.outcome.failed:
+        evt("youtubei_retry_exhausted", 
+            total_attempts=retry_state.attempt_number,
+            final_error=str(retry_state.outcome.exception()))
+    else:
+        evt("youtubei_retry_succeeded", 
+            attempts_needed=retry_state.attempt_number)
+
+
+def _execute_youtubei_with_circuit_breaker(operation_func, video_id: str):
+    """
+    Execute YouTubei operation with circuit breaker integration and retry logic.
+    
+    Implements Requirements 17.1-17.6:
+    - Exponential backoff with jitter for navigation timeouts
+    - 2-3 retry attempts for interception failures  
+    - Circuit breaker activation after retry exhaustion
+    - Tenacity-based retry logic
+    - Complete YouTubei attempt function as single retry unit
+    """
+    
+    # Check circuit breaker before attempting operation
+    if _playwright_circuit_breaker.is_open():
+        recovery_time = _playwright_circuit_breaker.get_recovery_time_remaining()
+        
+        # Use enhanced metrics system for structured logging
+        from transcript_metrics import record_circuit_breaker_event
+        
+        record_circuit_breaker_event(
+            event_type="skip_operation",
+            video_id=video_id,
+            state="open",
+            recovery_time_remaining=recovery_time,
+            reason="circuit_breaker_open"
+        )
+        return ""
+    
+    # Define retry wrapper with tenacity (Requirements 17.1, 17.2, 17.3, 17.5)
+    @tenacity.retry(
+        # Requirement 17.2: 2-3 retry attempts for interception failures
+        stop=tenacity.stop_after_attempt(3),
+        # Requirement 17.1: Exponential backoff with jitter for navigation timeouts
+        wait=tenacity.wait_exponential_jitter(
+            initial=1,      # Start with 1 second
+            max=10,         # Cap at 10 seconds
+            jitter=2        # Add up to 2 seconds of jitter
+        ),
+        # Retry only on specific error types that are likely transient
+        retry=tenacity.retry_if_exception(_should_retry_youtubei_error),
+        # Enhanced logging for retry attempts
+        before_sleep=lambda retry_state: _log_retry_attempt(retry_state, video_id),
+        # Log retry statistics after completion
+        after=lambda retry_state: _log_retry_completion(retry_state, video_id)
+    )
+    def _retry_wrapper():
+        return operation_func()
+    
+    try:
+        # Execute with retry logic
+        result = _retry_wrapper()
+        
+        # Record success after retry completion
+        if result:  # Only record success if we got a transcript
+            _playwright_circuit_breaker.record_success()
+            
+            # Use enhanced metrics system for structured logging
+            from transcript_metrics import record_circuit_breaker_event
+            
+            record_circuit_breaker_event(
+                event_type="post_retry_success",
+                video_id=video_id,
+                state=_playwright_circuit_breaker.get_state()
+            )
+        
+        return result
+        
+    except Exception as e:
+        # Record failure after retry exhaustion
+        _playwright_circuit_breaker.record_failure()
+        
+        # Use enhanced metrics system for structured logging
+        from transcript_metrics import record_circuit_breaker_event
+        
+        record_circuit_breaker_event(
+            event_type="post_retry_failure",
+            video_id=video_id,
+            error=str(e),
+            state=_playwright_circuit_breaker.get_state(),
+            failure_count=_playwright_circuit_breaker.failure_count
+        )
+        return ""
 
 
 def detect_youtube_blocking(error_message: str, response_content: str = "") -> bool:
@@ -193,14 +517,14 @@ def detect_youtube_blocking(error_message: str, response_content: str = "") -> b
 
 def handle_timeout_error(video_id: str, elapsed_time: float, method: str) -> None:
     """Handle timeout errors with circuit breaker integration."""
-    logging.error(f"Timeout in {method} for {video_id}: {elapsed_time:.1f}s elapsed")
+    evt("timeout_error", method=method, elapsed_time=elapsed_time)
     
     # Update circuit breaker for Playwright timeouts
     if method in ["youtubei", "playwright", "asr"]:
         _playwright_circuit_breaker.record_failure()
     
     # Log timeout details for monitoring
-    logging.info(f"timeout_event video_id={video_id} method={method} elapsed_time={elapsed_time:.1f}")
+    evt("timeout_event", method=method, elapsed_time=elapsed_time)
 
 
 def get_user_friendly_error_message(error_classification: str, video_id: str) -> str:
@@ -233,57 +557,57 @@ def classify_transcript_error(error: Exception, video_id: str, method: str) -> s
     
     # Handle new API 1.2.2 specific errors first
     if isinstance(error, (TranscriptsDisabled, NoTranscriptFound)):
-        logging.info(f"No transcript available for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="no_transcript", method=method, detail=error_msg)
         return "no_transcript"
     
     elif isinstance(error, (VideoUnavailable, VideoUnplayable, InvalidVideoId)):
-        logging.info(f"Video unavailable for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="video_unavailable", method=method, detail=error_msg)
         return "video_unavailable"
     
     elif isinstance(error, AgeRestricted):
-        logging.warning(f"Age-restricted video {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="age_restricted", method=method, detail=error_msg)
         return "age_restricted"
     
     elif isinstance(error, (CookieError, CookieInvalid, CookiePathInvalid, FailedToCreateConsentCookie)):
-        logging.warning(f"Cookie issue for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="cookie_error", method=method, detail=error_msg)
         return "cookie_error"
     
     elif isinstance(error, (IpBlocked, RequestBlocked)):
-        logging.warning(f"Request blocked for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="request_blocked", method=method, detail=error_msg)
         return "request_blocked"
     
     elif isinstance(error, PoTokenRequired):
-        logging.warning(f"PoToken required for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="po_token_required", method=method, detail=error_msg)
         return "po_token_required"
     
     elif isinstance(error, (HTTPError, YouTubeRequestFailed)):
-        logging.warning(f"HTTP/Request error for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="http_error", method=method, detail=error_msg)
         return "http_error"
     
     elif isinstance(error, (NotTranslatable, TranslationLanguageNotAvailable)):
-        logging.info(f"Translation issue for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="translation_error", method=method, detail=error_msg)
         return "translation_error"
     
     elif isinstance(error, YouTubeDataUnparsable):
-        logging.warning(f"YouTube data parsing error for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="parsing_error", method=method, detail=error_msg)
         return "parsing_error"
     
     elif isinstance(error, CouldNotRetrieveTranscript):
-        logging.warning(f"Could not retrieve transcript for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="retrieval_error", method=method, detail=error_msg)
         return "retrieval_error"
     
     elif isinstance(error, YouTubeTranscriptApiException):
-        logging.warning(f"General API error for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="api_error", method=method, detail=error_msg)
         return "api_error"
     
     # Handle compatibility layer errors
     from youtube_transcript_api_compat import TranscriptApiError
     if isinstance(error, TranscriptApiError):
         if "Old API method" in error_msg:
-            logging.error(f"API migration issue for {video_id} in {method}: {error_msg}")
+            evt("error_classification", error_type="api_migration_error", method=method, detail=error_msg)
             return "api_migration_error"
         else:
-            logging.warning(f"Compatibility layer error for {video_id} in {method}: {error_msg}")
+            evt("error_classification", error_type="compat_error", method=method, detail=error_msg)
             return "compat_error"
     
     # Timeout errors (legacy handling)
@@ -293,26 +617,26 @@ def classify_transcript_error(error: Exception, video_id: str, method: str) -> s
     
     # YouTube blocking detection (legacy handling)
     if detect_youtube_blocking(error_msg):
-        logging.warning(f"YouTube blocking detected for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="youtube_blocking", method=method, detail=error_msg)
         return "youtube_blocking"
     
     # Authentication issues (legacy handling)
     if any(auth_indicator in error_msg.lower() for auth_indicator in ["unauthorized", "forbidden", "401", "403"]):
-        logging.warning(f"Authentication issue for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="auth_failure", method=method, detail=error_msg)
         return "auth_failure"
     
     # Network issues (legacy handling)
     if any(net_indicator in error_msg.lower() for net_indicator in ["connection", "network", "dns", "resolve"]):
-        logging.warning(f"Network issue for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="network_error", method=method, detail=error_msg)
         return "network_error"
     
     # Content issues (legacy handling)
     if any(content_indicator in error_msg.lower() for content_indicator in ["not found", "unavailable", "private", "deleted"]):
-        logging.info(f"Content issue for {video_id} in {method}: {error_msg}")
+        evt("error_classification", error_type="content_unavailable", method=method, detail=error_msg)
         return "content_unavailable"
     
     # Generic error
-    logging.warning(f"Unclassified error for {video_id} in {method}: {error_type}: {error_msg}")
+    evt("error_classification", error_type="unknown", method=method, detail=f"{error_type}: {error_msg}")
     return "unknown"
 
 
@@ -325,23 +649,23 @@ class ResourceCleanupManager:
         try:
             if page:
                 page.close()
-                logging.debug("Playwright page closed")
+                evt("resource_cleanup", resource="playwright_page", outcome="success")
         except Exception as e:
-            logging.warning(f"Error closing Playwright page: {e}")
+            evt("resource_cleanup", resource="playwright_page", outcome="error", detail=str(e))
         
         try:
             if context:
                 context.close()
-                logging.debug("Playwright context closed")
+                evt("resource_cleanup", resource="playwright_context", outcome="success")
         except Exception as e:
-            logging.warning(f"Error closing Playwright context: {e}")
+            evt("resource_cleanup", resource="playwright_context", outcome="error", detail=str(e))
         
         try:
             if browser:
                 browser.close()
-                logging.debug("Playwright browser closed")
+                evt("resource_cleanup", resource="playwright_browser", outcome="success")
         except Exception as e:
-            logging.warning(f"Error closing Playwright browser: {e}")
+            evt("resource_cleanup", resource="playwright_browser", outcome="error", detail=str(e))
     
     @staticmethod
     def cleanup_temp_files(temp_dir_path: str):
@@ -350,9 +674,9 @@ class ResourceCleanupManager:
             import shutil
             if os.path.exists(temp_dir_path):
                 shutil.rmtree(temp_dir_path)
-                logging.debug(f"Cleaned up temporary directory: {temp_dir_path}")
+                evt("resource_cleanup", resource="temp_directory", outcome="success", path=temp_dir_path)
         except Exception as e:
-            logging.warning(f"Error cleaning up temp directory {temp_dir_path}: {e}")
+            evt("resource_cleanup", resource="temp_directory", outcome="error", path=temp_dir_path, detail=str(e))
     
     @staticmethod
     def cleanup_network_connections(session):
@@ -360,9 +684,9 @@ class ResourceCleanupManager:
         try:
             if hasattr(session, 'close'):
                 session.close()
-                logging.debug("HTTP session closed")
+                evt("resource_cleanup", resource="http_session", outcome="success")
         except Exception as e:
-            logging.warning(f"Error closing HTTP session: {e}")
+            evt("resource_cleanup", resource="http_session", outcome="error", detail=str(e))
 
 
 def _resolve_cookie_file_path() -> Optional[str]:
@@ -424,7 +748,7 @@ try:
     S3_AVAILABLE = True
 except ImportError:
     S3_AVAILABLE = False
-    logging.info("boto3 not available - S3 cookie loading disabled")
+    evt("s3_availability", available=False, reason="boto3_not_available")
 
 # Cookie configuration
 COOKIE_S3_BUCKET = os.getenv("COOKIE_S3_BUCKET")
@@ -457,6 +781,279 @@ class CookieSecurityManager:
         """Check which cookies are expired (simplified check)."""
         # For now, assume all cookies are valid - full expiry checking would need timestamp parsing
         return {name: True for name in cookie_dict.keys()}
+
+
+class EnhancedPlaywrightManager:
+    """Enhanced Playwright context management with automatic storage state loading and Netscape conversion."""
+    
+    def __init__(self, cookie_dir: str = None):
+        self.cookie_dir = Path(cookie_dir or os.getenv("COOKIE_DIR", "/app/cookies"))
+        self.storage_state_path = self.cookie_dir / "youtube_session.json"
+        self.netscape_cookies_path = self.cookie_dir / "cookies.txt"
+    
+    def ensure_storage_state_available(self) -> bool:
+        """
+        Ensure storage state is available, converting from Netscape if needed.
+        Returns True if storage state is available, False otherwise.
+        """
+        # Check if storage state already exists
+        if self.storage_state_path.exists():
+            evt("storage_state_check", outcome="found", path=str(self.storage_state_path))
+            return True
+        
+        # Check if Netscape cookies exist for conversion
+        if self.netscape_cookies_path.exists():
+            evt("storage_state_conversion", action="attempting", source=str(self.netscape_cookies_path))
+            try:
+                success = self._convert_netscape_to_storage_state(str(self.netscape_cookies_path))
+                if success:
+                    evt("storage_state_conversion", outcome="success", target=str(self.storage_state_path))
+                    return True
+                else:
+                    evt("storage_state_conversion", outcome="failed")
+                    return False
+            except Exception as e:
+                evt("storage_state_conversion", outcome="error", detail=str(e))
+                return False
+        
+        # No storage state or Netscape cookies available
+        self._log_missing_storage_state_warning()
+        return False
+    
+    def _log_missing_storage_state_warning(self) -> None:
+        """Log detailed warning with remediation instructions for missing storage state."""
+        logging.warning("=" * 60)
+        logging.warning("STORAGE STATE MISSING - REMEDIATION REQUIRED")
+        logging.warning("=" * 60)
+        logging.warning(f"Expected storage state file: {self.storage_state_path}")
+        logging.warning(f"Expected Netscape cookies file: {self.netscape_cookies_path}")
+        logging.warning("")
+        logging.warning("REMEDIATION OPTIONS:")
+        logging.warning("1. Generate storage state using cookie_generator.py:")
+        logging.warning("   python cookie_generator.py")
+        logging.warning("")
+        logging.warning("2. Convert existing Netscape cookies:")
+        logging.warning("   python cookie_generator.py --from-netscape /path/to/cookies.txt")
+        logging.warning("")
+        logging.warning("3. Place Netscape format cookies at:")
+        logging.warning(f"   {self.netscape_cookies_path}")
+        logging.warning("   (Will be auto-converted on next run)")
+        logging.warning("")
+        logging.warning("4. Set COOKIE_DIR environment variable if using custom location")
+        logging.warning("")
+        logging.warning("WITHOUT STORAGE STATE:")
+        logging.warning("- Playwright will run without authentication")
+        logging.warning("- May encounter GDPR consent walls")
+        logging.warning("- Reduced success rate for restricted content")
+        logging.warning("=" * 60)
+    
+    def _convert_netscape_to_storage_state(self, netscape_path: str) -> bool:
+        """
+        Convert Netscape cookies.txt to Playwright storage_state.json format.
+        Returns True if conversion successful, False otherwise.
+        """
+        try:
+            # Read and validate Netscape cookies
+            with open(netscape_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            if not CookieSecurityManager.validate_cookie_format(content):
+                logging.error(f"Invalid Netscape cookie format in {netscape_path}")
+                return False
+            
+            # Parse Netscape cookies
+            cookies = []
+            for line in content.strip().split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                parts = line.split('\t')
+                if len(parts) >= 7:
+                    domain, flag, path, secure, expiry, name, value = parts[:7]
+                    
+                    # Skip empty names or values
+                    if not name or not value:
+                        continue
+                    
+                    # Convert to Playwright cookie format
+                    cookie = {
+                        "name": name,
+                        "value": value,
+                        "domain": domain if not domain.startswith('.') else domain[1:],
+                        "path": path,
+                        "secure": secure.lower() == 'true',
+                        "httpOnly": False,  # Default for Netscape format
+                    }
+                    
+                    # Handle expiry (convert to seconds since epoch)
+                    try:
+                        if expiry and expiry != '0':
+                            cookie["expires"] = int(expiry)
+                    except (ValueError, TypeError):
+                        pass  # Skip invalid expiry dates
+                    
+                    # Sanitize __Host- cookies for Playwright compatibility
+                    if name.startswith('__Host-'):
+                        cookie = self._sanitize_host_cookie(cookie)
+                    
+                    cookies.append(cookie)
+            
+            if not cookies:
+                logging.error("No valid cookies found in Netscape file")
+                return False
+            
+            # Create storage state structure
+            storage_state = {
+                "cookies": cookies,
+                "origins": self._create_minimal_origins_structure(cookies),
+                "localStorage": []
+            }
+            
+            # Inject SOCS/CONSENT cookies if missing
+            storage_state = self._inject_consent_cookies_if_missing(storage_state)
+            
+            # Ensure cookie directory exists
+            self.cookie_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Write storage state file
+            with open(self.storage_state_path, 'w', encoding='utf-8') as f:
+                json.dump(storage_state, f, indent=2)
+            
+            logging.info(f"Converted {len(cookies)} cookies to storage state format")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to convert Netscape cookies: {e}")
+            return False
+    
+    def _sanitize_host_cookie(self, cookie: Dict) -> Dict:
+        """
+        Sanitize __Host- cookies for Playwright compatibility.
+        
+        __Host- cookies have strict requirements:
+        - Must have secure=True
+        - Must have path="/"
+        - Must NOT have domain field (use url field instead)
+        
+        This prevents Playwright __Host- cookie validation errors.
+        """
+        # Requirement 12.1: Normalize with secure=True
+        cookie["secure"] = True
+        
+        # Requirement 12.2: Normalize with path="/"
+        cookie["path"] = "/"
+        
+        # Requirement 12.3: Remove domain field and use url field instead
+        if "domain" in cookie:
+            domain = cookie["domain"]
+            # Remove leading dot if present (common in cookie files)
+            if domain.startswith('.'):
+                domain = domain[1:]
+            # Store original domain as url for Playwright
+            cookie["url"] = f"https://{domain}/"
+            del cookie["domain"]
+        
+        return cookie
+    
+    def _create_minimal_origins_structure(self, cookies: List[Dict]) -> List[Dict]:
+        """Create minimal origins structure for Playwright compatibility."""
+        origins = set()
+        
+        # Extract unique domains from cookies
+        for cookie in cookies:
+            domain = cookie.get("domain", "")
+            if domain:
+                # Add both www and non-www variants for YouTube
+                if "youtube" in domain.lower():
+                    origins.add("https://www.youtube.com")
+                    origins.add("https://youtube.com")
+                    origins.add("https://m.youtube.com")
+                else:
+                    origins.add(f"https://{domain}")
+        
+        # Ensure YouTube origins are always present
+        origins.update([
+            "https://www.youtube.com",
+            "https://youtube.com",
+            "https://m.youtube.com"
+        ])
+        
+        return [{"origin": origin, "localStorage": []} for origin in sorted(origins)]
+    
+    def _inject_consent_cookies_if_missing(self, storage_state: Dict) -> Dict:
+        """Inject SOCS/CONSENT cookies if missing to prevent consent dialogs."""
+        cookies = storage_state.get("cookies", [])
+        
+        # Check if SOCS or CONSENT cookies already exist
+        has_consent = any(
+            cookie.get("name") in ["SOCS", "CONSENT"] 
+            for cookie in cookies
+        )
+        
+        if not has_consent:
+            logging.info("Injecting CONSENT cookie to prevent consent dialogs")
+            
+            # Add CONSENT cookie with safe "accepted" value
+            consent_cookie = {
+                "name": "CONSENT",
+                "value": "YES+cb.20210328-17-p0.en+FX+1",
+                "domain": "youtube.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+                "expires": int(time.time()) + (365 * 24 * 60 * 60)  # 1 year from now
+            }
+            
+            cookies.append(consent_cookie)
+            storage_state["cookies"] = cookies
+            
+            logging.info("CONSENT cookie injected successfully")
+        
+        return storage_state
+    
+    def create_enhanced_context(self, browser, proxy_dict: Optional[Dict] = None, profile: str = "desktop") -> tuple:
+        """
+        Create enhanced browser context with automatic storage state loading and profile support.
+        Returns (context, storage_state_loaded) tuple.
+        """
+        # Ensure storage state is available (convert if needed)
+        storage_state_available = self.ensure_storage_state_available()
+        
+        # Get profile configuration
+        client_profile = PROFILES.get(profile, PROFILES["desktop"])
+        logging.info(f"Creating browser context with profile: {client_profile.name}")
+        
+        # Prepare context arguments with profile-specific settings
+        context_kwargs = {
+            "user_agent": client_profile.user_agent,
+            "viewport": client_profile.viewport,
+            "locale": "en-US",
+            "ignore_https_errors": True,
+        }
+        
+        # Add proxy if provided
+        if proxy_dict:
+            context_kwargs["proxy"] = proxy_dict
+        
+        # Add storage state if available
+        if storage_state_available and self.storage_state_path.exists():
+            context_kwargs["storage_state"] = str(self.storage_state_path)
+            logging.info(f"Using Playwright storage_state from {self.storage_state_path}")
+            
+            # Verify storage state contains cookies
+            try:
+                with open(self.storage_state_path, 'r') as f:
+                    state_data = json.load(f)
+                    cookie_count = len(state_data.get("cookies", []))
+                    logging.info(f"Storage state contains {cookie_count} cookies")
+            except Exception as e:
+                logging.warning(f"Could not verify storage state contents: {e}")
+        
+        # Create context
+        context = browser.new_context(**context_kwargs)
+        
+        return context, storage_state_available
 
 
 def load_user_cookies_from_s3(user_id: int) -> Optional[Dict[str, str]]:
@@ -558,13 +1155,61 @@ def make_http_session():
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
     )
-    session.mount("https://", HTTPAdapter(max_retries=retry))
+    # Mount retry adapter for both HTTP and HTTPS URLs
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     session.headers["User-Agent"] = _CHROME_UA
     return session
 
 
 # Global HTTP session for timed-text requests
 HTTP = make_http_session()
+
+
+def _requests_proxies(pm) -> Optional[Dict[str, str]]:
+    if not pm:
+        return None
+    try:
+        return pm.proxy_dict_for("requests") or None
+    except Exception:
+        return None
+
+def _playwright_proxy(pm) -> Optional[Dict[str, str]]:
+    if not pm:
+        return None
+    try:
+        return pm.proxy_dict_for("playwright") or None
+    except Exception:
+        return None
+
+def _ffmpeg_proxy_url(pm) -> Optional[str]:
+    """
+    Build an http(s) proxy URL for ffmpeg. Prefer requests-style https proxy URL.
+    """
+    if not pm:
+        return None
+    try:
+        req = pm.proxy_dict_for("requests") or {}
+        for key in ("https", "http"):
+            url = req.get(key)
+            if url:
+                return url
+    except Exception:
+        pass
+    try:
+        pw = pm.proxy_dict_for("playwright") or {}
+        server = pw.get("server")
+        if server:
+            user = pw.get("username")
+            pwd  = pw.get("password")
+            if user and pwd and "://" in server:
+                scheme, rest = server.split("://", 1)
+                return f"{scheme}://{user}:{pwd}@{rest}"
+            return server
+    except Exception:
+        pass
+    return None
 
 
 def validate_config():
@@ -582,14 +1227,42 @@ except ValueError as e:
     # Don't fail startup - let health checks handle it
 
 
-def _fetch_timedtext(
+def _fetch_timedtext_xml(
     video_id: str, lang: str, kind=None, cookies=None, proxies=None, timeout_s=15
 ) -> str:
-    """Try json3 first, then XML; return plain text or ''."""
+    """Enhanced timed-text XML extraction with user cookie preference."""
     headers = {"Accept-Language": "en-US,en;q=0.8"}
     params = {"v": video_id, "lang": lang}
     if kind:
         params["kind"] = kind
+    
+    # Enhanced cookie integration with debug logging
+    cookie_source = "none"
+    if cookies:
+        if isinstance(cookies, str):
+            # Convert header string to dict for requests cookies parameter
+            cookie_dict = {}
+            for pair in cookies.split("; "):
+                if "=" in pair:
+                    name, value = pair.split("=", 1)
+                    cookie_dict[name] = value
+            cookies = cookie_dict
+            cookie_source = "user"
+        elif isinstance(cookies, dict):
+            cookie_source = "user"
+        logging.debug(f"Using user cookies for timedtext xml extraction: cookie_source={cookie_source}")
+    else:
+        # Fall back to environment/file cookies
+        ck = _cookie_header_from_env_or_file()
+        if ck:
+            cookie_dict = {}
+            for pair in ck.split("; "):
+                if "=" in pair:
+                    name, value = pair.split("=", 1)
+                    cookie_dict[name] = value
+            cookies = cookie_dict
+            cookie_source = "env"
+            logging.debug(f"Using environment/file cookies for timedtext xml extraction: cookie_source={cookie_source}")
 
     # 1) Try json3 on youtube.com
     r = HTTP.get(
@@ -653,20 +1326,41 @@ def _fetch_timedtext(
     return ""
 
 
-def _fetch_timedtext_json3(video_id: str, proxy_manager=None) -> str:
+def _fetch_timedtext_json3(video_id: str, proxy_manager=None, cookies=None) -> str:
     """Timedtext with Cookie header first, json3 parse; falls back by lang/kind."""
     headers = {"Accept-Language": "en-US,en;q=0.8"}
-    ck = _cookie_header_from_env_or_file()
-    if ck:
-        headers["Cookie"] = ck
+    
+    # Enhanced cookie integration with user preference over environment/file cookies
+    cookie_source = "none"
+    if cookies:
+        # User cookies provided - highest priority
+        if isinstance(cookies, str):
+            headers["Cookie"] = cookies
+            cookie_source = "user"
+        elif isinstance(cookies, dict):
+            # Convert dict to header string
+            cookie_pairs = [f"{name}={value}" for name, value in cookies.items()]
+            headers["Cookie"] = "; ".join(cookie_pairs)
+            cookie_source = "user"
+        logging.debug(f"Using user cookies for timedtext json3 extraction: cookie_source={cookie_source}")
+    else:
+        # Fall back to environment/file cookies
+        ck = _cookie_header_from_env_or_file()
+        if ck:
+            headers["Cookie"] = ck
+            cookie_source = "env"
+            logging.debug(f"Using environment/file cookies for timedtext json3 extraction: cookie_source={cookie_source}")
 
     languages = ["en", "en-US", "en-GB", "es", "es-ES", "es-419"]
     kinds = [None, "asr"]
-    proxies = (
-        proxy_manager.proxy_dict_for("requests")
-        if (proxy_manager and USE_PROXY_FOR_TIMEDTEXT)
-        else None
-    )
+    # Respect global enforcement to avoid any direct calls
+    proxies = None
+    if proxy_manager:
+        try:
+            if ENFORCE_PROXY_ALL or USE_PROXY_FOR_TIMEDTEXT:
+                proxies = proxy_manager.proxy_dict_for("requests")
+        except Exception:
+            proxies = None
 
     for lang in languages:
         for kind in kinds:
@@ -707,6 +1401,13 @@ def _fetch_timedtext_json3(video_id: str, proxy_manager=None) -> str:
     return ""
 
 
+def _fetch_timedtext(
+    video_id: str, lang: str, kind=None, cookies=None, proxies=None, timeout_s=15
+) -> str:
+    """Backward compatibility wrapper for _fetch_timedtext_xml."""
+    return _fetch_timedtext_xml(video_id, lang, kind, cookies, proxies, timeout_s)
+
+
 def get_transcript_with_cookies_fixed(video_id: str, language_codes: list, user_id: int, proxies=None) -> str:
     """
     Fixed version with proper S3 cookie handling and error propagation.
@@ -729,6 +1430,15 @@ def get_transcript_with_cookies_fixed(video_id: str, language_codes: list, user_
     
     session = requests.Session()
     session.headers.update(headers)
+    if ENFORCE_PROXY_ALL:
+        # Force proxy for all calls within this session
+        from urllib.parse import urlparse
+        # Prefer caller-supplied proxies; else derive from global ProxyManager via shared_managers
+        if not proxies:
+            try:
+                proxies = shared_managers.get_proxy_manager().proxy_dict_for("requests")
+            except Exception:
+                proxies = None
     
     # Try each language code
     for lang in language_codes:
@@ -821,6 +1531,12 @@ def get_transcript_with_cookies(video_id: str, language_codes: list, cookies=Non
     
     session = requests.Session()
     session.headers.update(headers)
+    if ENFORCE_PROXY_ALL:
+        if not proxies:
+            try:
+                proxies = shared_managers.get_proxy_manager().proxy_dict_for("requests")
+            except Exception:
+                proxies = None
     
     # Try each language code
     for lang in language_codes:
@@ -828,7 +1544,7 @@ def get_transcript_with_cookies(video_id: str, language_codes: list, cookies=Non
             # First try to get the transcript list to find available transcripts
             list_url = f'https://www.youtube.com/api/timedtext?type=list&v={video_id}'
             
-            response = session.get(list_url, proxies=proxies, timeout=10)
+            response = session.get(list_url, proxies=(proxies or None), timeout=10)
             if response.status_code != 200:
                 continue
                 
@@ -863,7 +1579,7 @@ def get_transcript_with_cookies(video_id: str, language_codes: list, cookies=Non
                         transcript_url += f'&kind={track["kind"]}'
                     
                     try:
-                        transcript_response = session.get(transcript_url, proxies=proxies, timeout=15)
+                        transcript_response = session.get(transcript_url, proxies=(proxies or None), timeout=15)
                         if transcript_response.status_code == 200 and transcript_response.text.strip():
                             # Parse the transcript XML
                             transcript_root = ET.fromstring(transcript_response.text)
@@ -894,63 +1610,67 @@ def get_transcript_with_cookies(video_id: str, language_codes: list, cookies=Non
 
 
 def get_captions_via_timedtext(
-    video_id: str, proxy_manager=None, cookie_jar=None
+    video_id: str, proxy_manager=None, cookie_jar=None, user_cookies=None
 ) -> str:
-    """Robust timed-text with no-proxy-first strategy and backoff."""
+    """Enhanced timed-text with user cookie preference and robust fallback strategy."""
     languages = ["en", "en-US", "en-GB", "es", "es-ES", "es-419"]
     kinds = [None, "asr"]  # prefer official, then auto
-    proxies = (
-        proxy_manager.proxy_dict_for("requests")
-        if (proxy_manager and USE_PROXY_FOR_TIMEDTEXT)
-        else None
-    )
+    proxies = _requests_proxies(proxy_manager) if (proxy_manager and (USE_PROXY_FOR_TIMEDTEXT or ENFORCE_PROXY_ALL)) else None
 
-    # First: try JSON3 with explicit Cookie header from env/file (works even when cookie_jar is None)
+    # Enhanced cookie resolution with user preference over environment/file cookies
+    effective_cookies = None
+    cookie_source = "none"
+    
+    if user_cookies:
+        # User cookies have highest priority
+        effective_cookies = user_cookies
+        cookie_source = "user"
+        evt("timedtext_cookie_source", cookie_source=cookie_source)
+    elif cookie_jar:
+        # Legacy cookie_jar parameter (second priority)
+        effective_cookies = cookie_jar
+        cookie_source = "legacy"
+        evt("timedtext_cookie_source", cookie_source=cookie_source)
+    
+    # First: try JSON3 with enhanced cookie integration
     try:
-        txt0 = _fetch_timedtext_json3(video_id, proxy_manager=proxy_manager)
+        txt0 = _fetch_timedtext_json3(video_id, proxy_manager=proxy_manager, cookies=effective_cookies)
         if txt0:
-            logging.info("Timedtext hit via json3+Cookie header")
+            evt("timedtext_success", method="json3", cookie_source=cookie_source)
             return txt0
     except Exception:
         pass
 
-    # Build a cookie jar dict if not provided (from env/file) for requests 'cookies=' parameter
-    if cookie_jar is None:
-        ck = _cookie_header_from_env_or_file()
-        if ck:
-            cookie_jar = {
-                p.split("=", 1)[0]: p.split("=", 1)[1]
-                for p in ck.split("; ")
-                if "=" in p
-            }
+    # Build effective cookie jar for requests 'cookies=' parameter
+    # Priority: user_cookies > cookie_jar > env/file
+    if not effective_cookies:
+        if cookie_jar is None:
+            ck = _cookie_header_from_env_or_file()
+            if ck:
+                cookie_jar = {
+                    p.split("=", 1)[0]: p.split("=", 1)[1]
+                    for p in ck.split("; ")
+                    if "=" in p
+                }
+                cookie_source = "env"
+                evt("timedtext_cookie_source", cookie_source=cookie_source)
+        effective_cookies = cookie_jar
 
-    # No-proxy first (2 attempts with backoff)
-    for attempt in range(2):
-        try:
-            for lang in languages:
-                for kind in kinds:
-                    txt = _fetch_timedtext(
-                        video_id,
-                        lang,
-                        kind,
-                        cookies=cookie_jar,
-                        proxies=None,
-                        timeout_s=15,
-                    )
-                    if txt:
-                        logging.info(
-                            f"Timedtext hit (no-proxy): lang={lang}, kind={kind or 'caption'}"
+    # When NOT enforcing, try no-proxy first; otherwise skip direct attempts.
+    if not ENFORCE_PROXY_ALL:
+        for attempt in range(2):
+            try:
+                for lang in languages:
+                    for kind in kinds:
+                        txt = _fetch_timedtext_xml(
+                            video_id, lang, kind, cookies=effective_cookies, proxies=None, timeout_s=15,
                         )
-                        return txt
-        except (
-            requests.ReadTimeout,
-            requests.ConnectTimeout,
-            requests.RequestException,
-        ):
-            logging.warning(
-                f"Timedtext no-proxy attempt {attempt + 1} failed; backing off..."
-            )
-        time.sleep(1 + attempt)
+                        if txt:
+                            evt("timedtext_success", method="xml", use_proxy=False, lang=lang, kind=kind or 'caption', cookie_source=cookie_source)
+                            return txt
+            except (requests.ReadTimeout, requests.ConnectTimeout, requests.RequestException) as e:
+                evt("timedtext_attempt", method="xml", use_proxy=False, attempt=attempt + 1, outcome="timeout", detail=str(e))
+            time.sleep(1 + attempt)
 
     # Then proxy if enabled and available
     if proxies:
@@ -958,30 +1678,26 @@ def get_captions_via_timedtext(
             try:
                 for lang in languages:
                     for kind in kinds:
-                        txt = _fetch_timedtext(
+                        txt = _fetch_timedtext_xml(
                             video_id,
                             lang,
                             kind,
-                            cookies=cookie_jar,
+                            cookies=effective_cookies,
                             proxies=proxies,
                             timeout_s=15,
                         )
                         if txt:
-                            logging.info(
-                                f"Timedtext hit (proxy): lang={lang}, kind={kind or 'caption'}"
-                            )
+                            evt("timedtext_success", method="xml", use_proxy=True, lang=lang, kind=kind or 'caption', cookie_source=cookie_source)
                             return txt
             except (
                 requests.ReadTimeout,
                 requests.ConnectTimeout,
                 requests.RequestException,
-            ):
-                logging.warning(
-                    f"Timedtext proxy attempt {attempt + 1} failed; backing off..."
-                )
+            ) as e:
+                evt("timedtext_attempt", method="xml", use_proxy=True, attempt=attempt + 1, outcome="timeout", detail=str(e))
             time.sleep(1 + attempt)
 
-    logging.info("Timedtext: no captions found")
+    evt("timedtext_result", outcome="no_captions")
     return ""
 
 
@@ -993,6 +1709,21 @@ def _try_click_any(page, selectors, wait_after=0):
             loc.click()
             if wait_after:
                 page.wait_for_timeout(wait_after)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _try_click_any_async(page, selectors, wait_after=0):
+    """Async version of _try_click_any for use with async Playwright"""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=3000)
+            await loc.click()
+            if wait_after:
+                await page.wait_for_timeout(wait_after)
             return True
         except Exception:
             continue
@@ -1039,8 +1770,9 @@ _BROWSER_SEM = threading.Semaphore(WORKER_CONCURRENCY)
 class ASRAudioExtractor:
     """ASR fallback system with HLS audio extraction and Deepgram transcription"""
 
-    def __init__(self, deepgram_api_key: str):
+    def __init__(self, deepgram_api_key: str, proxy_manager=None):
         self.deepgram_api_key = deepgram_api_key
+        self.proxy_manager = proxy_manager
         self.max_video_minutes = ASR_MAX_VIDEO_MINUTES
 
     def extract_and_transcribe(
@@ -1050,12 +1782,12 @@ class ASRAudioExtractor:
         Extract audio via HLS interception and transcribe with Deepgram.
         Includes cost controls and duration limits.
         """
-        logging.info(f"Starting ASR extraction for video {video_id}")
+        evt("asr_start")
 
         # Step 1: Extract HLS audio URL using Playwright
         audio_url = self._extract_hls_audio_url(video_id, proxy_manager, cookies)
         if not audio_url:
-            logging.warning(f"No HLS audio URL found for {video_id}")
+            evt("asr_step", step="hls_extraction", outcome="no_url")
             return ""
 
         # Step 2: Convert audio to WAV using ffmpeg
@@ -1063,15 +1795,14 @@ class ASRAudioExtractor:
             wav_path = os.path.join(temp_dir, "audio.wav")
 
             if not self._extract_audio_to_wav(audio_url, wav_path):
-                logging.warning(f"Audio extraction failed for {video_id}")
+                evt("asr_step", step="audio_extraction", outcome="failed")
                 return ""
 
             # Step 3: Check duration limits
             duration_minutes = self._get_audio_duration_minutes(wav_path)
             if duration_minutes > self.max_video_minutes:
-                logging.warning(
-                    f"Video {video_id} duration {duration_minutes}min exceeds limit {self.max_video_minutes}min"
-                )
+                evt("asr_step", step="duration_check", outcome="exceeded_limit", 
+                    duration_minutes=duration_minutes, limit_minutes=self.max_video_minutes)
                 return ""
 
             # Step 4: Transcribe with Deepgram
@@ -1086,15 +1817,15 @@ class ASRAudioExtractor:
         # Circuit breaker check
         now_ms = int(time.time() * 1000)
         if not _pw_allowed(now_ms):
-            logging.info("Playwright circuit breaker active - skipping ASR")
+            evt("asr_circuit_breaker", state="active")
             return ""
 
         # Non-fatal preflight check: log only
         try:
             if not youtube_reachable():
-                logging.info("YouTube preflight failed - continuing with ASR anyway")
+                evt("asr_preflight", outcome="failed", detail="YouTube not reachable")
         except Exception as e:
-            logging.info(f"YouTube preflight error ({e}); continuing with ASR")
+            evt("asr_preflight", outcome="error", detail=str(e))
 
         captured_url = {"url": None}
 
@@ -1105,27 +1836,30 @@ class ASRAudioExtractor:
                 "audio" in url or "mime=audio" in url
             ):
                 captured_url["url"] = response.url
-                logging.info(f"Captured HLS audio URL: {response.url[:140]}...")
+                evt("asr_capture", stream_type="hls", url_preview=response.url[:140])
             elif url.endswith(".mpd") or ".mpd?" in url:
                 # DASH manifest; ffmpeg can handle most mpd manifests
                 if "audio" in url or "mime=audio" in url:
                     captured_url["url"] = response.url
-                    logging.info(f"Captured DASH audio MPD: {response.url[:140]}...")
+                    evt("asr_capture", stream_type="dash", url_preview=response.url[:140])
             elif "videoplayback" in url and (
                 "mime=audio" in url or "mime=audio%2F" in url
             ):
                 captured_url["url"] = response.url
-                logging.info(f"Captured direct audio stream: {response.url[:140]}...")
+                evt("asr_capture", stream_type="direct", url_preview=response.url[:140])
 
-        # ASR strategy: try direct first, then proxy if available
-        proxy_strategies = [None]  # Start with no proxy
-        if proxy_manager:
-            try:
-                pw_proxy_config = proxy_manager.proxy_dict_for("playwright")
-                if pw_proxy_config:
-                    proxy_strategies.append(pw_proxy_config)  # Add proxy as fallback
-            except Exception:
-                pass
+        proxy_strategies = []
+        if ENFORCE_PROXY_ALL:
+            pw_proxy_config = _playwright_proxy(proxy_manager)
+            if pw_proxy_config:
+                proxy_strategies = [pw_proxy_config]
+            else:
+                proxy_strategies = []  # no valid proxy -> skip attempts
+        else:
+            proxy_strategies = [None]
+            pw_proxy_config = _playwright_proxy(proxy_manager)
+            if pw_proxy_config:
+                proxy_strategies.append(pw_proxy_config)
 
         with _BROWSER_SEM:
             with sync_playwright() as p:
@@ -1133,7 +1867,7 @@ class ASRAudioExtractor:
                     browser = None
                     try:
                         strategy_name = "direct" if pw_proxy is None else "proxy"
-                        logging.info(f"ASR attempting {strategy_name} strategy for {video_id}")
+                        evt("asr_strategy", strategy=strategy_name)
                         
                         browser = p.chromium.launch(
                             headless=True,
@@ -1292,25 +2026,106 @@ class ASRAudioExtractor:
 
         return ""
 
+    def _build_ffmpeg_headers(self, headers: list) -> str:
+        """
+        Build FFmpeg headers string with proper CRLF formatting and validation.
+        
+        Requirements:
+        - 9.1: CRLF-joined header string formatting
+        - 9.4: Validation to prevent "No trailing CRLF" errors
+        """
+        if not headers:
+            return ""
+        
+        try:
+            # Join headers with proper CRLF (actual \r\n characters, not escaped strings)
+            headers_str = "\r\n".join(headers)
+            
+            # Ensure trailing CRLF to prevent "No trailing CRLF" errors
+            if not headers_str.endswith("\r\n"):
+                headers_str += "\r\n"
+            
+            # Validate that we have proper CRLF formatting
+            if "\\r\\n" in headers_str:
+                logging.error("Headers contain escaped CRLF sequences instead of actual CRLF characters")
+                return ""
+            
+            # Validate that headers end with CRLF
+            if not headers_str.endswith("\r\n"):
+                logging.error("Headers do not end with proper CRLF sequence")
+                return ""
+            
+            return headers_str
+            
+        except Exception as e:
+            logging.error(f"Failed to build FFmpeg headers: {e}")
+            return ""
+
+    def _mask_ffmpeg_command_for_logging(self, cmd: list) -> list:
+        """
+        Create a safe version of FFmpeg command for logging with masked cookie values.
+        
+        Requirements:
+        - 9.3: Cookie value masking in all log output
+        """
+        safe_cmd = cmd.copy()
+        
+        for i, arg in enumerate(safe_cmd):
+            if isinstance(arg, str) and "Cookie:" in arg:
+                # Mask the entire headers argument that contains cookies
+                safe_cmd[i] = "[HEADERS_WITH_MASKED_COOKIES]"
+            elif isinstance(arg, str) and any(cookie_indicator in arg.lower() for cookie_indicator in ["cookie=", "session=", "auth="]):
+                # Mask any other arguments that might contain cookie-like data
+                safe_cmd[i] = "[MASKED_COOKIE_DATA]"
+        
+        return safe_cmd
+
     def _extract_audio_to_wav(self, audio_url: str, wav_path: str) -> bool:
-        """Extract audio from HLS stream to WAV using ffmpeg with WebM/Opus hardening"""
+        """Extract audio from HLS stream to WAV using ffmpeg with WebM/Opus hardening and proxy support"""
         max_retries = 2
         
         for attempt in range(max_retries):
+            start_time = time.time()
             try:
                 # Pass headers to avoid 403 on googlevideo domains (UA/Referer) and include Cookie if available
                 headers = [f"User-Agent: {_CHROME_UA}", "Referer: https://www.youtube.com/"]
                 ck = _cookie_header_from_env_or_file()
                 if ck:
                     headers.append(f"Cookie: {ck}")
-                headers_arg = "\r\n".join(headers) + "\r\n"
+                
+                # Build headers with proper CRLF formatting and validation
+                headers_arg = self._build_ffmpeg_headers(headers)
+                if not headers_arg:
+                    logging.error("Failed to build valid FFmpeg headers")
+                    return False
                 
                 # Enhanced FFmpeg command with WebM/Opus tolerance and format detection
+                # Place -headers parameter before -i parameter as required
                 cmd = [
                     "ffmpeg",
                     "-y",
                     "-loglevel", "error",
                     "-headers", headers_arg,
+                ]
+                
+                # Get proxy environment variables for subprocess
+                proxy_env = {}
+                if self.proxy_manager:
+                    proxy_env = self.proxy_manager.proxy_env_for_subprocess()
+                    if proxy_env:
+                        logging.info("Using proxy environment variables for FFmpeg subprocess")
+                        # Verify proxy configuration immediately
+                        if not self._verify_proxy_configuration(proxy_env):
+                            logging.error("Proxy configuration verification failed - aborting FFmpeg extraction")
+                            return False
+                elif ENFORCE_PROXY_ALL:
+                    # Fallback to legacy proxy URL method if proxy_manager not available
+                    proxy_url = _ffmpeg_proxy_url(shared_managers.get_proxy_manager())
+                    if proxy_url:
+                        cmd += ["-http_proxy", proxy_url]
+                
+                # Continue building command
+                cmd += [
                     # Add input format tolerance for WebM/Opus streams
                     "-analyzeduration", "10M",
                     "-probesize", "50M",
@@ -1326,40 +2141,86 @@ class ASRAudioExtractor:
                     wav_path,
                 ]
 
-                # Log the exact command for debugging (without sensitive headers)
-                safe_cmd = cmd.copy()
-                for i, arg in enumerate(safe_cmd):
-                    if "Cookie:" in arg:
-                        safe_cmd[i] = "-headers [REDACTED_COOKIES]"
+                # Log the exact command for debugging (with masked sensitive headers)
+                safe_cmd = self._mask_ffmpeg_command_for_logging(cmd)
                 logging.info(f"FFmpeg command (attempt {attempt + 1}): {' '.join(safe_cmd)}")
 
-                result = subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+                # Prepare environment for subprocess - inherit current env and add proxy vars
+                subprocess_env = os.environ.copy()
+                if proxy_env:
+                    subprocess_env.update(proxy_env)
+                    # Log proxy usage without exposing credentials
+                    logging.info("FFmpeg subprocess will use proxy environment variables")
 
+                # Run ffmpeg with stderr capture to memory buffer
+                result = subprocess.run(cmd, check=True, capture_output=True, timeout=120, env=subprocess_env)
+
+                # Calculate duration for success logging
+                duration_ms = int((time.time() - start_time) * 1000)
+                
                 if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
-                    logging.info(
-                        f"Audio extracted successfully: {os.path.getsize(wav_path)} bytes"
-                    )
+                    file_size = os.path.getsize(wav_path)
+                    # Structured logging for ffmpeg success with byte counts and duration
+                    from log_events import evt
+                    evt("stage_result", 
+                        stage="ffmpeg", 
+                        outcome="success", 
+                        dur_ms=duration_ms,
+                        detail=f"extracted {file_size} bytes")
                     return True
                 else:
-                    logging.error("Audio extraction produced empty file")
+                    # Empty file produced
+                    evt("stage_result", 
+                        stage="ffmpeg", 
+                        outcome="error", 
+                        dur_ms=duration_ms,
+                        detail="empty file produced")
                     if attempt < max_retries - 1:
                         logging.info(f"Retrying audio extraction (attempt {attempt + 2})")
                         continue
                     return False
 
-            except subprocess.TimeoutExpired:
-                logging.error(f"Audio extraction timed out after 120 seconds (attempt {attempt + 1})")
+            except subprocess.TimeoutExpired as e:
+                # Calculate duration for timeout logging
+                duration_ms = int((time.time() - start_time) * 1000)
+                
+                # Extract stderr tail if available
+                stderr_tail = None
+                if hasattr(e, 'stderr') and e.stderr:
+                    stderr_tail = self._extract_stderr_tail(e.stderr, 40)
+                
+                # Structured logging for ffmpeg timeout with duration
+                from log_events import evt
+                evt("stage_result", 
+                    stage="ffmpeg", 
+                    outcome="timeout", 
+                    dur_ms=duration_ms,
+                    detail=f"timeout after {duration_ms}ms",
+                    stderr_tail=stderr_tail)
+                
                 if attempt < max_retries - 1:
                     logging.info(f"Retrying after timeout (attempt {attempt + 2})")
                     continue
                 return False
                 
             except subprocess.CalledProcessError as e:
-                stderr_output = e.stderr.decode() if e.stderr else str(e)
-                logging.error(f"ffmpeg failed (attempt {attempt + 1}): {stderr_output}")
+                # Calculate duration for error logging
+                duration_ms = int((time.time() - start_time) * 1000)
+                
+                # Extract stderr tail (last 40 lines) on failure
+                stderr_tail = self._extract_stderr_tail(e.stderr, 40) if e.stderr else None
+                
+                # Structured logging for ffmpeg failure with stderr tail
+                from log_events import evt
+                evt("stage_result", 
+                    stage="ffmpeg", 
+                    outcome="error", 
+                    dur_ms=duration_ms,
+                    detail=f"exit_code={e.returncode}",
+                    stderr_tail=stderr_tail)
                 
                 # Check for specific WebM/Opus errors and retry with different approach
-                if "Invalid data found when processing input" in stderr_output and attempt < max_retries - 1:
+                if stderr_tail and "Invalid data found when processing input" in stderr_tail and attempt < max_retries - 1:
                     logging.info("Detected WebM/Opus format issue, retrying with enhanced tolerance")
                     continue
                 elif attempt < max_retries - 1:
@@ -1368,13 +2229,97 @@ class ASRAudioExtractor:
                 return False
                 
             except Exception as e:
-                logging.error(f"Audio extraction error (attempt {attempt + 1}): {e}")
+                # Calculate duration for general error logging
+                duration_ms = int((time.time() - start_time) * 1000)
+                
+                # Structured logging for general errors
+                from log_events import evt
+                evt("stage_result", 
+                    stage="ffmpeg", 
+                    outcome="error", 
+                    dur_ms=duration_ms,
+                    detail=f"general_error: {str(e)}")
+                
                 if attempt < max_retries - 1:
                     logging.info(f"Retrying after general error (attempt {attempt + 2})")
                     continue
                 return False
         
         return False
+
+    def _extract_stderr_tail(self, stderr_bytes: bytes, max_lines: int = 40) -> str:
+        """
+        Extract the last N lines from stderr output for logging.
+        
+        Args:
+            stderr_bytes: Raw stderr bytes from subprocess
+            max_lines: Maximum number of lines to extract (default 40)
+            
+        Returns:
+            String containing the last N lines of stderr, or empty string if no stderr
+        """
+        if not stderr_bytes:
+            return ""
+        
+        try:
+            # Try to decode stderr to string
+            stderr_text = stderr_bytes.decode('utf-8', errors='strict')
+            
+            # Split into lines and get the last N lines
+            lines = stderr_text.strip().split('\n')
+            tail_lines = lines[-max_lines:] if len(lines) > max_lines else lines
+            
+            # Join back into string
+            return '\n'.join(tail_lines)
+            
+        except UnicodeDecodeError as e:
+            # Handle decode errors explicitly
+            return f"stderr_decode_error: {str(e)}"
+        except Exception as e:
+            # Fallback for any other errors
+            return f"stderr_decode_error: {str(e)}"
+
+    def _verify_proxy_configuration(self, proxy_env: Dict[str, str]) -> bool:
+        """Verify proxy configuration by checking external IP changes"""
+        if not proxy_env:
+            return True  # No proxy to verify
+            
+        try:
+            import requests
+            
+            # Get IP without proxy
+            try:
+                direct_response = requests.get("http://httpbin.org/ip", timeout=5)
+                direct_ip = direct_response.json().get("origin", "").split(",")[0].strip()
+            except Exception as e:
+                logging.warning(f"Could not get direct IP for proxy verification: {e}")
+                # If we can't get direct IP, assume proxy is working
+                return True
+            
+            # Get IP with proxy environment
+            try:
+                # Create a new session with proxy environment
+                proxies = {
+                    "http": proxy_env.get("http_proxy"),
+                    "https": proxy_env.get("https_proxy")
+                }
+                proxy_response = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=10)
+                proxy_ip = proxy_response.json().get("origin", "").split(",")[0].strip()
+            except Exception as e:
+                logging.error(f"Proxy verification failed - could not connect through proxy: {e}")
+                return False
+            
+            # Verify IPs are different
+            if direct_ip == proxy_ip:
+                logging.error(f"Proxy verification failed - IP unchanged (both {direct_ip})")
+                return False
+            
+            logging.info(f"Proxy verification successful - IP changed from {direct_ip} to {proxy_ip}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Proxy verification error: {e}")
+            return False
 
     def _get_audio_duration_minutes(self, wav_path: str) -> float:
         """Get audio duration in minutes using ffprobe"""
@@ -1481,7 +2426,13 @@ class ASRAudioExtractor:
 def youtube_reachable(timeout_s=5) -> bool:
     """Preflight check: ping YouTube reachability before Playwright"""
     try:
-        r = HTTP.get("https://www.youtube.com/generate_204", timeout=(2, timeout_s))
+        proxies = None
+        if ENFORCE_PROXY_ALL:
+            try:
+                proxies = shared_managers.get_proxy_manager().proxy_dict_for("requests")
+            except Exception:
+                proxies = None
+        r = HTTP.get("https://www.youtube.com/generate_204", timeout=(2, timeout_s), proxies=proxies)
         return r.status_code == 204
     except requests.RequestException:
         return False
@@ -1512,63 +2463,208 @@ def _pw_register_success():
 
 def _convert_cookiejar_to_playwright_format(cookie_jar):
     """
-    Convert a cookie header string or dict into a Playwright cookies list.
-    Handles host-only cookies (__Host-*) by using 'url' instead of 'domain'.
-    Drops malformed pairs and names/values with illegal chars.
+    Convert cookie header string or dict into a Playwright cookies list.
+    Handles __Host- cookies via 'url'; sets domain/path for normal cookies.
     """
     if not cookie_jar:
         return None
-
-    def _pairs_from_header(header: str):
-        pairs = []
-        for kv in header.split(";"):
-            kv = kv.strip()
-            if not kv or "=" not in kv:
-                continue
-            name, value = kv.split("=", 1)
-            name, value = name.strip(), value.strip()
-            # basic sanitation: drop illegal cookie name/value chars
-            if not name or any(c in name for c in [';', ',', ' ', '\n', '\r']):
-                continue
-            if any(c in value for c in ['\n', '\r']):
-                continue
-            pairs.append((name, value))
-        return pairs
-
+    pairs: List[Tuple[str, str]] = []
     if isinstance(cookie_jar, dict):
         pairs = [(k, v) for k, v in cookie_jar.items() if isinstance(k, str)]
     elif isinstance(cookie_jar, str):
-        pairs = _pairs_from_header(cookie_jar)
+        for kv in cookie_jar.split(";"):
+            kv = kv.strip()
+            if "=" in kv:
+                name, value = kv.split("=", 1)
+                name, value = name.strip(), value.strip()
+                if name:
+                    pairs.append((name, value))
     else:
         return None
-
     cookies = []
     for name, value in pairs:
-        # Host-only cookies must NOT include 'domain'. Use url+path instead.
         if name.startswith("__Host-"):
-            cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "url": "https://www.youtube.com/",
-                    "path": "/",
-                    "secure": True,
-                }
-            )
+            cookies.append({"name": name, "value": value, "url": "https://www.youtube.com/", "path": "/", "secure": True})
             continue
-        # Default: set on common YT domains
         for domain in [".youtube.com", ".m.youtube.com"]:
-            cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": domain,
-                    "path": "/",
-                    # Be permissive; __Secure- prefers secure, set it if name hints it
-                    "secure": name.startswith("__Secure-"),
-                }
-            )
+            cookies.append({"name": name, "value": value, "domain": domain, "path": "/", "secure": name.startswith("__Secure-")})
     return cookies or None
+
+
+class DeterministicTranscriptCapture:
+    """Deterministic transcript capture using page.route() with Future resolution and DOM fallback."""
+    
+    def __init__(self, timeout_seconds: int = 25):
+        self.timeout_seconds = timeout_seconds
+        self.transcript_future = None
+        self.transcript_data = None
+        self.page = None  # Store page reference for DOM fallback
+        
+    async def setup_route_interception(self, page):
+        """Setup deterministic route interception for /youtubei/v1/get_transcript"""
+        import asyncio
+        
+        # Store page reference for DOM fallback
+        self.page = page
+        
+        # Create a new Future for this capture session
+        self.transcript_future = asyncio.Future()
+        self.transcript_data = None
+        
+        async def handle_transcript_route(route):
+            """Handle transcript route with Future resolution"""
+            try:
+                # Continue the request to let it proceed normally
+                response = await route.fetch()
+                
+                # Check if this is the transcript endpoint
+                url = route.request.url
+                if "/youtubei/v1/get_transcript" in url:
+                    try:
+                        # Read response body
+                        body = await response.body()
+                        if body:
+                            text_content = body.decode('utf-8', errors='ignore')
+                            if text_content and not self.transcript_future.done():
+                                self.transcript_data = text_content
+                                self.transcript_future.set_result(text_content)
+                                logging.info(f"YouTubei transcript captured via route interception: {len(text_content)} chars")
+                    except Exception as e:
+                        logging.warning(f"Error reading transcript response body: {e}")
+                        if not self.transcript_future.done():
+                            self.transcript_future.set_exception(e)
+                
+                # Fulfill the route with the response
+                await route.fulfill(response=response)
+                
+            except Exception as e:
+                logging.warning(f"Error in transcript route handler: {e}")
+                if not self.transcript_future.done():
+                    self.transcript_future.set_exception(e)
+                # Continue with original request if route handling fails
+                try:
+                    await route.continue_()
+                except:
+                    pass
+        
+        # Set up route interception for transcript endpoints
+        await page.route("**/youtubei/v1/get_transcript*", handle_transcript_route)
+        logging.info(f"Route interception setup for /youtubei/v1/get_transcript with {self.timeout_seconds}s timeout")
+    
+    async def _dom_fallback_extraction(self):
+        """
+        DOM fallback extraction when network interception times out.
+        Polls for transcript line selectors for 3-5 seconds and extracts text from DOM nodes.
+        """
+        if not self.page:
+            logging.warning("DOM fallback: No page reference available")
+            return None
+        
+        logging.info("DOM fallback: Starting transcript extraction from DOM after network timeout")
+        
+        # Transcript line selectors to poll for
+        transcript_selectors = [
+            # YouTube transcript panel selectors
+            '[data-testid="transcript-segment"]',
+            '.ytd-transcript-segment-renderer',
+            '.segment-text',
+            '.cue-group-renderer',
+            '.transcript-cue-renderer',
+            # Alternative selectors for different YouTube layouts
+            '[role="button"][aria-label*="transcript"]',
+            '.ytd-transcript-body-renderer .segment',
+            '.ytd-transcript-renderer .cue',
+            # Generic text content selectors
+            '.transcript-text',
+            '.caption-line',
+            '.subtitle-line'
+        ]
+        
+        import asyncio
+        
+        # Poll for 3-5 seconds (using 4 seconds as middle ground)
+        poll_duration = 4.0
+        poll_interval = 0.5
+        max_attempts = int(poll_duration / poll_interval)
+        
+        for attempt in range(max_attempts):
+            try:
+                transcript_lines = []
+                
+                # Try each selector to find transcript content
+                for selector in transcript_selectors:
+                    try:
+                        # Check if elements exist with this selector
+                        elements = await self.page.query_selector_all(selector)
+                        if elements:
+                            logging.info(f"DOM fallback: Found {len(elements)} elements with selector '{selector}'")
+                            
+                            # Extract text from each element
+                            for element in elements:
+                                try:
+                                    text_content = await element.text_content()
+                                    if text_content and text_content.strip():
+                                        transcript_lines.append(text_content.strip())
+                                except Exception as e:
+                                    logging.debug(f"DOM fallback: Error extracting text from element: {e}")
+                                    continue
+                            
+                            # If we found content with this selector, return immediately
+                            if transcript_lines:
+                                transcript_text = "\n".join(transcript_lines)
+                                logging.info(f"DOM fallback: Successfully extracted transcript from DOM: {len(transcript_text)} chars, {len(transcript_lines)} lines")
+                                return transcript_text
+                                
+                    except Exception as e:
+                        logging.debug(f"DOM fallback: Error with selector '{selector}': {e}")
+                        continue
+                
+                # Wait before next polling attempt if no content found
+                if attempt < max_attempts - 1:  # Don't wait on last attempt
+                    await asyncio.sleep(poll_interval)
+                    
+            except Exception as e:
+                logging.warning(f"DOM fallback: Error during polling attempt {attempt + 1}: {e}")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(poll_interval)
+                continue
+        
+        logging.info(f"DOM fallback: No transcript content found after {poll_duration}s of polling")
+        return None
+    
+    async def wait_for_transcript(self):
+        """Wait for transcript capture with timeout and DOM fallback"""
+        import asyncio
+        
+        try:
+            # Wait for transcript with timeout
+            result = await asyncio.wait_for(self.transcript_future, timeout=self.timeout_seconds)
+            return result
+        except asyncio.TimeoutError:
+            logging.info(f"YouTubei route interception timed out after {self.timeout_seconds}s - attempting DOM fallback")
+            
+            # Try DOM fallback when network interception times out
+            dom_result = await self._dom_fallback_extraction()
+            if dom_result:
+                logging.info("DOM fallback: Successfully extracted transcript when network was blocked")
+                return dom_result
+            else:
+                logging.info("DOM fallback: No transcript found via DOM - falling back to next method")
+                return None
+                
+        except Exception as e:
+            logging.warning(f"YouTubei route interception failed: {e} - attempting DOM fallback")
+            
+            # Try DOM fallback on other errors too
+            try:
+                dom_result = await self._dom_fallback_extraction()
+                if dom_result:
+                    logging.info("DOM fallback: Successfully extracted transcript after network error")
+                    return dom_result
+            except Exception as dom_error:
+                logging.warning(f"DOM fallback also failed: {dom_error}")
+            
+            return None
 
 
 def get_transcript_via_youtubei(
@@ -1576,160 +2672,284 @@ def get_transcript_via_youtubei(
 ) -> str:
     """
     Navigate a YouTube watch page and capture `/youtubei/v1/get_transcript` JSON via Playwright.
-    - Honors per-attempt proxy toggle (no-proxy first, then proxy if available).
+    Uses deterministic route interception with asyncio.Future resolution pattern.
+    - Implements multi-client profile support: desktop(no-proxy → proxy) then mobile(no-proxy → proxy)
+    - Uses browser context reuse with profile switching logic
     - Continues without storage_state if missing (no early returns).
-    - Emits CloudWatch-friendly logs including the via_proxy flag.
+    - Emits CloudWatch-friendly logs including the via_proxy flag and profile information.
+    - Integrates with enhanced circuit breaker and tenacity retry logic.
     """
-    from pathlib import Path
-    from playwright.sync_api import sync_playwright
+    
+    def _youtubei_operation():
+        """Internal operation function to be wrapped by circuit breaker and retry logic."""
+        return _get_transcript_via_youtubei_internal(video_id, proxy_manager, cookies, timeout_ms)
+    
+    # Execute with circuit breaker integration and retry logic
+    return _execute_youtubei_with_circuit_breaker(_youtubei_operation, video_id)
+
+
+def _get_transcript_via_youtubei_internal(
+    video_id: str, proxy_manager=None, cookies=None, timeout_ms: int = None
+) -> str:
+    """
+    Internal YouTubei extraction implementation (wrapped by circuit breaker and retry logic).
+    """
+    import asyncio
 
     timeout_ms = timeout_ms or PLAYWRIGHT_NAVIGATION_TIMEOUT
-    now_ms = int(time.time() * 1000)
-    if not _pw_allowed(now_ms):
-        logging.info("YouTubei circuit breaker active - skipping")
-        return ""
 
-    # Build attempt order: direct first, then proxy (if any)
+    # Build multi-profile attempt sequence: desktop(no-proxy → proxy) then mobile(no-proxy → proxy)
     attempts = []
-    attempts.append({"use_proxy": False, "proxy": None})
+    
+    # Get proxy configuration
     pw_proxy = None
     if proxy_manager:
         try:
-            pw_proxy = proxy_manager.proxy_dict_for("playwright")
+            pw_proxy = _playwright_proxy(proxy_manager)
         except Exception:
             pw_proxy = None
-    if pw_proxy:
-        attempts.append({"use_proxy": True, "proxy": pw_proxy})
+    
+    # Profile attempt sequence as per requirements
+    for profile_name in ["desktop", "mobile"]:
+        if ENFORCE_PROXY_ALL:
+            # Only proxy attempts when enforcing
+            attempts.append({
+                "profile": profile_name,
+                "use_proxy": True, 
+                "proxy": pw_proxy
+            })
+        else:
+            # No-proxy first, then proxy for each profile
+            attempts.append({
+                "profile": profile_name,
+                "use_proxy": False, 
+                "proxy": None
+            })
+            if pw_proxy:
+                attempts.append({
+                    "profile": profile_name,
+                    "use_proxy": True, 
+                    "proxy": pw_proxy
+                })
 
-    with _BROWSER_SEM:
-        with sync_playwright() as p:
-            for idx, a in enumerate(attempts, 1):
-                use_proxy = a["use_proxy"]
+    async def _create_profile_context(browser, playwright_manager, profile_name, proxy_dict):
+        """Create browser context with profile-specific settings and storage state."""
+        # Get profile configuration
+        client_profile = PROFILES.get(profile_name, PROFILES["desktop"])
+        
+        # Ensure storage state is available (convert if needed)
+        storage_state_available = playwright_manager.ensure_storage_state_available()
+        
+        # Prepare context arguments with profile-specific settings
+        context_kwargs = {
+            "user_agent": client_profile.user_agent,
+            "viewport": client_profile.viewport,
+            "locale": "en-US",
+            "ignore_https_errors": True,
+        }
+        
+        # Add proxy if provided
+        if proxy_dict:
+            context_kwargs["proxy"] = proxy_dict
+            logging.info(f"[playwright] Creating {profile_name} context with proxy server={proxy_dict.get('server')}")
+        else:
+            logging.info(f"[playwright] Creating {profile_name} context WITHOUT proxy")
+        
+        # Add storage state if available
+        if storage_state_available and playwright_manager.storage_state_path.exists():
+            context_kwargs["storage_state"] = str(playwright_manager.storage_state_path)
+            logging.info(f"Using Playwright storage_state from {playwright_manager.storage_state_path}")
+            
+            # Verify storage state contains cookies
+            try:
+                with open(playwright_manager.storage_state_path, 'r') as f:
+                    state_data = json.load(f)
+                    cookie_count = len(state_data.get("cookies", []))
+                    logging.info(f"Storage state contains {cookie_count} cookies for {profile_name} profile")
+            except Exception as e:
+                logging.warning(f"Could not verify storage state contents: {e}")
+        
+        # Create context with profile settings
+        context = await browser.new_context(**context_kwargs)
+        logging.info(f"Created {profile_name} context with UA: {client_profile.user_agent[:50]}... viewport: {client_profile.viewport}")
+        
+        return context, storage_state_available
+
+    async def run_youtubei_extraction():
+        """Async function to run the YouTubei extraction with deterministic capture and multi-profile support"""
+        
+        async with async_playwright() as p:
+            browser = None
+            current_profile = None
+            
+            try:
+                # Launch browser once and reuse for all attempts
                 launch_kwargs = {"headless": True, "args": ["--no-sandbox"]}
-                if use_proxy and pw_proxy:
-                    launch_kwargs["proxy"] = pw_proxy
-                    logging.info(f"[playwright] launching with proxy server={pw_proxy.get('server')}")
-                else:
-                    logging.info("[playwright] launching WITHOUT proxy for this attempt")
-
-                browser = None
-                context = None
-                page = None
-                try:
-                    youtubei_payload = {"raw_json": None}
-
-                    def on_response(resp):
-                        url = resp.url
-                        if "/youtubei/v1/get_transcript" in url:
-                            try:
-                                text = resp.text()
-                                if text:
-                                    youtubei_payload["raw_json"] = text
-                            except Exception as e:
-                                logging.warning(f"youtubei response read error: {e}")
-
-                    browser = p.chromium.launch(**launch_kwargs)
-                    # storage_state is optional; proceed if missing
-                    cookie_dir = Path(os.getenv("COOKIE_DIR", "/app/cookies"))
-                    storage_state_path = cookie_dir / "youtube_session.json"
-
-                    context_kwargs = dict(
-                        user_agent=_CHROME_UA,
-                        viewport={"width": 1366, "height": 900},
-                        locale="en-US",
-                        ignore_https_errors=True,
+                browser = await p.chromium.launch(**launch_kwargs)
+                logging.info("[playwright] Browser launched for multi-profile attempts")
+                
+                # Initialize enhanced Playwright manager
+                playwright_manager = EnhancedPlaywrightManager()
+                
+                for idx, attempt in enumerate(attempts, 1):
+                    profile_name = attempt["profile"]
+                    use_proxy = attempt["use_proxy"]
+                    proxy = attempt["proxy"]
+                    
+                    # Import context management for attempt tracking
+                    from logging_setup import set_job_ctx, get_job_ctx
+                    from log_events import evt
+                    
+                    # Update context with attempt details
+                    current_ctx = get_job_ctx()
+                    set_job_ctx(
+                        job_id=current_ctx.get('job_id'),
+                        video_id=video_id
                     )
-                    if storage_state_path.exists():
-                        context_kwargs["storage_state"] = str(storage_state_path)
-                        logging.info(f"Using Playwright storage_state at {storage_state_path}")
-                    else:
-                        logging.warning(
-                            f"Playwright storage_state missing at {storage_state_path} - proceeding without storage_state"
-                        )
-
-                    context = browser.new_context(**context_kwargs)
-                    # Pre-seed consent to reduce friction
+                    
+                    # Log attempt start with context
+                    evt("youtubei_attempt_start", 
+                        attempt=idx, 
+                        total_attempts=len(attempts),
+                        profile=profile_name, 
+                        use_proxy=use_proxy)
+                    
+                    context = None
+                    page = None
                     try:
-                        context.add_cookies(
-                            [
+                        # Create deterministic transcript capture handler for this attempt
+                        transcript_capture = DeterministicTranscriptCapture(timeout_seconds=25)
+                        
+                        # Create context with profile-specific settings
+                        context, storage_state_loaded = await _create_profile_context(
+                            browser, playwright_manager, profile_name, proxy if use_proxy else None
+                        )
+                        
+                        # Pre-seed consent to reduce friction
+                        try:
+                            await context.add_cookies([
                                 {"name": "CONSENT", "value": "YES+1", "domain": ".youtube.com", "path": "/"},
                                 {"name": "CONSENT", "value": "YES+1", "domain": ".m.youtube.com", "path": "/"},
-                            ]
-                        )
-                    except Exception:
-                        pass
-
-                    if cookies:
-                        pw_cookies = _convert_cookiejar_to_playwright_format(cookies)
-                        if pw_cookies:
-                            try:
-                                context.add_cookies(pw_cookies)
-                            except Exception:
-                                pass
-
-                    page = context.new_page()
-                    page.set_default_navigation_timeout(timeout_ms * 1000 if timeout_ms < 1000 else timeout_ms)
-                    page.on("response", on_response)
-
-                    url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
-                    logging.info(f"youtubei_attempt video_id={video_id} url={url} via_proxy={use_proxy}")
-                    page.goto(url, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT_MS)
-
-                    # Light interaction helps trigger network calls
-                    try:
-                        _try_click_any(
-                            page,
-                            [
-                                'button:has-text("Accept all")',
-                                'button:has-text("I agree")',
-                                '[aria-label*="Accept"]',
-                            ],
-                            wait_after=1000,
-                        )
-                    except Exception:
-                        pass
-
-                    try:
-                        page.keyboard.press("k")  # play/pause toggle
-                    except Exception:
-                        pass
-
-                    # Allow network to settle and the transcript endpoint to fire (YT throttles)
-                    page.wait_for_timeout(7000)
-
-                    if youtubei_payload["raw_json"]:
-                        _pw_register_success()
-                        try:
-                            data = json.loads(youtubei_payload["raw_json"])
-                            # Very simple extractor: concatenate textRuns if present
-                            out = []
-                            def walk(node):
-                                if isinstance(node, dict):
-                                    if "text" in node and isinstance(node["text"], str):
-                                        out.append(node["text"])
-                                    for v in node.values():
-                                        walk(v)
-                                elif isinstance(node, list):
-                                    for v in node:
-                                        walk(v)
-                            walk(data)
-                            txt = "\n".join(t.strip() for t in out if isinstance(t, str) and t.strip())
-                            if txt:
-                                return txt
+                            ])
                         except Exception:
-                            # return raw as fallback
-                            return youtubei_payload["raw_json"]
+                            pass
 
-                except Exception as e:
-                    if "TimeoutError" in type(e).__name__:
-                        logging.warning(f"YouTubei timeout on attempt {idx}: {e}")
-                        _pw_register_timeout(now_ms)
-                    else:
-                        logging.warning(f"YouTubei error on attempt {idx}: {e}")
-                finally:
-                    ResourceCleanupManager.cleanup_playwright_resources(browser, context, page)
+                        # Add user cookies if provided
+                        if cookies:
+                            pw_cookies = _convert_cookiejar_to_playwright_format(cookies)
+                            if pw_cookies:
+                                try:
+                                    await context.add_cookies(pw_cookies)
+                                except Exception:
+                                    pass
 
-    return ""
+                        page = await context.new_page()
+                        page.set_default_navigation_timeout(timeout_ms * 1000 if timeout_ms < 1000 else timeout_ms)
+                        
+                        # Setup deterministic route interception
+                        await transcript_capture.setup_route_interception(page)
+
+                        url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
+                        await page.goto(url, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT_MS)
+
+                        # Light interaction helps trigger network calls
+                        try:
+                            await _try_click_any_async(
+                                page,
+                                [
+                                    'button:has-text("Accept all")',
+                                    'button:has-text("I agree")',
+                                    '[aria-label*="Accept"]',
+                                ],
+                                wait_after=1000,
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            await page.keyboard.press("k")  # play/pause toggle
+                        except Exception:
+                            pass
+
+                        # Wait for transcript capture with deterministic timeout
+                        transcript_data = await transcript_capture.wait_for_transcript()
+
+                        if transcript_data:
+                            # Log successful attempt with context
+                            evt("youtubei_attempt_success", 
+                                attempt=idx,
+                                profile=profile_name, 
+                                use_proxy=use_proxy,
+                                outcome="success")
+                            
+                            try:
+                                data = json.loads(transcript_data)
+                                # Very simple extractor: concatenate textRuns if present
+                                out = []
+                                def walk(node):
+                                    if isinstance(node, dict):
+                                        if "text" in node and isinstance(node["text"], str):
+                                            out.append(node["text"])
+                                        for v in node.values():
+                                            walk(v)
+                                    elif isinstance(node, list):
+                                        for v in node:
+                                            walk(v)
+                                walk(data)
+                                txt = "\n".join(t.strip() for t in out if isinstance(t, str) and t.strip())
+                                if txt:
+                                    return txt
+                            except Exception:
+                                # return raw as fallback
+                                return transcript_data
+
+                    except Exception as e:
+                        # Log failed attempt with context
+                        error_type = "timeout" if "TimeoutError" in type(e).__name__ else "error"
+                        evt("youtubei_attempt_failed", 
+                            attempt=idx,
+                            profile=profile_name, 
+                            use_proxy=use_proxy,
+                            outcome=error_type,
+                            detail=str(e)[:100])
+                        
+                        # Re-raise exception to be handled by retry logic
+                        raise
+                    finally:
+                        if page:
+                            await page.close()
+                        if context:
+                            await context.close()
+                
+                logging.info(f"All YouTubei attempts exhausted across profiles: {len(attempts)} attempts tried")
+                
+            finally:
+                if browser:
+                    await browser.close()
+                    logging.info("[playwright] Browser closed after all profile attempts")
+
+        return ""
+
+    # Run the async extraction in a new event loop
+    with _BROWSER_SEM:
+        try:
+            # Create new event loop for this thread if needed
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're in an existing event loop, we need to run in a thread
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, run_youtubei_extraction())
+                        return future.result(timeout=YOUTUBEI_HARD_TIMEOUT)
+                else:
+                    return loop.run_until_complete(run_youtubei_extraction())
+            except RuntimeError:
+                # No event loop exists, create one
+                return asyncio.run(run_youtubei_extraction())
+        except Exception as e:
+            logging.error(f"YouTubei extraction failed: {e}")
+            return ""
 
 
 def get_transcript_via_youtubei_with_timeout(
@@ -1997,6 +3217,11 @@ class TranscriptService:
         correlation_id = generate_correlation_id()
         start_time = time.time()
         
+        # Set video context if not already set
+        current_ctx = get_job_ctx()
+        if 'video_id' not in current_ctx:
+            set_job_ctx(video_id=video_id)
+        
         # Use provided proxy_manager or fall back to instance proxy_manager
         effective_proxy_manager = proxy_manager or self.proxy_manager
         
@@ -2013,54 +3238,57 @@ class TranscriptService:
             primary_language = language_codes[0] if language_codes else "en"
             cached_transcript = self.cache.get(video_id, primary_language)
             if cached_transcript:
-                logging.info(
-                    f"transcript_attempt video_id={video_id} method=cache success=true duration_ms=0"
-                )
+                evt("stage_result", stage="cache", outcome="success", dur_ms=0)
                 return cached_transcript
 
             # 1) youtube_transcript_api (manual captions preferred)
             try:
                 if ENABLE_YT_API:
-                    # youtube_transcript_api_compat expects 'languages', not 'language_codes'
-                    txt = get_transcript(video_id, languages=language_codes)
-                    if txt:
-                        return txt
+                    with StageTimer("yt_api"):
+                        # youtube_transcript_api_compat expects 'languages', not 'language_codes'
+                        txt = get_transcript(video_id, languages=language_codes)
+                        if txt:
+                            return txt
             except Exception as e:
-                logging.info(f"YouTube Transcript API failed for {video_id}: {e}")
+                evt("stage_result", stage="yt_api", outcome="error", detail=f"{type(e).__name__}: {str(e)}")
 
             # 2) timedtext (json3, xml, then alternate host)
-            txt = get_captions_via_timedtext(
-                video_id,
-                proxy_manager=effective_proxy_manager,
-                cookie_jar=cookie_dict  # pass cookies to requests where supported
-            )
-            if txt:
-                return txt
+            with StageTimer("timedtext", use_proxy=bool(effective_proxy_manager)):
+                txt = get_captions_via_timedtext(
+                    video_id,
+                    proxy_manager=effective_proxy_manager,
+                    cookie_jar=cookie_dict,  # pass cookies to requests where supported
+                    user_cookies=user_cookies  # Enhanced: thread user cookies through timed-text pipeline
+                )
+                if txt:
+                    return txt
 
             # 3) YouTubei via Playwright network capture
-            txt = get_transcript_via_youtubei_with_timeout(
-                video_id,
-                proxy_manager=effective_proxy_manager,
-                cookies=cookie_dict or cookie_header  # function accepts cookie jar OR header; internal converter present
-            )
-            if txt:
-                return txt
+            with StageTimer("youtubei", use_proxy=bool(effective_proxy_manager)):
+                txt = get_transcript_via_youtubei_with_timeout(
+                    video_id,
+                    proxy_manager=effective_proxy_manager,
+                    cookies=cookie_dict or cookie_header  # function accepts cookie jar OR header; internal converter present
+                )
+                if txt:
+                    return txt
 
             # 4) ASR fallback (Deepgram)
             if ENABLE_ASR_FALLBACK:
                 try:
                     dg_key = os.getenv("DEEPGRAM_API_KEY", "")
                     if dg_key:
-                        asr = ASRAudioExtractor(dg_key)
-                        txt = asr.extract_and_transcribe(
-                            video_id,
-                            proxy_manager=effective_proxy_manager,
-                            cookies=cookie_dict or cookie_header
-                        )
-                        if txt:
-                            return txt
+                        with StageTimer("asr", use_proxy=bool(effective_proxy_manager)):
+                            asr = ASRAudioExtractor(dg_key, proxy_manager)
+                            txt = asr.extract_and_transcribe(
+                                video_id,
+                                proxy_manager=effective_proxy_manager,
+                                cookies=cookie_dict or cookie_header
+                            )
+                            if txt:
+                                return txt
                 except Exception as e:
-                    logging.error(f"ASR fallback failed for {video_id}: {e}")
+                    evt("stage_result", stage="asr", outcome="error", detail=f"{type(e).__name__}: {str(e)}")
 
             return ""
 
@@ -2080,7 +3308,7 @@ class TranscriptService:
                 "timedtext",
                 ENABLE_TIMEDTEXT,
                 lambda vid, lang, cookies: get_captions_via_timedtext(
-                    vid, self.proxy_manager, cookies
+                    vid, self.proxy_manager, cookies, user_cookies=user_cookies
                 ),
             ),
             (
@@ -2112,6 +3340,22 @@ class TranscriptService:
                 continue
 
             start_time = time.time()
+            
+            # Determine proxy usage and profile for this stage
+            proxy_used = False
+            profile = None
+            
+            if source in ["timedtext", "youtubei"] and self.proxy_manager:
+                proxy_used = True
+            
+            # For youtubei, we might have profile information from multi-client support
+            if source == "youtubei":
+                # Default to desktop profile if not specified
+                profile = "desktop"
+            
+            # Get current circuit breaker state for logging
+            circuit_breaker_state = _playwright_circuit_breaker.get_state() if source == "youtubei" else None
+            
             try:
                 if source == "yt_api":
                     result = method(video_id, (language, "en", "en-US"))
@@ -2123,7 +3367,23 @@ class TranscriptService:
                 duration_ms = int((time.time() - start_time) * 1000)
 
                 if result and result.strip():
-                    # Log successful transcript acquisition
+                    # Record comprehensive stage metrics with structured logging
+                    from transcript_metrics import record_stage_metrics, log_successful_transcript_method
+                    
+                    record_stage_metrics(
+                        video_id=video_id,
+                        stage=source,
+                        duration_ms=duration_ms,
+                        success=True,
+                        proxy_used=proxy_used,
+                        profile=profile,
+                        circuit_breaker_state=circuit_breaker_state
+                    )
+                    
+                    # Log which method succeeded for this video
+                    log_successful_transcript_method(video_id)
+                    
+                    # Legacy metrics for backward compatibility
                     log_performance_metrics(
                         operation=f"transcript_{source}",
                         duration_ms=duration_ms,
@@ -2134,7 +3394,21 @@ class TranscriptService:
                     inc_success(source)
                     return result, source
                 else:
-                    # Log empty result
+                    # Record failed stage metrics (empty result)
+                    from transcript_metrics import record_stage_metrics
+                    
+                    record_stage_metrics(
+                        video_id=video_id,
+                        stage=source,
+                        duration_ms=duration_ms,
+                        success=False,
+                        proxy_used=proxy_used,
+                        profile=profile,
+                        error_type="empty_result",
+                        circuit_breaker_state=circuit_breaker_state
+                    )
+                    
+                    # Legacy logging
                     log_performance_metrics(
                         operation=f"transcript_{source}",
                         duration_ms=duration_ms,
@@ -2145,6 +3419,24 @@ class TranscriptService:
 
             except Exception as e:
                 duration_ms = int((time.time() - start_time) * 1000)
+                
+                # Classify error type for structured logging
+                error_type = classify_transcript_error(e, video_id, source)
+                
+                # Record failed stage metrics with error details
+                from transcript_metrics import record_stage_metrics
+                
+                record_stage_metrics(
+                    video_id=video_id,
+                    stage=source,
+                    duration_ms=duration_ms,
+                    success=False,
+                    proxy_used=proxy_used,
+                    profile=profile,
+                    error_type=error_type,
+                    circuit_breaker_state=circuit_breaker_state
+                )
+                
                 # Use structured error handling
                 handle_transcript_error(video_id, source, e, duration_ms)
                 inc_fail(source)
@@ -2164,10 +3456,9 @@ class TranscriptService:
             # Log API version and method availability for debugging
             import youtube_transcript_api as yta_mod
 
-            logging.info(
-                f"yt-transcript-api version={getattr(yta_mod, '__version__', 'unknown')}, "
-                f"get_transcript_hasattr={hasattr(YouTubeTranscriptApi, 'get_transcript')}"
-            )
+            evt("yt_api_info", 
+                version=getattr(yta_mod, '__version__', 'unknown'),
+                has_get_transcript=hasattr(YouTubeTranscriptApi, 'get_transcript'))
 
             # Strategy 1: Try list_transcripts first (more robust)
             try:
@@ -2250,8 +3541,12 @@ class TranscriptService:
                         elif self.cookie_header:
                             cookies = self.cookie_header
                         
-                        # For youtube-transcript-api: try direct first (usually works better without proxy)
-                        proxies = None  # Start without proxy for better success rate
+                        proxies = None
+                        if ENFORCE_PROXY_ALL:
+                            try:
+                                proxies = shared_managers.get_proxy_manager().proxy_dict_for("requests")
+                            except Exception:
+                                proxies = None
                         
                         # Use direct HTTP transcript fetching
                         transcript_text = get_transcript_with_cookies(
@@ -2299,8 +3594,12 @@ class TranscriptService:
                 elif self.cookie_header:
                     cookies = self.cookie_header
                 
-                # For youtube-transcript-api: try direct first (usually works better without proxy)
-                proxies = None  # Start without proxy for better success rate
+                proxies = None
+                if ENFORCE_PROXY_ALL:
+                    try:
+                        proxies = shared_managers.get_proxy_manager().proxy_dict_for("requests")
+                    except Exception:
+                        proxies = None
                 
                 for lang in languages:
                     try:
@@ -2417,18 +3716,16 @@ class TranscriptService:
         ASR fallback: Extract audio via HLS interception and transcribe with Deepgram.
         Includes cost controls and duration limits.
         """
-        logging.info(f"transcript_stage_start video_id={video_id} stage=asr")
+        evt("stage_start", stage="asr")
         if not self.deepgram_api_key:
-            logging.warning(
-                f"transcript_attempt video_id={video_id} method=asr success=false reason=no_key"
-            )
+            evt("stage_result", stage="asr", outcome="no_key")
             return ""
 
         try:
-            extractor = ASRAudioExtractor(self.deepgram_api_key)
+            extractor = ASRAudioExtractor(self.deepgram_api_key, pm)
             return extractor.extract_and_transcribe(video_id, pm, cookies)
         except Exception as e:
-            logging.error(f"ASR fallback failed for {video_id}: {e}")
+            evt("stage_result", stage="asr", outcome="error", detail=f"{type(e).__name__}: {str(e)}")
             return ""
 
     def close(self):

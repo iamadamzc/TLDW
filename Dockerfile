@@ -40,7 +40,9 @@ ENV PORT=8080 \
     PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
-    COOKIE_DIR=/app/cookies
+    COOKIE_DIR=/app/cookies \
+    USE_MINIMAL_LOGGING=true \
+    LOG_LEVEL=INFO
 
 # Ensure cookies directory exists at runtime
 RUN mkdir -p ${COOKIE_DIR}

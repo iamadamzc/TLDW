@@ -117,5 +117,12 @@ See `.env.example` for required configuration.
 
 ## Documentation
 
+### Core Documentation
+- `docs/TRANSCRIPT_SERVICE_ENHANCEMENTS_GUIDE.md` - Complete guide to enhanced transcript service features
+- `docs/TRANSCRIPT_ENHANCEMENTS_DEPLOYMENT_GUIDE.md` - Deployment guide for new functionality
+- `docs/ENVIRONMENT_VARIABLE_MIGRATION_GUIDE.md` - Migration guide for environment variables
+- `docs/TRANSCRIPT_ENHANCEMENTS_TROUBLESHOOTING_GUIDE.md` - Troubleshooting procedures for new features
+
+### Legacy Documentation
 - `deployment/cookie-deployment-guide.md` - Cookie feature deployment
-- `docs/` - Additional documentation
+- `docs/` - Additional technical documentation
