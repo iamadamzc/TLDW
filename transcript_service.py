@@ -26,6 +26,7 @@ from timedtext_service import timedtext_with_job_proxy
 from storage_state_manager import get_storage_state_manager
 from ffmpeg_service import extract_audio_with_job_proxy
 from youtubei_service import extract_transcript_with_job_proxy
+from reliability_config import get_reliability_config
 
 from playwright.sync_api import sync_playwright, Page
 from playwright.async_api import async_playwright
@@ -103,6 +104,143 @@ _CHROME_UA = (
 )
 
 
+# --- XML Content Validation Helpers (Requirements 3.1, 3.3) ---
+
+def _is_html_response(content: str) -> bool:
+    """Detect if response content is HTML rather than XML."""
+    content_lower = content.lower().strip()
+    
+    # Check for HTML doctype or opening tags
+    html_indicators = [
+        "<!doctype html",
+        "<html",
+        "<head>",
+        "<body>",
+        "<title>",
+        "<meta ",
+        "<script",
+        "<style"
+    ]
+    
+    return any(indicator in content_lower for indicator in html_indicators)
+
+
+def _is_consent_or_captcha_response(content: str) -> bool:
+    """Detect consent walls, captcha pages, or other blocking responses."""
+    content_lower = content.lower()
+    
+    # Common consent/blocking patterns
+    blocking_patterns = [
+        "before you continue to youtube",
+        "consent",
+        "captcha",
+        "verify you are human",
+        "automated requests",
+        "unusual traffic",
+        "access denied",
+        "blocked",
+        "robot",
+        "bot detection"
+    ]
+    
+    return any(pattern in content_lower for pattern in blocking_patterns)
+
+
+def _validate_xml_content(content: str) -> Tuple[bool, str]:
+    """
+    Validate XML content before parsing with early blocking detection.
+    Returns (is_valid, error_reason).
+    """
+    if not content or not content.strip():
+        return False, "empty_body"
+    
+    content_stripped = content.strip()
+    
+    # Early HTML detection
+    if _is_html_response(content_stripped):
+        if _is_consent_or_captcha_response(content_stripped):
+            return False, "html_consent_or_captcha"
+        return False, "html_response"
+    
+    # Check if content starts with XML declaration or root element
+    if not content_stripped.startswith(("<", "<?xml")):
+        return False, "not_xml_format"
+    
+    # Basic XML structure validation
+    try:
+        # Quick validation without full parsing - just check if it's well-formed
+        ET.fromstring(content_stripped)
+        return True, "valid"
+    except ET.ParseError as e:
+        return False, f"xml_parse_error: {str(e)[:100]}"
+    except Exception as e:
+        return False, f"validation_error: {str(e)[:100]}"
+
+
+class ContentValidationError(Exception):
+    """Exception raised when content validation fails, potentially requiring retry with cookies."""
+    def __init__(self, message: str, error_reason: str, should_retry_with_cookies: bool = False):
+        super().__init__(message)
+        self.error_reason = error_reason
+        self.should_retry_with_cookies = should_retry_with_cookies
+
+
+def _validate_and_parse_xml(response, context: str = "unknown") -> ET.Element:
+    """
+    Validate response content before XML parsing with early blocking detection.
+    
+    Args:
+        response: HTTP response object with .text attribute
+        context: Context string for logging (e.g., "timedtext", "captionTracks")
+    
+    Returns:
+        ET.Element: Parsed XML root element
+        
+    Raises:
+        ContentValidationError: If content validation fails (may suggest retry with cookies)
+        ET.ParseError: If XML parsing fails after validation
+    
+    Requirements: 3.1, 3.3
+    """
+    if not response or not hasattr(response, 'text'):
+        evt("xml_validation_failed", context=context, reason="no_response_text")
+        raise ContentValidationError("No response text available", "no_response_text")
+    
+    xml_text = response.text.strip() if response.text else ""
+    
+    # Validate content before parsing
+    is_valid, error_reason = _validate_xml_content(xml_text)
+    
+    if not is_valid:
+        # Determine if we should retry with cookies (Requirement 3.2)
+        should_retry = "html_consent_or_captcha" in error_reason or "html_response" in error_reason
+        
+        # Log specific validation failure types (Requirement 3.3)
+        if error_reason == "empty_body":
+            evt("timedtext_empty_body", context=context)
+        elif "html_consent_or_captcha" in error_reason:
+            evt("timedtext_html_or_block", context=context, content_preview=xml_text[:200])
+        elif "html_response" in error_reason:
+            evt("timedtext_html_or_block", context=context, content_preview=xml_text[:200])
+        elif "not_xml_format" in error_reason:
+            evt("timedtext_not_xml", context=context, content_preview=xml_text[:120])
+        else:
+            evt("timedtext_not_xml", context=context, content_preview=xml_text[:120])
+        
+        raise ContentValidationError(
+            f"Content validation failed: {error_reason}", 
+            error_reason, 
+            should_retry_with_cookies=should_retry
+        )
+    
+    # Parse validated XML
+    try:
+        return ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        evt("xml_parse_failed", context=context, error=str(e)[:100])
+        raise
+
+
 @dataclass
 class ClientProfile:
     """Client profile configuration for multi-client support."""
@@ -136,18 +274,32 @@ ENABLE_ASR_FALLBACK = (
     not ASR_DISABLED
 )  # Enable ASR by default unless explicitly disabled
 
-# Performance and safety controls
-PW_NAV_TIMEOUT_MS = int(os.getenv("PW_NAV_TIMEOUT_MS", "120000"))  # Increased to 120s for better reliability
-USE_PROXY_FOR_TIMEDTEXT = os.getenv("USE_PROXY_FOR_TIMEDTEXT", "1") == "1"  # Default to using proxy for timedtext
-# When set, force ALL network to go through proxy: requests, Playwright, and ffmpeg.
-ENFORCE_PROXY_ALL = os.getenv("ENFORCE_PROXY_ALL", "0") in ("1", "true", "yes")
-ASR_MAX_VIDEO_MINUTES = int(os.getenv("ASR_MAX_VIDEO_MINUTES", "20"))
+# Get reliability configuration
+_config = get_reliability_config()
 
-# Timeout configuration
-YOUTUBEI_HARD_TIMEOUT = 35  # seconds maximum YouTubei operation time (reduced from 150)
-PLAYWRIGHT_NAVIGATION_TIMEOUT = 60  # seconds for page navigation
-CIRCUIT_BREAKER_RECOVERY = 600  # 10 minutes circuit breaker timeout
+# Performance and safety controls from centralized config
+PW_NAV_TIMEOUT_MS = _config.playwright_navigation_timeout * 1000  # Convert to milliseconds
+USE_PROXY_FOR_TIMEDTEXT = _config.use_proxy_for_timedtext
+ENFORCE_PROXY_ALL = _config.enforce_proxy_all
+ASR_MAX_VIDEO_MINUTES = _config.asr_max_video_minutes
+
+# Timeout configuration from centralized config
+YOUTUBEI_HARD_TIMEOUT = _config.youtubei_hard_timeout
+PLAYWRIGHT_NAVIGATION_TIMEOUT = _config.playwright_navigation_timeout
+CIRCUIT_BREAKER_RECOVERY = _config.circuit_breaker_recovery
 GLOBAL_JOB_TIMEOUT = 240  # 4 minutes maximum job duration (global watchdog)
+
+# Log configuration for debugging deployment issues
+def _log_transcript_service_config():
+    """Log transcript service configuration for debugging."""
+    logger.info("Transcript service configuration:")
+    logger.info(f"  Feature flags: YT_API={ENABLE_YT_API}, TIMEDTEXT={ENABLE_TIMEDTEXT}, YOUTUBEI={ENABLE_YOUTUBEI}, ASR={ENABLE_ASR_FALLBACK}")
+    logger.info(f"  Reliability config: proxy_enforcement={ENFORCE_PROXY_ALL}, proxy_timedtext={USE_PROXY_FOR_TIMEDTEXT}")
+    logger.info(f"  Timeouts: youtubei={YOUTUBEI_HARD_TIMEOUT}s, playwright_nav={PLAYWRIGHT_NAVIGATION_TIMEOUT}s, global_job={GLOBAL_JOB_TIMEOUT}s")
+    logger.info(f"  ASR: max_minutes={ASR_MAX_VIDEO_MINUTES}, circuit_breaker_recovery={CIRCUIT_BREAKER_RECOVERY}s")
+
+# Log configuration on module load
+_log_transcript_service_config()
 
 
 class PlaywrightCircuitBreaker:
@@ -1303,12 +1455,46 @@ def _fetch_timedtext_xml(
     # 2) Try XML on youtube.com
     if r.status_code == 200 and r.text.strip():
         try:
-            root = ET.fromstring(r.text)
+            root = _validate_and_parse_xml(r, "timedtext_xml")
             texts = [
                 ("".join(node.itertext())).strip() for node in root.findall(".//text")
             ]
             if texts:
                 return "\n".join(texts)
+        except ContentValidationError as e:
+            # Retry with cookies if blocking is detected (Requirement 3.2)
+            if e.should_retry_with_cookies and not cookies:
+                evt("timedtext_retry_with_cookies", context="timedtext_xml", reason=e.error_reason)
+                # Get cookies from environment/file for retry
+                ck = _cookie_header_from_env_or_file()
+                if ck:
+                    cookie_dict = {}
+                    for pair in ck.split("; "):
+                        if "=" in pair:
+                            name, value = pair.split("=", 1)
+                            cookie_dict[name] = value
+                    
+                    # Retry the same request with cookies
+                    r_retry = HTTP.get(
+                        "https://www.youtube.com/api/timedtext",
+                        params={**params, "fmt": "xml"},
+                        headers=headers,
+                        cookies=cookie_dict,
+                        proxies=proxies,
+                        timeout=(5, timeout_s),
+                        allow_redirects=True,
+                    )
+                    if r_retry.status_code == 200 and r_retry.text.strip():
+                        try:
+                            root_retry = _validate_and_parse_xml(r_retry, "timedtext_xml_retry")
+                            texts_retry = [
+                                ("".join(node.itertext())).strip() for node in root_retry.findall(".//text")
+                            ]
+                            if texts_retry:
+                                evt("timedtext_retry_success", context="timedtext_xml")
+                                return "\n".join(texts_retry)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -1324,12 +1510,46 @@ def _fetch_timedtext_xml(
     )
     if r2.status_code == 200 and r2.text.strip():
         try:
-            root = ET.fromstring(r2.text)
+            root = _validate_and_parse_xml(r2, "timedtext_xml_fallback")
             texts = [
                 ("".join(node.itertext())).strip() for node in root.findall(".//text")
             ]
             if texts:
                 return "\n".join(texts)
+        except ContentValidationError as e:
+            # Retry with cookies if blocking is detected (Requirement 3.2)
+            if e.should_retry_with_cookies and not cookies:
+                evt("timedtext_retry_with_cookies", context="timedtext_xml_fallback", reason=e.error_reason)
+                # Get cookies from environment/file for retry
+                ck = _cookie_header_from_env_or_file()
+                if ck:
+                    cookie_dict = {}
+                    for pair in ck.split("; "):
+                        if "=" in pair:
+                            name, value = pair.split("=", 1)
+                            cookie_dict[name] = value
+                    
+                    # Retry the same request with cookies
+                    r2_retry = HTTP.get(
+                        "https://video.google.com/timedtext",
+                        params=params,
+                        headers=headers,
+                        cookies=cookie_dict,
+                        proxies=proxies,
+                        timeout=(5, timeout_s),
+                        allow_redirects=True,
+                    )
+                    if r2_retry.status_code == 200 and r2_retry.text.strip():
+                        try:
+                            root_retry = _validate_and_parse_xml(r2_retry, "timedtext_xml_fallback_retry")
+                            texts_retry = [
+                                ("".join(node.itertext())).strip() for node in root_retry.findall(".//text")
+                            ]
+                            if texts_retry:
+                                evt("timedtext_retry_success", context="timedtext_xml_fallback")
+                                return "\n".join(texts_retry)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -1462,7 +1682,7 @@ def get_transcript_with_cookies_fixed(video_id: str, language_codes: list, user_
                 
             # Parse the transcript list XML
             try:
-                root = ET.fromstring(response.text)
+                root = _validate_and_parse_xml(response, "transcript_list")
                 
                 # Find transcripts for the requested language
                 transcript_tracks = []
@@ -1492,18 +1712,23 @@ def get_transcript_with_cookies_fixed(video_id: str, language_codes: list, user_
                     try:
                         transcript_response = session.get(transcript_url, proxies=proxies, timeout=15)
                         if transcript_response.status_code == 200 and transcript_response.text.strip():
-                            # Parse the transcript XML
-                            transcript_root = ET.fromstring(transcript_response.text)
-                            texts = []
-                            for text_elem in transcript_root.findall('.//text'):
-                                text_content = ''.join(text_elem.itertext()).strip()
-                                if text_content and text_content not in ['[Music]', '[Applause]', '[Laughter]']:
-                                    texts.append(text_content)
-                            
-                            if texts:
-                                transcript_text = '\n'.join(texts)
-                                logging.info(f"Direct HTTP transcript success for {video_id}, lang={lang}, kind={track['kind'] or 'manual'}")
-                                return transcript_text
+                            try:
+                                # Parse the transcript XML
+                                transcript_root = _validate_and_parse_xml(transcript_response, "transcript_content_1")
+                                texts = []
+                                for text_elem in transcript_root.findall('.//text'):
+                                    text_content = ''.join(text_elem.itertext()).strip()
+                                    if text_content and text_content not in ['[Music]', '[Applause]', '[Laughter]']:
+                                        texts.append(text_content)
+                                
+                                if texts:
+                                    transcript_text = '\n'.join(texts)
+                                    logging.info(f"Direct HTTP transcript success for {video_id}, lang={lang}, kind={track['kind'] or 'manual'}")
+                                    return transcript_text
+                            except ContentValidationError as e:
+                                # Log validation failure and continue to next track
+                                evt("transcript_validation_failed", video_id=video_id, lang=lang, reason=e.error_reason)
+                                continue
                                 
                     except Exception as e:
                         logging.warning(f"Failed to fetch transcript for {video_id}, lang={lang}: {e}")
@@ -1561,7 +1786,7 @@ def get_transcript_with_cookies(video_id: str, language_codes: list, cookies=Non
             # Parse the transcript list XML
             try:
                 import xml.etree.ElementTree as ET
-                root = ET.fromstring(response.text)
+                root = _validate_and_parse_xml(response, "transcript_list_2")
                 
                 # Find transcripts for the requested language
                 transcript_tracks = []
@@ -1591,18 +1816,23 @@ def get_transcript_with_cookies(video_id: str, language_codes: list, cookies=Non
                     try:
                         transcript_response = session.get(transcript_url, proxies=(proxies or None), timeout=15)
                         if transcript_response.status_code == 200 and transcript_response.text.strip():
-                            # Parse the transcript XML
-                            transcript_root = ET.fromstring(transcript_response.text)
-                            texts = []
-                            for text_elem in transcript_root.findall('.//text'):
-                                text_content = ''.join(text_elem.itertext()).strip()
-                                if text_content and text_content not in ['[Music]', '[Applause]', '[Laughter]']:
-                                    texts.append(text_content)
-                            
-                            if texts:
-                                transcript_text = '\n'.join(texts)
-                                logging.info(f"Direct HTTP transcript success for {video_id}, lang={lang}, kind={track['kind'] or 'manual'}")
-                                return transcript_text
+                            try:
+                                # Parse the transcript XML
+                                transcript_root = _validate_and_parse_xml(transcript_response, "transcript_content_2")
+                                texts = []
+                                for text_elem in transcript_root.findall('.//text'):
+                                    text_content = ''.join(text_elem.itertext()).strip()
+                                    if text_content and text_content not in ['[Music]', '[Applause]', '[Laughter]']:
+                                        texts.append(text_content)
+                                
+                                if texts:
+                                    transcript_text = '\n'.join(texts)
+                                    logging.info(f"Direct HTTP transcript success for {video_id}, lang={lang}, kind={track['kind'] or 'manual'}")
+                                    return transcript_text
+                            except ContentValidationError as e:
+                                # Log validation failure and continue to next track
+                                evt("transcript_validation_failed", video_id=video_id, lang=lang, reason=e.error_reason)
+                                continue
                                 
                     except Exception as e:
                         logging.warning(f"Failed to fetch transcript for {video_id}, lang={lang}: {e}")
@@ -1785,6 +2015,62 @@ class ASRAudioExtractor:
         self.proxy_manager = proxy_manager
         self.max_video_minutes = ASR_MAX_VIDEO_MINUTES
 
+    def _trigger_asr_playback(self, page) -> None:
+        """
+        Start video playback to trigger HLS/MPD manifest requests.
+        
+        Implements Requirements 3.5, 3.6:
+        - Use keyboard shortcuts (k key) and video element clicks
+        - Add asr_playback_initiated logging before HLS capture
+        - Add error handling for playback initiation failures
+        
+        Args:
+            page: Playwright page object (sync)
+        """
+        try:
+            evt("asr_playback_initiated")
+            
+            # Method 1: Use keyboard shortcut to start playback
+            try:
+                page.keyboard.press("k")  # YouTube play/pause toggle
+                page.wait_for_timeout(1000)  # Give time for playback to start
+                evt("asr_playback_keyboard_success")
+            except Exception as e:
+                evt("asr_playback_keyboard_failed", err=str(e)[:100])
+            
+            # Method 2: Click video element directly
+            try:
+                video_locator = page.locator("video").first
+                video_locator.wait_for(state="visible", timeout=5000)
+                video_locator.click(timeout=3000)
+                page.wait_for_timeout(1000)
+                evt("asr_playback_click_success")
+            except Exception as e:
+                evt("asr_playback_click_failed", err=str(e)[:100])
+            
+            # Method 3: JavaScript-based playback initiation (muted to satisfy autoplay policy)
+            try:
+                page.evaluate("""
+                    () => {
+                        const video = document.querySelector('video');
+                        if (video) {
+                            video.muted = true;
+                            video.play().catch(err => console.log('Video play failed:', err));
+                        }
+                    }
+                """)
+                page.wait_for_timeout(1000)
+                evt("asr_playback_js_success")
+            except Exception as e:
+                evt("asr_playback_js_failed", err=str(e)[:100])
+            
+            # Give additional time for HLS/MPD manifest requests to be triggered
+            page.wait_for_timeout(2000)
+            
+        except Exception as e:
+            evt("asr_playback_trigger_failed", err=str(e)[:100])
+            # Continue anyway - some videos may already be playing or may start playing later
+
     def extract_and_transcribe(
         self, video_id: str, proxy_manager=None, cookies=None
     ) -> str:
@@ -1916,6 +2202,7 @@ class ASRAudioExtractor:
 
                         page = ctx.new_page()
                         page.set_default_navigation_timeout(timeout_ms)
+                        # Set up HLS/MPD listeners BEFORE navigation and playback (Requirement 3.5, 3.6)
                         page.on("response", capture_m3u8_response)
 
                         # Try desktop first, then mobile, then embed with retry logic
@@ -1959,24 +2246,17 @@ class ASRAudioExtractor:
                                     except Exception:
                                         pass  # Consent handling is optional
 
-                                    # ensure the player has focus, then play (muted to satisfy any policy)
+                                    # Trigger video playback immediately after page navigation (Requirements 3.5, 3.6)
+                                    # HLS/MPD listeners are already active from page setup above
                                     try:
-                                        page.click("video", timeout=5000)  # Increased timeout
-                                    except Exception:
-                                        pass
-                                    try:
-                                        page.keyboard.press("k")  # toggle play
-                                    except Exception:
-                                        pass
-                                    try:
-                                        page.evaluate(
-                                            """() => {
-                                            const v = document.querySelector('video');
-                                            if (v) { v.muted = true; v.play().catch(()=>{}); }
-                                        }"""
-                                        )
-                                    except Exception:
-                                        pass
+                                        self._trigger_asr_playback(page)
+                                    except Exception as playback_error:
+                                        # Log playback initiation failure but continue with capture attempt
+                                        evt("asr_playback_initiation_error", 
+                                            error_type=type(playback_error).__name__,
+                                            error=str(playback_error)[:100])
+                                        logging.warning(f"ASR playback initiation failed: {playback_error}")
+                                        # Continue anyway - HLS/MPD streams might still be captured
                                     
                                     # Give more time for stream/manifest to load
                                     page.wait_for_timeout(8000)  # Increased from 5s to 8s
@@ -3419,6 +3699,14 @@ class TranscriptService:
             if ENABLE_TIMEDTEXT:
                 stage_start = time.time()
                 try:
+                    # Log cookie usage for timedtext stage
+                    cookie_source = "user_provided" if cookie_header else "none"
+                    evt("timedtext_cookie_usage", 
+                        video_id=video_id, 
+                        job_id=job_id, 
+                        cookie_source=cookie_source,
+                        has_cookies=bool(cookie_header))
+                    
                     transcript_text = timedtext_with_job_proxy(
                         video_id, job_id, effective_proxy_manager, cookie_header
                     )
@@ -3442,15 +3730,27 @@ class TranscriptService:
                     evt("stage_result", stage="timedtext", outcome=type(e).__name__, dur_ms=stage_duration, detail=(str(e)[:200] if str(e) else ""))
                     pipeline_stages.append(("timedtext", error_class, stage_duration))
 
-            # 3) Enhanced YouTubei via Playwright with guaranteed storage state
+            # 3) Enhanced YouTubei via Playwright with guaranteed storage state and fast-fail timeout detection
+            youtubei_fast_fail = False  # Flag to track navigation timeout fast-fail
             if ENABLE_YOUTUBEI:
                 stage_start = time.time()
                 try:
                     # Use playwright_cookies if provided, otherwise use cookie_header
                     effective_cookies = playwright_cookies or cookie_header
-                    transcript_text = self._enhanced_youtubei_stage(
+                    
+                    # Log cookie usage for youtubei stage
+                    cookie_source = "playwright" if playwright_cookies else ("user_provided" if cookie_header else "none")
+                    evt("youtubei_cookie_usage", 
+                        video_id=video_id, 
+                        job_id=job_id, 
+                        cookie_source=cookie_source,
+                        has_cookies=bool(effective_cookies))
+                    
+                    # Run YouTubei with fast-fail timeout detection (Requirement 3.4)
+                    transcript_text = self._run_youtubei_with_timeout(
                         video_id, job_id, effective_proxy_manager, effective_cookies
                     )
+                    
                     if transcript_text:
                         stage_duration = int((time.time() - stage_start) * 1000)
                         evt("stage_result", stage="youtubei", outcome="success", dur_ms=stage_duration)
@@ -3467,7 +3767,18 @@ class TranscriptService:
                     evt("stage_result", stage="youtubei", outcome=error_class, dur_ms=stage_duration)
                     pipeline_stages.append(("youtubei", error_class, stage_duration))
                     
-                    # Log YouTubei timeout specifically to trigger ASR (Fix E)
+                    # Check for navigation timeout to trigger fast-fail to ASR (Requirements 3.4, 5.1)
+                    if self._is_navigation_timeout_error(e):
+                        evt("youtubei_nav_timeout_short_circuit",
+                            video_id=video_id,
+                            job_id=job_id,
+                            timeout_seconds=YOUTUBEI_HARD_TIMEOUT,
+                            error_type=error_class,
+                            next_stage="asr")
+                        # Set flag to skip any retry loops and immediately proceed to ASR (Requirement 5.1)
+                        youtubei_fast_fail = True
+                    
+                    # Log other YouTubei timeouts for monitoring
                     if "timeout" in error_class.lower() or "TimeoutError" in error_class:
                         evt("youtubei_timeout", 
                             video_id=video_id, 
@@ -3475,17 +3786,31 @@ class TranscriptService:
                             timeout_seconds=YOUTUBEI_HARD_TIMEOUT,
                             next_stage="asr")
 
-            # 4) Enhanced ASR fallback with job-scoped proxy (Fix E: Always runs after YouTubei timeout)
+            # 4) Enhanced ASR fallback with job-scoped proxy and fast-fail support
             if ENABLE_ASR_FALLBACK:
                 stage_start = time.time()
-                # Log ASR start explicitly (Fix E)
+                
+                # Determine trigger reason for ASR stage (Requirement 3.4)
+                trigger_reason = "nav_timeout_fast_fail" if youtubei_fast_fail else "pipeline_fallback"
+                
+                # Log ASR start with trigger context
                 evt("asr_start", 
                     video_id=video_id, 
                     job_id=job_id,
-                    triggered_by="pipeline_fallback")
+                    triggered_by=trigger_reason,
+                    fast_fail=youtubei_fast_fail)
                 try:
                     # Use playwright_cookies if provided, otherwise use cookie_header
                     effective_cookies = playwright_cookies or cookie_header
+                    
+                    # Log cookie usage for ASR stage
+                    cookie_source = "playwright" if playwright_cookies else ("user_provided" if cookie_header else "none")
+                    evt("asr_cookie_usage", 
+                        video_id=video_id, 
+                        job_id=job_id, 
+                        cookie_source=cookie_source,
+                        has_cookies=bool(effective_cookies))
+                    
                     transcript_text = self._enhanced_asr_stage(
                         video_id, job_id, effective_proxy_manager, effective_cookies
                     )
@@ -4033,11 +4358,18 @@ class TranscriptService:
         Returns:
             Tuple of (transcript_text, selected_track_info)
         """
-        # Log languages being tried
+        # Log languages being tried and cookie usage
+        cookie_source = "user_provided" if cookie_header else "none"
         evt("yt_api_languages_tried", 
             video_id=video_id, 
             languages=language_codes,
             job_id=job_id)
+        
+        evt("yt_api_cookie_usage", 
+            video_id=video_id, 
+            job_id=job_id, 
+            cookie_source=cookie_source,
+            has_cookies=bool(cookie_header))
         
         try:
             # Get job-scoped proxy if needed
@@ -4100,6 +4432,93 @@ class TranscriptService:
             
             return "", error_class
     
+    def _run_youtubei_with_timeout(
+        self,
+        video_id: str,
+        job_id: str,
+        proxy_manager,
+        cookie_header: Optional[str]
+    ) -> str:
+        """
+        Run YouTubei with fast-fail timeout detection for immediate ASR transition.
+        
+        Implements Requirements 3.4, 5.1:
+        - Add timeout detection in YouTubei wrapper calls
+        - Implement immediate ASR transition when navigation timeouts occur
+        - Prevent retry loops on the same failed extraction path
+        
+        Args:
+            video_id: YouTube video ID
+            job_id: Job identifier
+            proxy_manager: ProxyManager instance
+            cookie_header: Cookie header string
+            
+        Returns:
+            Transcript text if successful, empty string otherwise
+            
+        Raises:
+            Exception: Re-raises navigation timeout exceptions for fast-fail detection
+        """
+        try:
+            # Use the enhanced YouTubei stage with timeout monitoring
+            return self._enhanced_youtubei_stage(video_id, job_id, proxy_manager, cookie_header)
+            
+        except Exception as e:
+            # Check for navigation timeout errors that should trigger fast-fail (Requirement 3.4)
+            if self._is_navigation_timeout_error(e):
+                # Re-raise navigation timeout for fast-fail detection in pipeline
+                raise e
+            
+            # For other errors, log and return empty string for normal fallback
+            evt("youtubei_non_timeout_error",
+                video_id=video_id,
+                job_id=job_id,
+                error_type=type(e).__name__,
+                error_detail=str(e)[:200])
+            return ""
+    
+    def _is_navigation_timeout_error(self, error: Exception) -> bool:
+        """
+        Detect navigation timeout errors that should trigger fast-fail to ASR.
+        
+        Implements Requirement 3.4:
+        - Detect page.goto timeouts and route wait timeouts
+        - Identify navigation-specific timeout conditions
+        
+        Args:
+            error: Exception to check
+            
+        Returns:
+            True if error is a navigation timeout, False otherwise
+        """
+        error_str = str(error).lower()
+        error_type = type(error).__name__.lower()
+        
+        # Navigation timeout indicators
+        navigation_timeout_patterns = [
+            "navigation timeout",
+            "page.goto" in error_str and "timeout" in error_str,
+            "timeout" in error_str and "navigation" in error_str,
+            "timeouterror" in error_type and ("page" in error_str or "navigation" in error_str),
+            "playwright" in error_str and "timeout" in error_str and "goto" in error_str,
+            # Route wait timeouts that exceed the configured hard timeout
+            "route" in error_str and "timeout" in error_str and "wait" in error_str,
+            # Playwright-specific timeout errors during page operations
+            "asyncio.timeouterror" in error_type and "page" in error_str,
+            "concurrent.futures.timeouterror" in error_type
+        ]
+        
+        is_nav_timeout = any(pattern if isinstance(pattern, bool) else pattern in error_str 
+                           for pattern in navigation_timeout_patterns)
+        
+        if is_nav_timeout:
+            evt("navigation_timeout_detected",
+                error_type=type(error).__name__,
+                error_preview=error_str[:100],
+                will_fast_fail=True)
+        
+        return is_nav_timeout
+
     def _enhanced_youtubei_stage(
         self,
         video_id: str,
@@ -4140,7 +4559,8 @@ class TranscriptService:
                 job_id=job_id,
                 error_type=type(e).__name__,
                 error_detail=str(e)[:200])
-            return ""
+            # Re-raise the exception so timeout detection can work in _run_youtubei_with_timeout
+            raise
     
     def _enhanced_asr_stage(
         self,

@@ -25,12 +25,16 @@ from urllib3.util.retry import Retry
 
 from logging_setup import get_logger
 from log_events import evt
+from reliability_config import get_reliability_config
 
 logger = get_logger(__name__)
 
-# FFmpeg configuration
-FFMPEG_TIMEOUT = 120  # seconds
-FFMPEG_MAX_RETRIES = 2
+# Get reliability configuration
+_config = get_reliability_config()
+
+# FFmpeg configuration from centralized config
+FFMPEG_TIMEOUT = _config.ffmpeg_timeout
+FFMPEG_MAX_RETRIES = _config.ffmpeg_max_retries
 REQUESTS_CHUNK_SIZE = 8192  # bytes
 REQUESTS_TIMEOUT = 180  # seconds
 
@@ -263,8 +267,8 @@ class FFmpegService:
             except Exception as e:
                 logger.warning(f"Failed to get job proxy for FFmpeg: {e}")
         
-        # Check ENFORCE_PROXY_ALL compliance
-        self.enforce_proxy = os.getenv("ENFORCE_PROXY_ALL", "0") in ("1", "true", "yes")
+        # Check proxy enforcement from centralized config
+        self.enforce_proxy = _config.enforce_proxy_all
         if self.enforce_proxy and not (self.proxy_env or self.proxy_url):
             logger.error(f"ENFORCE_PROXY_ALL=1 but no proxy available for FFmpeg job {job_id}")
     
@@ -368,7 +372,6 @@ class FFmpegService:
                 "ffmpeg",
                 "-y",  # Overwrite output file
                 "-loglevel", "error",  # Only show errors
-                "-headers", headers_str,  # CRLF-formatted headers
                 # Network resilience flags
                 "-rw_timeout", "60000000",  # 60 second read/write timeout (microseconds)
                 "-reconnect", "1",
@@ -379,6 +382,8 @@ class FFmpegService:
                 # Input format tolerance
                 "-analyzeduration", "10M",
                 "-probesize", "50M",
+                # Headers must be immediately before -i
+                "-headers", headers_str,  # CRLF-formatted headers
                 "-i", audio_url,
                 # WAV output configuration (mono 16kHz)
                 "-vn",  # No video
@@ -439,25 +444,29 @@ class FFmpegService:
             if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 file_size = os.path.getsize(output_path)
                 
-                # Reject tiny downloads (< 1MB) as they're likely corrupted or HTML error pages
-                MIN_FILE_SIZE = 1024 * 1024  # 1MB
-                if file_size < MIN_FILE_SIZE:
-                    evt("ffmpeg_tiny_file_rejected",
-                        job_id=self.job_id,
-                        attempt=attempt,
-                        file_size=file_size,
-                        min_size=MIN_FILE_SIZE)
-                    
-                    # Clean up the tiny file
-                    try:
-                        os.unlink(output_path)
-                    except:
-                        pass
-                    
-                    return False, result.returncode, "tiny_file_rejected"
+                # Always run ffprobe validation regardless of file size
+                validation_result = self._validate_audio_with_ffprobe(output_path)
                 
-                # Validate audio file with ffprobe before declaring success
-                if self._validate_audio_with_ffprobe(output_path):
+                if validation_result == "success":
+                    # Even if ffprobe validation passes, reject tiny files (<1MB) to prevent HTML bodies
+                    MIN_FILE_SIZE = 1024 * 1024  # 1MB
+                    if file_size < MIN_FILE_SIZE:
+                        evt("ffmpeg_tiny_file_rejected",
+                            job_id=self.job_id,
+                            attempt=attempt,
+                            file_size=file_size,
+                            min_size=MIN_FILE_SIZE,
+                            note="rejected_despite_valid_ffprobe")
+                        
+                        # Clean up the tiny file
+                        try:
+                            os.unlink(output_path)
+                        except:
+                            pass
+                        
+                        return False, result.returncode, "tiny_file_rejected"
+                    
+                    # File passed both ffprobe validation and size check
                     evt("ffmpeg_success",
                         job_id=self.job_id,
                         attempt=attempt,
@@ -465,10 +474,12 @@ class FFmpegService:
                         output_size=file_size)
                     return True, result.returncode, "success"
                 else:
+                    # ffprobe validation failed
                     evt("ffmpeg_invalid_audio",
                         job_id=self.job_id,
                         attempt=attempt,
-                        file_size=file_size)
+                        file_size=file_size,
+                        validation_error=validation_result)
                     
                     # Clean up the invalid file
                     try:
@@ -476,7 +487,7 @@ class FFmpegService:
                     except:
                         pass
                     
-                    return False, result.returncode, "invalid_audio_format"
+                    return False, result.returncode, f"invalid_audio_{validation_result}"
             else:
                 return False, result.returncode, error_classification
                 
@@ -484,12 +495,13 @@ class FFmpegService:
             duration_ms = int((time.time() - start_time) * 1000)
             stderr_head = _extract_stderr_lines(e.stderr, max_lines=2) if e.stderr else ""
             
-            evt("ffmpeg_timeout",
+            evt("ffmpeg_timeout_exceeded",
                 job_id=self.job_id,
                 attempt=attempt,
                 duration_ms=duration_ms,
                 timeout_seconds=FFMPEG_TIMEOUT,
-                stderr_head=stderr_head)
+                stderr_head=stderr_head,
+                context="ffmpeg_extract_attempt")
             
             return False, -1, "timeout"
             
@@ -505,7 +517,7 @@ class FFmpegService:
             
             return False, -1, f"exception_{type(e).__name__}"
     
-    def _validate_audio_with_ffprobe(self, audio_path: str) -> bool:
+    def _validate_audio_with_ffprobe(self, audio_path: str) -> str:
         """
         Validate audio file with ffprobe before sending to Deepgram.
         
@@ -513,7 +525,7 @@ class FFmpegService:
             audio_path: Path to audio file to validate
             
         Returns:
-            True if audio file is valid, False otherwise
+            "success" if audio file is valid, error string otherwise
         """
         try:
             # Use ffprobe to validate the audio file
@@ -529,7 +541,7 @@ class FFmpegService:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=10,
+                timeout=10,  # Keep shorter timeout for ffprobe validation
                 check=False
             )
             
@@ -538,7 +550,7 @@ class FFmpegService:
                     job_id=self.job_id,
                     returncode=result.returncode,
                     stderr=result.stderr.decode('utf-8', errors='replace')[:200] if result.stderr else "")
-                return False
+                return "ffprobe_failed"
             
             # Parse ffprobe output
             try:
@@ -548,13 +560,13 @@ class FFmpegService:
                 format_info = probe_data.get('format', {})
                 if not format_info:
                     evt("ffprobe_no_format_info", job_id=self.job_id)
-                    return False
+                    return "no_format_info"
                 
                 # Check duration - should be > 0
                 duration = float(format_info.get('duration', 0))
                 if duration <= 0:
                     evt("ffprobe_zero_duration", job_id=self.job_id, duration=duration)
-                    return False
+                    return "zero_duration"
                 
                 # Check if we have audio streams
                 streams = probe_data.get('streams', [])
@@ -562,7 +574,7 @@ class FFmpegService:
                 
                 if not audio_streams:
                     evt("ffprobe_no_audio_streams", job_id=self.job_id, total_streams=len(streams))
-                    return False
+                    return "no_audio_streams"
                 
                 # Validate first audio stream
                 audio_stream = audio_streams[0]
@@ -576,7 +588,7 @@ class FFmpegService:
                         job_id=self.job_id,
                         codec_name=codec_name,
                         expected="pcm_*")
-                    return False
+                    return "invalid_codec"
                 
                 # Check sample rate (should be 16000 for our use case)
                 if sample_rate != '16000':
@@ -601,25 +613,44 @@ class FFmpegService:
                     sample_rate=sample_rate,
                     channels=channels)
                 
-                return True
+                return "success"
                 
             except (json.JSONDecodeError, KeyError, ValueError) as parse_error:
                 evt("ffprobe_parse_error",
                     job_id=self.job_id,
                     error=str(parse_error)[:200],
                     stdout_preview=result.stdout.decode('utf-8', errors='replace')[:200] if result.stdout else "")
-                return False
+                return "parse_error"
                 
         except subprocess.TimeoutExpired:
-            evt("ffprobe_timeout", job_id=self.job_id, timeout_seconds=10)
-            return False
+            evt("ffmpeg_timeout_exceeded", 
+                job_id=self.job_id, 
+                timeout_seconds=10,
+                context="ffprobe_validation")
+            return "timeout"
             
         except Exception as e:
             evt("ffprobe_exception",
                 job_id=self.job_id,
                 error_type=type(e).__name__,
                 error_detail=str(e)[:200])
-            return False
+            return "exception"
+    
+    def _get_job_proxy_dict(self) -> Optional[Dict[str, str]]:
+        """
+        Get proxy dictionary for the current job.
+        
+        Returns:
+            Proxy dictionary if available, None otherwise
+        """
+        if not (self.proxy_manager and self.proxy_manager.in_use):
+            return None
+        
+        try:
+            return self.proxy_manager.proxy_dict_for_job(self.job_id, "requests")
+        except Exception as e:
+            logger.warning(f"Failed to get job proxy dict: {e}")
+            return None
     
     def _mask_ffmpeg_command(self, cmd: List[str]) -> List[str]:
         """
@@ -668,6 +699,13 @@ class FFmpegService:
         Returns:
             True if successful, False otherwise
         """
+        # Enforce proxy compliance - block execution when ENFORCE_PROXY_ALL=1 and no proxy available
+        if self.enforce_proxy:
+            proxies = self._get_job_proxy_dict()
+            if not proxies:
+                evt("requests_fallback_blocked", job_id=self.job_id, reason="enforce_proxy_no_proxy")
+                return False
+        
         start_time = time.time()
         
         try:
@@ -699,13 +737,17 @@ class FFmpegService:
             if cookies:
                 headers["Cookie"] = cookies
             
-            # Configure proxy
+            # Configure proxy - verify proxy availability before proceeding
             proxies = None
             if self.proxy_manager and self.proxy_manager.in_use:
                 try:
                     proxies = self.proxy_manager.proxy_dict_for_job(self.job_id, "requests")
                 except Exception as e:
                     logger.warning(f"Failed to get proxy for requests fallback: {e}")
+                    # If proxy enforcement is enabled and we can't get proxy, fail
+                    if self.enforce_proxy:
+                        evt("requests_fallback_blocked", job_id=self.job_id, reason="proxy_manager_error")
+                        return False
             
             # Make streaming request
             evt("requests_fallback_start",
@@ -826,15 +868,22 @@ def extract_audio_with_job_proxy(
 
     # 2) ffprobe validation before handing to Deepgram
     import json, subprocess
-    probe = subprocess.run(
-        ["ffprobe","-v","error","-show_streams","-show_format","-print_format","json", output_path],
-        capture_output=True, text=True, timeout=10
-    )
-    meta = json.loads(probe.stdout or "{}")
-    streams = meta.get("streams") or []
-    has_audio = any(s.get("codec_type") == "audio" for s in streams)
-    if not has_audio:
-        evt("asr_audio_probe_failed", meta=meta if len(json.dumps(meta)) < 800 else {"note":"omitted"})
-        return False, "audio-invalid"
+    try:
+        probe = subprocess.run(
+            ["ffprobe","-v","error","-show_streams","-show_format","-print_format","json", output_path],
+            capture_output=True, text=True, timeout=10
+        )
+        meta = json.loads(probe.stdout or "{}")
+        streams = meta.get("streams") or []
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        if not has_audio:
+            evt("asr_audio_probe_failed", meta=meta if len(json.dumps(meta)) < 800 else {"note":"omitted"})
+            return False, "audio-invalid"
+    except subprocess.TimeoutExpired:
+        evt("ffmpeg_timeout_exceeded", 
+            job_id=job_id, 
+            timeout_seconds=10,
+            context="final_ffprobe_validation")
+        return False, "ffprobe_timeout"
 
     return success, error_classification

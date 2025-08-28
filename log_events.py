@@ -273,6 +273,139 @@ def video_processed(video_id: str, outcome: str, duration_ms: int, transcript_so
     evt("video_processed", **event_fields)
 
 
+# Reliability Event Definitions
+# These events are tied to specific requirements in the transcript reliability fix pack
+
+RELIABILITY_EVENTS = {
+    # YouTubei Service Reliability Events
+    "youtubei_captiontracks_shortcircuit": {
+        "description": "Caption tracks extracted directly from ytInitialPlayerResponse without DOM interaction",
+        "requirements": ["1.3"],
+        "context_fields": ["lang", "asr", "video_id", "job_id"]
+    },
+    "youtubei_captiontracks_probe_failed": {
+        "description": "Failed to extract caption tracks from ytInitialPlayerResponse",
+        "requirements": ["1.3"],
+        "context_fields": ["err", "video_id", "job_id"]
+    },
+    "youtubei_title_menu_open_failed": {
+        "description": "Failed to open transcript panel using title-row menu selector",
+        "requirements": ["1.4"],
+        "context_fields": ["err", "video_id", "job_id"]
+    },
+    "youtubei_direct_missing_ctx": {
+        "description": "Missing required context for direct POST fallback (API key, context, or params)",
+        "requirements": ["1.5"],
+        "context_fields": ["has_key", "has_ctx", "has_params", "video_id", "job_id"]
+    },
+    "youtubei_nav_timeout_short_circuit": {
+        "description": "Navigation timeout detected, fast-failing to ASR processing",
+        "requirements": ["3.4", "5.1"],
+        "context_fields": ["video_id", "job_id"]
+    },
+    
+    # FFmpeg Service Reliability Events
+    "requests_fallback_blocked": {
+        "description": "Requests fallback blocked due to proxy enforcement when no proxy available",
+        "requirements": ["2.1", "2.2"],
+        "context_fields": ["job_id", "reason"]
+    },
+    "ffmpeg_timeout_exceeded": {
+        "description": "FFmpeg processing exceeded configured timeout",
+        "requirements": ["2.3", "2.4"],
+        "context_fields": ["timeout", "job_id"]
+    },
+    
+    # Transcript Service Content Validation Events
+    "timedtext_empty_body": {
+        "description": "Timedtext response had empty body, indicating potential blocking",
+        "requirements": ["3.1", "3.3"],
+        "context_fields": ["status_code", "content_type"]
+    },
+    "timedtext_html_or_block": {
+        "description": "Timedtext response contained HTML, consent page, or captcha instead of XML",
+        "requirements": ["3.1", "3.2", "3.3"],
+        "context_fields": ["context", "content_preview"]
+    },
+    "timedtext_not_xml": {
+        "description": "Timedtext response was not valid XML format",
+        "requirements": ["3.1", "3.3"],
+        "context_fields": ["context", "content_preview"]
+    },
+    
+    # ASR Processing Reliability Events
+    "asr_playback_initiated": {
+        "description": "Video playback initiated to trigger HLS/MPD manifest requests for ASR",
+        "requirements": ["3.5", "3.6"],
+        "context_fields": []
+    }
+}
+
+
+def get_reliability_event_info(event_name: str) -> dict:
+    """
+    Get information about a reliability event.
+    
+    Args:
+        event_name: Name of the reliability event
+        
+    Returns:
+        Dictionary with event description, requirements, and context fields
+    """
+    return RELIABILITY_EVENTS.get(event_name, {
+        "description": "Unknown reliability event",
+        "requirements": [],
+        "context_fields": []
+    })
+
+
+def validate_reliability_event(event_name: str, **fields) -> bool:
+    """
+    Validate that a reliability event has the expected context fields.
+    
+    Args:
+        event_name: Name of the reliability event
+        **fields: Event context fields
+        
+    Returns:
+        True if event is valid, False otherwise
+    """
+    if event_name not in RELIABILITY_EVENTS:
+        return False
+    
+    expected_fields = set(RELIABILITY_EVENTS[event_name]["context_fields"])
+    provided_fields = set(fields.keys())
+    
+    # Check if all expected fields are provided (allowing extra fields)
+    return expected_fields.issubset(provided_fields)
+
+
+def log_reliability_event(event_name: str, **fields) -> None:
+    """
+    Log a reliability event with validation and context.
+    
+    This function provides a structured way to emit reliability events
+    with automatic validation and consistent formatting.
+    
+    Args:
+        event_name: Name of the reliability event
+        **fields: Event context fields
+        
+    Example:
+        log_reliability_event("youtubei_captiontracks_shortcircuit", 
+                            lang="en", asr=False, video_id="abc123", job_id="job_456")
+    """
+    if not validate_reliability_event(event_name, **fields):
+        # Log validation warning but still emit the event
+        evt("reliability_event_validation_failed", 
+            event_name=event_name, 
+            provided_fields=list(fields.keys()),
+            expected_fields=RELIABILITY_EVENTS.get(event_name, {}).get("context_fields", []))
+    
+    # Emit the reliability event
+    evt(event_name, **fields)
+
+
 def classify_error_type(exception: Exception) -> str:
     """
     Classify exception into error type for structured logging.

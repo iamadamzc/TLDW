@@ -96,6 +96,16 @@ def _create_timedtext_session(proxy_dict: Optional[Dict[str, str]] = None) -> re
 def _parse_track_list_xml(xml_string: str) -> List[Dict[str, str]]:
     """Parse the XML response from a `type=list` call."""
     try:
+        # Import validation function from transcript_service
+        from transcript_service import _validate_xml_content
+        
+        # Validate content before parsing
+        is_valid, error_reason = _validate_xml_content(xml_string)
+        if not is_valid:
+            evt("timedtext_track_list_validation_failed", reason=error_reason)
+            logger.debug(f"Track list XML validation failed: {error_reason}")
+            return []
+        
         root = ET.fromstring(xml_string)
         tracks = []
         for track in root.findall('track'):
@@ -107,8 +117,9 @@ def _parse_track_list_xml(xml_string: str) -> List[Dict[str, str]]:
                     "kind": track_data.get('kind', ''),
                 })
         return tracks
-    except ET.ParseError:
-        logger.debug("Failed to parse track list XML.")
+    except ET.ParseError as e:
+        evt("timedtext_track_list_parse_failed", error=str(e)[:100])
+        logger.debug(f"Failed to parse track list XML: {e}")
         return []
 
 def _parse_transcript(response_text: str, content_type: str) -> str:
@@ -123,13 +134,24 @@ def _parse_transcript(response_text: str, content_type: str) -> str:
             ]
             return "\n".join(p.strip() for p in parts if p.strip())
         except json.JSONDecodeError:
+            evt("timedtext_json_parse_failed", content_preview=response_text[:100])
             return ""
     elif "xml" in content_type:
         try:
+            # Import validation function from transcript_service
+            from transcript_service import _validate_xml_content
+            
+            # Validate content before parsing
+            is_valid, error_reason = _validate_xml_content(response_text)
+            if not is_valid:
+                evt("timedtext_transcript_validation_failed", reason=error_reason)
+                return ""
+            
             root = ET.fromstring(response_text)
             parts = ["".join(elem.itertext()).strip() for elem in root.findall(".//text")]
             return "\n".join(p for p in parts if p)
-        except ET.ParseError:
+        except ET.ParseError as e:
+            evt("timedtext_transcript_parse_failed", error=str(e)[:100])
             return ""
     return ""
 
@@ -182,7 +204,28 @@ def _validate_response(resp: requests.Response) -> Tuple[bool, str, str]:
 def _execute_request(session: requests.Session, url: str, cookies: Optional[Any], vid: str) -> requests.Response:
     """Execute an HTTP GET request with session, cookies, and referer."""
     headers = {"Referer": f"https://www.youtube.com/watch?v={vid}"}
-    return session.get(url, headers=headers, cookies=cookies, timeout=TIMEDTEXT_TIMEOUT)
+    
+    # Handle different cookie formats
+    request_cookies = None
+    if cookies:
+        if isinstance(cookies, str):
+            # Convert cookie header string to dict format for requests
+            try:
+                request_cookies = {}
+                for pair in cookies.split(';'):
+                    if '=' in pair:
+                        name, value = pair.split('=', 1)
+                        request_cookies[name.strip()] = value.strip()
+            except Exception:
+                # If parsing fails, add as Cookie header instead
+                headers['Cookie'] = cookies
+        elif isinstance(cookies, dict):
+            request_cookies = cookies
+        else:
+            # For other formats (like RequestsCookieJar), pass directly
+            request_cookies = cookies
+    
+    return session.get(url, headers=headers, cookies=request_cookies, timeout=TIMEDTEXT_TIMEOUT)
 
 def _fetch_track_list(session: requests.Session, vid: str, cookies: Optional[Any]) -> List[Dict[str, str]]:
     """Fetch available tracks from both YouTube and Google Video endpoints."""
