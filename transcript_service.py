@@ -21,6 +21,12 @@ import tenacity
 from log_events import evt, StageTimer
 from logging_setup import set_job_ctx, get_job_ctx
 
+# Import enhanced services
+from timedtext_service import timedtext_with_job_proxy
+from storage_state_manager import get_storage_state_manager
+from ffmpeg_service import extract_audio_with_job_proxy
+from youtubei_service import extract_transcript_with_job_proxy
+
 from playwright.sync_api import sync_playwright, Page
 from playwright.async_api import async_playwright
 
@@ -86,7 +92,10 @@ from error_handler import (
 from transcript_metrics import inc_success, inc_fail, record_stage_metrics, record_circuit_breaker_event, log_successful_transcript_method
 from performance_monitor import get_optimized_browser_context, emit_performance_metric
 from logging_setup import get_logger
-from log_events import job_context as log_context, StageTimer
+from log_events import StageTimer
+from logging_setup import set_job_ctx, get_job_ctx
+
+logger = get_logger(__name__)
 
 _CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -135,9 +144,10 @@ ENFORCE_PROXY_ALL = os.getenv("ENFORCE_PROXY_ALL", "0") in ("1", "true", "yes")
 ASR_MAX_VIDEO_MINUTES = int(os.getenv("ASR_MAX_VIDEO_MINUTES", "20"))
 
 # Timeout configuration
-YOUTUBEI_HARD_TIMEOUT = 150  # seconds maximum YouTubei operation time
+YOUTUBEI_HARD_TIMEOUT = 35  # seconds maximum YouTubei operation time (reduced from 150)
 PLAYWRIGHT_NAVIGATION_TIMEOUT = 60  # seconds for page navigation
 CIRCUIT_BREAKER_RECOVERY = 600  # 10 minutes circuit breaker timeout
+GLOBAL_JOB_TIMEOUT = 240  # 4 minutes maximum job duration (global watchdog)
 
 
 class PlaywrightCircuitBreaker:
@@ -3001,6 +3011,96 @@ def _parse_youtubei_transcript_json(data: dict) -> str:
     return "\n".join(lines).strip()
 
 
+def _extract_cues_from_youtubei(data: dict) -> List[Dict]:
+    """
+    Parse YouTubei JSON response to extract transcript cues with timing information.
+    
+    Args:
+        data: YouTubei JSON response data
+        
+    Returns:
+        List of transcript segments with text, start, and duration
+    """
+    segments = []
+    
+    try:
+        # Extract cue groups from YouTubei response
+        cues = data["actions"][0]["updateEngagementPanelAction"]["content"][
+            "transcriptRenderer"
+        ]["body"]["transcriptBodyRenderer"]["cueGroups"]
+        
+        for cue_group in cues:
+            try:
+                # Handle different cue group structures
+                cue_renderer = None
+                
+                # Try primary structure
+                try:
+                    cue_renderer = cue_group["transcriptCueGroupRenderer"]["cues"][0]["transcriptCueRenderer"]
+                except (KeyError, IndexError):
+                    # Try alternative structure
+                    try:
+                        cue_renderer = cue_group["transcriptCueGroupRenderer"]["cue"]["transcriptCueRenderer"]
+                    except (KeyError, IndexError):
+                        continue
+                
+                if not cue_renderer:
+                    continue
+                
+                # Extract text content
+                cue_text = ""
+                try:
+                    # Try simpleText first
+                    cue_text = cue_renderer["cue"]["simpleText"]
+                except (KeyError, TypeError):
+                    # Try runs format
+                    try:
+                        runs = cue_renderer["cue"]["simpleText"]["runs"]
+                        cue_text = "".join((r or {}).get("text", "") for r in (runs or []))
+                    except (KeyError, TypeError):
+                        continue
+                
+                # Extract timing information
+                start_offset_ms = cue_renderer.get("startOffsetMs", "0")
+                duration_ms = cue_renderer.get("durationMs", "0")
+                
+                # Convert to float seconds
+                try:
+                    start_seconds = float(start_offset_ms) / 1000.0
+                    duration_seconds = float(duration_ms) / 1000.0
+                except (ValueError, TypeError):
+                    start_seconds = 0.0
+                    duration_seconds = 0.0
+                
+                # Add segment if text is not empty
+                if cue_text and cue_text.strip():
+                    segments.append({
+                        'text': cue_text.strip(),
+                        'start': start_seconds,
+                        'duration': duration_seconds
+                    })
+                    
+            except Exception as cue_error:
+                # Log individual cue parsing errors but continue processing
+                evt("youtubei_cue_parse_error", 
+                    error=str(cue_error)[:100],
+                    cue_index=len(segments))
+                continue
+                
+    except Exception as parse_error:
+        # Log parsing error and return empty list
+        evt("youtubei_parse_error", 
+            error_type=type(parse_error).__name__,
+            error=str(parse_error)[:200])
+        return []
+    
+    evt("youtubei_cues_extracted", 
+        segments_count=len(segments),
+        total_duration=sum(s['duration'] for s in segments))
+    
+    return segments
+
+
 # --- Playwright Helper Functions ---
 
 
@@ -3165,9 +3265,52 @@ class TranscriptService:
         **kwargs,  # absorb future/alias kwargs without crashing
     ) -> str:
         """
-        Orchestrate the transcript pipeline:
+        Enhanced transcript pipeline with job-scoped sessions and comprehensive logging:
         youtube_transcript_api -> timedtext -> YouTubei -> ASR (Deepgram)
         """
+        # Generate job ID for sticky proxy sessions
+        job_id = generate_correlation_id()
+        
+        # Set job context for logging
+        set_job_ctx(job_id=job_id, video_id=video_id)
+        
+        # Global job watchdog - enforce maximum job duration
+        import concurrent.futures
+        
+        def _execute_pipeline():
+            return self._execute_transcript_pipeline(
+                video_id, job_id, language_codes, proxy_manager, 
+                cookies, user_id, user_cookies, **kwargs
+            )
+        
+        # Execute with global timeout
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_execute_pipeline)
+            try:
+                return future.result(timeout=GLOBAL_JOB_TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                evt("global_job_timeout", 
+                    job_id=job_id, 
+                    video_id=video_id, 
+                    timeout_seconds=GLOBAL_JOB_TIMEOUT)
+                handle_timeout_error(video_id, GLOBAL_JOB_TIMEOUT, "global_watchdog")
+                return ""
+    
+    def _execute_transcript_pipeline(
+        self,
+        video_id: str,
+        job_id: str,
+        language_codes: Optional[list],
+        proxy_manager,
+        cookies,
+        user_id: Optional[int],
+        user_cookies: Optional[object],
+        **kwargs
+    ) -> str:
+        """
+        Internal pipeline execution (wrapped by global timeout watchdog).
+        """
+        
         # ---- Cookie resolution (single source of truth) ----
         # Accept multiple inputs and aliases without breaking callers.
         # Precedence:
@@ -3180,9 +3323,12 @@ class TranscriptService:
             alias_cookie_header = kwargs["cookies_header"].strip() or None
         elif "cookie_header" in kwargs and isinstance(kwargs["cookie_header"], str):
             alias_cookie_header = kwargs["cookie_header"].strip() or None
+        # Handle playwright_cookies argument properly (Fix C)
+        playwright_cookies = kwargs.get("playwright_cookies")
+        
         # log any extra kwargs we're ignoring to aid future cleanup (but don't fail)
         if kwargs:
-            extra_keys = [k for k in kwargs.keys() if k not in ("cookies_header", "cookie_header")]
+            extra_keys = [k for k in kwargs.keys() if k not in ("cookies_header", "cookie_header", "playwright_cookies")]
             if extra_keys:
                 logging.info(f"Ignoring extra kwargs in get_transcript: {extra_keys}")
 
@@ -3214,85 +3360,186 @@ class TranscriptService:
                 }
             except Exception:
                 cookie_dict = None
-        correlation_id = generate_correlation_id()
-        start_time = time.time()
         
-        # Set video context if not already set
-        current_ctx = get_job_ctx()
-        if 'video_id' not in current_ctx:
-            set_job_ctx(video_id=video_id)
+        start_time = time.time()
         
         # Use provided proxy_manager or fall back to instance proxy_manager
         effective_proxy_manager = proxy_manager or self.proxy_manager
         
-        # Set default language_codes if not provided
+        # Set default language_codes with USER_LOCALE support
         if language_codes is None:
             language_codes = ["en", "en-US", "en-GB"]
+            user_locale = os.getenv('USER_LOCALE')
+            if user_locale and user_locale not in language_codes:
+                language_codes.append(user_locale)
 
         if video_id in self._video_locks:
             logging.info(f"Video {video_id} already being processed, waiting...")
 
         self._video_locks[video_id] = True
+        
+        # Track pipeline stages for summary logging
+        pipeline_stages = []
+        stage_winner = None
+        
         try:
             # Check cache first (use first language for cache key)
             primary_language = language_codes[0] if language_codes else "en"
             cached_transcript = self.cache.get(video_id, primary_language)
             if cached_transcript:
                 evt("stage_result", stage="cache", outcome="success", dur_ms=0)
+                stage_winner = "cache"
                 return cached_transcript
 
-            # 1) youtube_transcript_api (manual captions preferred)
-            try:
-                if ENABLE_YT_API:
-                    with StageTimer("yt_api"):
-                        # youtube_transcript_api_compat expects 'languages', not 'language_codes'
-                        txt = get_transcript(video_id, languages=language_codes)
-                        if txt:
-                            return txt
-            except Exception as e:
-                evt("stage_result", stage="yt_api", outcome="error", detail=f"{type(e).__name__}: {str(e)}")
-
-            # 2) timedtext (json3, xml, then alternate host)
-            with StageTimer("timedtext", use_proxy=bool(effective_proxy_manager)):
-                txt = get_captions_via_timedtext(
-                    video_id,
-                    proxy_manager=effective_proxy_manager,
-                    cookie_jar=cookie_dict,  # pass cookies to requests where supported
-                    user_cookies=user_cookies  # Enhanced: thread user cookies through timed-text pipeline
-                )
-                if txt:
-                    return txt
-
-            # 3) YouTubei via Playwright network capture
-            with StageTimer("youtubei", use_proxy=bool(effective_proxy_manager)):
-                txt = get_transcript_via_youtubei_with_timeout(
-                    video_id,
-                    proxy_manager=effective_proxy_manager,
-                    cookies=cookie_dict or cookie_header  # function accepts cookie jar OR header; internal converter present
-                )
-                if txt:
-                    return txt
-
-            # 4) ASR fallback (Deepgram)
-            if ENABLE_ASR_FALLBACK:
+            # 1) Enhanced YouTube Transcript API stage
+            if ENABLE_YT_API:
+                stage_start = time.time()
                 try:
-                    dg_key = os.getenv("DEEPGRAM_API_KEY", "")
-                    if dg_key:
-                        with StageTimer("asr", use_proxy=bool(effective_proxy_manager)):
-                            asr = ASRAudioExtractor(dg_key, proxy_manager)
-                            txt = asr.extract_and_transcribe(
-                                video_id,
-                                proxy_manager=effective_proxy_manager,
-                                cookies=cookie_dict or cookie_header
-                            )
-                            if txt:
-                                return txt
+                    transcript_text, selected_track = self._enhanced_yt_api_stage(
+                        video_id, language_codes, cookie_header, effective_proxy_manager, job_id
+                    )
+                    if transcript_text:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="yt_api", outcome="success", 
+                            dur_ms=stage_duration, selected_track=selected_track)
+                        stage_winner = "yt_api"
+                        pipeline_stages.append(("yt_api", "success", stage_duration))
+                        return transcript_text
+                    else:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="yt_api", outcome="NoTranscriptFound", dur_ms=stage_duration)
+                        pipeline_stages.append(("yt_api", "NoTranscriptFound", stage_duration))
                 except Exception as e:
-                    evt("stage_result", stage="asr", outcome="error", detail=f"{type(e).__name__}: {str(e)}")
+                    stage_duration = int((time.time() - stage_start) * 1000)
+                    error_class = type(e).__name__
+                    evt("stage_result", stage="yt_api", outcome=error_class, dur_ms=stage_duration)
+                    pipeline_stages.append(("yt_api", error_class, stage_duration))
 
+            # 2) Enhanced Timedtext stage
+            if ENABLE_TIMEDTEXT:
+                stage_start = time.time()
+                try:
+                    transcript_text = timedtext_with_job_proxy(
+                        video_id, job_id, effective_proxy_manager, cookie_header
+                    )
+                    if transcript_text:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="timedtext", outcome="success", dur_ms=stage_duration)
+                        stage_winner = "timedtext"
+                        pipeline_stages.append(("timedtext", "success", stage_duration))
+                        return transcript_text
+                    else:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="timedtext", outcome="no_captions", dur_ms=stage_duration)
+                        pipeline_stages.append(("timedtext", "no_captions", stage_duration))
+                except Exception as e:
+                    stage_duration = int((time.time() - stage_start) * 1000)
+                    error_class = type(e).__name__
+                    
+                    # Expose the real failure for debugging; let the pipeline fall through.
+                    logger.exception("timedtext stage failed")
+                    evt("timedtext_error_detail", error=(str(e)[:400] if str(e) else type(e).__name__))
+                    evt("stage_result", stage="timedtext", outcome=type(e).__name__, dur_ms=stage_duration, detail=(str(e)[:200] if str(e) else ""))
+                    pipeline_stages.append(("timedtext", error_class, stage_duration))
+
+            # 3) Enhanced YouTubei via Playwright with guaranteed storage state
+            if ENABLE_YOUTUBEI:
+                stage_start = time.time()
+                try:
+                    # Use playwright_cookies if provided, otherwise use cookie_header
+                    effective_cookies = playwright_cookies or cookie_header
+                    transcript_text = self._enhanced_youtubei_stage(
+                        video_id, job_id, effective_proxy_manager, effective_cookies
+                    )
+                    if transcript_text:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="youtubei", outcome="success", dur_ms=stage_duration)
+                        stage_winner = "youtubei"
+                        pipeline_stages.append(("youtubei", "success", stage_duration))
+                        return transcript_text
+                    else:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="youtubei", outcome="no_transcript", dur_ms=stage_duration)
+                        pipeline_stages.append(("youtubei", "no_transcript", stage_duration))
+                except Exception as e:
+                    stage_duration = int((time.time() - stage_start) * 1000)
+                    error_class = type(e).__name__
+                    evt("stage_result", stage="youtubei", outcome=error_class, dur_ms=stage_duration)
+                    pipeline_stages.append(("youtubei", error_class, stage_duration))
+                    
+                    # Log YouTubei timeout specifically to trigger ASR (Fix E)
+                    if "timeout" in error_class.lower() or "TimeoutError" in error_class:
+                        evt("youtubei_timeout", 
+                            video_id=video_id, 
+                            job_id=job_id, 
+                            timeout_seconds=YOUTUBEI_HARD_TIMEOUT,
+                            next_stage="asr")
+
+            # 4) Enhanced ASR fallback with job-scoped proxy (Fix E: Always runs after YouTubei timeout)
+            if ENABLE_ASR_FALLBACK:
+                stage_start = time.time()
+                # Log ASR start explicitly (Fix E)
+                evt("asr_start", 
+                    video_id=video_id, 
+                    job_id=job_id,
+                    triggered_by="pipeline_fallback")
+                try:
+                    # Use playwright_cookies if provided, otherwise use cookie_header
+                    effective_cookies = playwright_cookies or cookie_header
+                    transcript_text = self._enhanced_asr_stage(
+                        video_id, job_id, effective_proxy_manager, effective_cookies
+                    )
+                    if transcript_text:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="asr", outcome="success", dur_ms=stage_duration)
+                        # Log ASR finish explicitly (Fix E)
+                        evt("asr_finish", 
+                            video_id=video_id, 
+                            job_id=job_id,
+                            outcome="success",
+                            transcript_length=len(transcript_text))
+                        stage_winner = "asr"
+                        pipeline_stages.append(("asr", "success", stage_duration))
+                        return transcript_text
+                    else:
+                        stage_duration = int((time.time() - stage_start) * 1000)
+                        evt("stage_result", stage="asr", outcome="no_transcript", dur_ms=stage_duration)
+                        # Log ASR finish even on failure (Fix E)
+                        evt("asr_finish", 
+                            video_id=video_id, 
+                            job_id=job_id,
+                            outcome="no_transcript")
+                        pipeline_stages.append(("asr", "no_transcript", stage_duration))
+                except Exception as e:
+                    stage_duration = int((time.time() - stage_start) * 1000)
+                    error_class = type(e).__name__
+                    evt("stage_result", stage="asr", outcome=error_class, dur_ms=stage_duration)
+                    # Log ASR finish on exception (Fix E)
+                    evt("asr_finish", 
+                        video_id=video_id, 
+                        job_id=job_id,
+                        outcome="error",
+                        error_type=error_class)
+                    pipeline_stages.append(("asr", error_class, stage_duration))
+
+            # No transcript found in any stage
             return ""
 
         finally:
+            # Clean up job session
+            if effective_proxy_manager:
+                try:
+                    effective_proxy_manager.cleanup_job_session(job_id)
+                except Exception:
+                    pass
+            
+            # Log per-job summary
+            total_duration = int((time.time() - start_time) * 1000)
+            self._log_job_summary(
+                job_id, video_id, stage_winner or "none", total_duration, 
+                pipeline_stages, effective_proxy_manager, cookie_header
+            )
+            
             self._video_locks.pop(video_id, None)
 
     def _get_transcript_with_fallback(
@@ -3445,6 +3692,37 @@ class TranscriptService:
         inc_fail("none")
         return "", "none"
 
+    def _list_transcripts_safe(self, video_id: str, cookies=None):
+        """
+        Safe wrapper for YouTubeTranscriptApi.list_transcripts that converts XML parse errors to blocking signals.
+        
+        Args:
+            video_id: YouTube video ID
+            cookies: Cookie data (optional)
+            
+        Returns:
+            Transcript list object
+            
+        Raises:
+            RequestBlocked: When empty/HTML response detected (converted from parse error)
+        """
+        try:
+            return YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookies)
+        except YouTubeDataUnparsable as e:
+            error_msg = str(e)
+            # Convert specific XML parse error to blocking signal
+            if "no element found: line 1, column 0" in error_msg.lower():
+                evt("yt_api_parse_error_converted_to_blocking",
+                    video_id=video_id,
+                    original_error=error_msg[:200])
+                # Treat as blocking/empty response and short-circuit to next method
+                raise RequestBlocked(f"Empty or non-XML transcript list for {video_id} (converted from parse error)")
+            # Re-raise other parse errors as-is
+            raise
+        except Exception as e:
+            # Let other exceptions bubble up normally
+            raise
+
     def get_captions_via_api(
         self, video_id: str, languages=("en", "en-US", "es")
     ) -> str:
@@ -3460,19 +3738,19 @@ class TranscriptService:
                 version=getattr(yta_mod, '__version__', 'unknown'),
                 has_get_transcript=hasattr(YouTubeTranscriptApi, 'get_transcript'))
 
-            # Strategy 1: Try list_transcripts first (more robust)
+            # Strategy 1: Try list_transcripts first (more robust) with blocking detection
             try:
                 # Pass cookies to reduce 429 / "disabled" false negatives
                 if self.cookies_path and os.path.exists(self.cookies_path):
-                    transcripts = YouTubeTranscriptApi.list_transcripts(
+                    transcripts = self._list_transcripts_safe(
                         video_id, cookies=self.cookies_path
                     )
                 elif self.cookie_header:
-                    transcripts = YouTubeTranscriptApi.list_transcripts(
+                    transcripts = self._list_transcripts_safe(
                         video_id, cookies=self.cookie_header
                     )
                 else:
-                    transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+                    transcripts = self._list_transcripts_safe(video_id)
 
                 # Prefer human captions, then auto-generated
                 preferred = ["en", "en-US", "en-GB", "es", "es-ES"]
@@ -3740,6 +4018,429 @@ class TranscriptService:
 
     def cleanup_cache(self):
         return self.cache.cleanup_expired()
+
+    def _enhanced_yt_api_stage(
+        self, 
+        video_id: str, 
+        language_codes: List[str], 
+        cookie_header: Optional[str],
+        proxy_manager,
+        job_id: str
+    ) -> Tuple[str, str]:
+        """
+        Enhanced YouTube Transcript API stage with explicit logging.
+        
+        Returns:
+            Tuple of (transcript_text, selected_track_info)
+        """
+        # Log languages being tried
+        evt("yt_api_languages_tried", 
+            video_id=video_id, 
+            languages=language_codes,
+            job_id=job_id)
+        
+        try:
+            # Get job-scoped proxy if needed
+            proxies = None
+            if ENFORCE_PROXY_ALL and proxy_manager:
+                try:
+                    proxies = proxy_manager.proxy_dict_for_job(job_id, "requests")
+                except Exception as e:
+                    evt("yt_api_proxy_error", error=str(e), job_id=job_id)
+                    if ENFORCE_PROXY_ALL:
+                        return "", "proxy_error"
+            
+            # Try to get transcript using enhanced method
+            for lang in language_codes:
+                try:
+                    # Use direct HTTP method with job-scoped proxy
+                    transcript_text = get_transcript_with_cookies(
+                        video_id, [lang], cookies=cookie_header, proxies=proxies
+                    )
+                    
+                    if transcript_text:
+                        # Determine if this is official or auto-generated
+                        # This is a simplified heuristic - in practice, we'd need to check the track metadata
+                        selected_track = f"{lang}:official"  # Assume official for direct HTTP success
+                        
+                        evt("yt_api_success",
+                            video_id=video_id,
+                            selected_language=lang,
+                            selected_track=selected_track,
+                            transcript_length=len(transcript_text),
+                            job_id=job_id)
+                        
+                        return transcript_text, selected_track
+                        
+                except Exception as e:
+                    error_class = type(e).__name__
+                    evt("yt_api_language_failed",
+                        video_id=video_id,
+                        language=lang,
+                        exception_class=error_class,
+                        error_detail=str(e)[:200],
+                        job_id=job_id)
+                    continue
+            
+            # No transcript found for any language
+            evt("yt_api_no_transcript", 
+                video_id=video_id, 
+                languages_tried=language_codes,
+                job_id=job_id)
+            
+            return "", "NoTranscriptFound"
+            
+        except Exception as e:
+            error_class = type(e).__name__
+            evt("yt_api_stage_error",
+                video_id=video_id,
+                exception_class=error_class,
+                error_detail=str(e)[:200],
+                job_id=job_id)
+            
+            return "", error_class
+    
+    def _enhanced_youtubei_stage(
+        self,
+        video_id: str,
+        job_id: str,
+        proxy_manager,
+        cookie_header: Optional[str]
+    ) -> str:
+        """
+        Enhanced YouTubei stage with DOM interaction sequence integration.
+        
+        Uses the new _get_transcript_via_playwright method that integrates
+        DOM helper methods for consent handling, description expansion,
+        and transcript button discovery with scroll-and-retry logic.
+        
+        Returns:
+            Transcript text if successful, empty string otherwise
+        """
+        try:
+            # Use the new DOM-integrated Playwright method
+            import asyncio
+            
+            # Run the async _get_transcript_via_playwright method
+            segments = asyncio.run(self._get_transcript_via_playwright(
+                video_id, job_id, proxy_manager, cookie_header
+            ))
+            
+            if segments:
+                # Convert segments back to text format for compatibility
+                transcript_text = "\n".join(segment.get('text', '') for segment in segments)
+                return transcript_text.strip()
+            else:
+                # No transcript found - return empty string for fallback
+                return ""
+                
+        except Exception as e:
+            evt("youtubei_stage_error",
+                video_id=video_id,
+                job_id=job_id,
+                error_type=type(e).__name__,
+                error_detail=str(e)[:200])
+            return ""
+    
+    def _enhanced_asr_stage(
+        self,
+        video_id: str,
+        job_id: str,
+        proxy_manager,
+        cookie_header: Optional[str]
+    ) -> str:
+        """
+        Enhanced ASR stage with job-scoped proxy and hardened FFmpeg.
+        
+        Returns:
+            Transcript text if successful, empty string otherwise
+        """
+        if not self.deepgram_api_key:
+            evt("asr_no_key", video_id=video_id, job_id=job_id)
+            return ""
+        
+        # Check ENFORCE_PROXY_ALL compliance
+        if ENFORCE_PROXY_ALL and not (proxy_manager and proxy_manager.in_use):
+            evt("asr_blocked", reason="enforce_proxy_no_proxy", job_id=job_id)
+            return ""
+        
+        try:
+            # Use enhanced ASR with job-scoped proxy
+            extractor = ASRAudioExtractor(self.deepgram_api_key, proxy_manager)
+            
+            # Extract HLS audio URL using Playwright (existing implementation)
+            audio_url = extractor._extract_hls_audio_url(video_id, proxy_manager, cookie_header)
+            if not audio_url:
+                evt("asr_no_audio_url", video_id=video_id, job_id=job_id)
+                return ""
+            
+            # Extract audio using enhanced FFmpeg service
+            with tempfile.TemporaryDirectory() as temp_dir:
+                wav_path = os.path.join(temp_dir, "audio.wav")
+                
+                success, error_classification = extract_audio_with_job_proxy(
+                    audio_url, wav_path, job_id, proxy_manager, cookie_header
+                )
+                
+                if not success:
+                    evt("asr_audio_extraction_failed",
+                        video_id=video_id,
+                        job_id=job_id,
+                        error_classification=error_classification)
+                    return ""
+                
+                # Check duration limits
+                duration_minutes = extractor._get_audio_duration_minutes(wav_path)
+                if duration_minutes > extractor.max_video_minutes:
+                    evt("asr_duration_exceeded",
+                        video_id=video_id,
+                        job_id=job_id,
+                        duration_minutes=duration_minutes,
+                        limit_minutes=extractor.max_video_minutes)
+                    return ""
+                
+                # Transcribe with Deepgram
+                transcript = extractor._transcribe_with_deepgram(wav_path, video_id)
+                
+                if transcript:
+                    evt("asr_success",
+                        video_id=video_id,
+                        job_id=job_id,
+                        transcript_length=len(transcript),
+                        duration_minutes=duration_minutes)
+                else:
+                    evt("asr_transcription_failed",
+                        video_id=video_id,
+                        job_id=job_id)
+                
+                return transcript
+                
+        except Exception as e:
+            evt("asr_stage_error",
+                video_id=video_id,
+                job_id=job_id,
+                error_type=type(e).__name__,
+                error_detail=str(e)[:200])
+            return ""
+    
+    def _log_job_summary(
+        self,
+        job_id: str,
+        video_id: str,
+        stage_winner: str,
+        total_duration_ms: int,
+        pipeline_stages: List[Tuple[str, str, int]],
+        proxy_manager,
+        cookie_header: Optional[str]
+    ):
+        """
+        Log comprehensive per-job summary line.
+        
+        Args:
+            job_id: Job identifier
+            video_id: YouTube video ID
+            stage_winner: Stage that succeeded ("yt_api", "timedtext", "youtubei", "asr", "none")
+            total_duration_ms: Total pipeline duration in milliseconds
+            pipeline_stages: List of (stage_name, outcome, duration_ms) tuples
+            proxy_manager: ProxyManager instance
+            cookie_header: Cookie header string
+        """
+        # Get proxy session hash for logging
+        proxy_sessid_hash = "none"
+        if proxy_manager and proxy_manager.in_use:
+            try:
+                session_id = proxy_manager.for_job(job_id)
+                if session_id:
+                    proxy_sessid_hash = session_id[:8] + "***"  # Mask for security
+            except Exception:
+                proxy_sessid_hash = "error"
+        
+        # Determine cookie source
+        cookie_source = "none"
+        if cookie_header:
+            # Simple heuristic to determine cookie source
+            if len(cookie_header) < 100 and ('SOCS=' in cookie_header or 'CONSENT=' in cookie_header):
+                cookie_source = "synthetic"
+            else:
+                cookie_source = "user"  # Could be user or env, but we'll call it user for simplicity
+        
+        # Build attempts per stage summary
+        attempts_per_stage = {}
+        for stage_name, outcome, duration_ms in pipeline_stages:
+            if stage_name not in attempts_per_stage:
+                attempts_per_stage[stage_name] = 0
+            attempts_per_stage[stage_name] += 1
+        
+        # Log comprehensive job summary
+        evt("job_summary",
+            job_id=job_id,
+            video_id=video_id,
+            pipeline_outcome=stage_winner,
+            stage_winner=stage_winner,
+            duration_ms=total_duration_ms,
+            proxy_sessid_hash=proxy_sessid_hash,
+            cookie_source=cookie_source,
+            attempts_per_stage=attempts_per_stage,
+            total_stages_tried=len(pipeline_stages))
+        
+        logger.info(f"Job {job_id} complete: video={video_id}, winner={stage_winner}, "
+                   f"duration={total_duration_ms}ms, proxy_session={proxy_sessid_hash}, "
+                   f"cookie_source={cookie_source}")
+
+    async def _get_transcript_via_playwright(self, video_id: str, job_id: str = None, proxy_manager=None, cookie_header: Optional[str] = None) -> Optional[List[Dict]]:
+        """
+        Enhanced Playwright transcript extraction with DOM interaction sequence.
+        
+        Integrates DOM helper methods for consent handling, description expansion,
+        and transcript button discovery with scroll-and-retry logic.
+        
+        Args:
+            video_id: YouTube video ID
+            job_id: Job identifier for proxy session
+            proxy_manager: ProxyManager instance
+            cookie_header: Cookie header string
+            
+        Returns:
+            List of transcript segments if successful, None for fallback to next method
+        """
+        # Import DeterministicYouTubeiCapture for DOM interaction integration
+        from youtubei_service import DeterministicYouTubeiCapture
+        
+        # Set job context if provided
+        if job_id:
+            set_job_ctx(job_id=job_id, video_id=video_id)
+        
+        # Determine metrics tags for filtering by root cause (Requirements 7.4, 13.1, 13.2)
+        cookie_source = "user" if cookie_header else "env"
+        proxy_mode = "on" if (proxy_manager and proxy_manager.in_use) else "off"
+        
+        try:
+            # Create capture instance with DOM interaction capabilities
+            capture = DeterministicYouTubeiCapture(
+                job_id=job_id or f"playwright_{video_id}_{int(time.time())}",
+                video_id=video_id,
+                proxy_manager=proxy_manager
+            )
+            
+            # Extract transcript using integrated DOM interaction sequence
+            transcript_text = await capture.extract_transcript(cookie_header)
+            
+            # Graceful degradation: handle both None and empty string returns (Requirements 9.4, 9.5)
+            if transcript_text and transcript_text.strip():
+                # Parse transcript text into segments format
+                # The DeterministicYouTubeiCapture returns raw text, but we need to convert
+                # it to the expected list of dict format for consistency
+                segments = self._parse_transcript_text_to_segments(transcript_text)
+                
+                if segments and len(segments) > 0:
+                    evt("playwright_dom_success",
+                        video_id=video_id,
+                        job_id=job_id,
+                        cookie_source=cookie_source,
+                        proxy_mode=proxy_mode,
+                        segments_count=len(segments))
+                    
+                    return segments
+                else:
+                    # Parsing failed - return None for fallback to next method
+                    evt("playwright_dom_parse_failed",
+                        video_id=video_id,
+                        job_id=job_id,
+                        cookie_source=cookie_source,
+                        proxy_mode=proxy_mode)
+                    return None
+            else:
+                # No transcript found or DOM interactions failed completely - return None for fallback to next method (Requirement 9.5)
+                evt("playwright_dom_no_transcript",
+                    video_id=video_id,
+                    job_id=job_id,
+                    cookie_source=cookie_source,
+                    proxy_mode=proxy_mode,
+                    reason="empty_or_none_result")
+                return None
+                
+        except Exception as e:
+            # Graceful degradation: DOM interaction failures should not break the transcript pipeline (Requirement 9.4)
+            # Log error and return None for graceful fallback to next transcript method (Requirement 9.5)
+            evt("playwright_dom_error",
+                video_id=video_id,
+                job_id=job_id,
+                cookie_source=cookie_source,
+                proxy_mode=proxy_mode,
+                error_type=type(e).__name__,
+                error_detail=str(e)[:200])
+            
+            # Classify error for better debugging
+            error_class = classify_transcript_error(e, video_id, "playwright_dom")
+            
+            # Requirement 7.5: Add warning logs for failures without verbose dumps or stack traces
+            logger.warning(f"playwright_dom_error: {type(e).__name__}")
+            
+            # Return None to trigger fallback to next transcript method (Requirement 9.5, 14.4)
+            return None
+    
+    def _parse_transcript_text_to_segments(self, transcript_text: str) -> List[Dict]:
+        """
+        Parse raw transcript text into segments format using _extract_cues_from_youtubei method.
+        
+        Implements graceful degradation - never throws exceptions that break the transcript pipeline.
+        
+        Requirements: 9.4, 14.4
+        
+        Args:
+            transcript_text: Raw transcript text or JSON data
+            
+        Returns:
+            List of transcript segments with text, start, and duration
+        """
+        # Graceful degradation: handle None or empty input
+        if not transcript_text or not transcript_text.strip():
+            return []
+        
+        try:
+            # Try to parse as JSON first (YouTubei format)
+            import json
+            data = json.loads(transcript_text)
+            
+            # Use the new _extract_cues_from_youtubei method for structured parsing
+            if isinstance(data, dict) and 'actions' in data:
+                try:
+                    segments = _extract_cues_from_youtubei(data)
+                    if segments and len(segments) > 0:
+                        return segments
+                except Exception as extract_error:
+                    # Graceful degradation: extraction failure should not break parsing
+                    evt("transcript_parse_extract_failed",
+                        error_type=type(extract_error).__name__,
+                        error=str(extract_error)[:100])
+            
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as json_error:
+            # Graceful degradation: JSON parsing failure should fall back to plain text
+            evt("transcript_parse_json_failed",
+                error_type=type(json_error).__name__,
+                error=str(json_error)[:100])
+        except Exception as parse_error:
+            # Graceful degradation: any other parsing error should not break the pipeline
+            evt("transcript_parse_unexpected_error",
+                error_type=type(parse_error).__name__,
+                error=str(parse_error)[:100])
+        
+        try:
+            # Fallback: treat as plain text and create single segment
+            if transcript_text.strip():
+                return [{
+                    'text': transcript_text.strip(),
+                    'start': 0.0,
+                    'duration': 0.0
+                }]
+        except Exception as fallback_error:
+            # Graceful degradation: even fallback parsing should not break the pipeline
+            evt("transcript_parse_fallback_failed",
+                error_type=type(fallback_error).__name__,
+                error=str(fallback_error)[:100])
+        
+        # Graceful degradation: return empty list if all parsing attempts fail
+        return []
 
     def get_health_diagnostics(self):
         """Get diagnostic information for health checks"""

@@ -1,0 +1,214 @@
+a single “PR-style” patch set that (1) makes the “…more → Show transcript” open-sequence actually happen, (2) ensures the intercepted /youtubei/v1/get_transcript request isn’t stalled, (3) stops hiding the Timedtext failure, and (4) hardens ASR so Deepgram never sees garbage again. I’m intentionally leaving your XML-parsing work alone, per your note.
+
+Below are three small patches you can apply directly.
+
+1) youtubei_service.py — make DOM open-sequence deterministic + unstall the route
+
+Why: Your logs show: navigation → no consent → no expander → transcript button not found (twice) → global watchdog. Also, the route handler does route.fetch() but doesn’t guarantee fulfill/continue, which can stall the panel load. These diffs fix both, and change goto to networkidle so the description hydrates before we hunt the expander.
+
+diff --git a/youtubei_service.py b/youtubei_service.py
+index 4b8ad21..c7fd112 100644
+--- a/youtubei_service.py
++++ b/youtubei_service.py
+@@ -1,6 +1,7 @@
+ # ... header & imports elided
+ YOUTUBEI_TIMEOUT = 25
+ TRANSCRIPT_PANEL_WAIT = 12
+ CONSENT_DETECTION_TIMEOUT = 5
++TRANSCRIPT_PANEL_SELECTOR = 'ytd-transcript-search-panel-renderer'
+ 
+ class DeterministicYouTubeiCapture:
+@@ -88,7 +89,7 @@ class DeterministicYouTubeiCapture:
+                 await self._setup_route_interception()
+ 
+                 # Navigate to video page
+-                await page.goto(f"https://www.youtube.com/watch?v={self.video_id}&hl=en", wait_until="domcontentloaded", timeout=60000)
++                await page.goto(f"https://www.youtube.com/watch?v={self.video_id}&hl=en", wait_until="networkidle", timeout=60000)
+                 evt("youtubei_navigation_complete", video_id=self.video_id, job_id=self.job_id, url=f"https://www.youtube.com/watch?v={self.video_id}&hl=en")
+ 
+                 # DOM interaction sequence AFTER route interception setup
+@@ -99,6 +100,7 @@ class DeterministicYouTubeiCapture:
+                 try:
+                     await self._try_consent()
+-                    await self._expand_description()
++                    expanded = await self._expand_description()
++                    if expanded: evt("youtubei_dom_expanded_description")
+ 
+                     # Try to open transcript with new helper method
+-                    if not await self._open_transcript():
++                    opened = await self._open_transcript()
++                    if opened: evt("youtubei_dom_clicked_transcript")
++                    if not opened:
+                         evt("youtubei_dom_scroll_retry", video_id=self.video_id, job_id=self.job_id)
+                         try:
+                             await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+@@ -111,6 +113,14 @@ class DeterministicYouTubeiCapture:
+                             evt("youtubei_dom_transcript_retry_failed", video_id=self.video_id, job_id=self.job_id)
+                             return ""
+ 
++                # Wait for the transcript side panel to appear (proves the click really worked)
++                try:
++                    await page.wait_for_selector(TRANSCRIPT_PANEL_SELECTOR, timeout=TRANSCRIPT_PANEL_WAIT * 1000)
++                    evt("youtubei_transcript_panel_opened")
++                except Exception:
++                    evt("youtubei_transcript_panel_not_opened")
++                    # Keep going; route may still have fired
++
+                 # Wait for transcript capture with enhanced timeout and cleanup
+                 transcript_data = await self._wait_for_transcript_with_fallback()
+                 if transcript_data:
+@@ -148,6 +158,7 @@ class DeterministicYouTubeiCapture:
+         self.transcript_future = asyncio.Future()
+ 
+         async def handle_transcript_route(route):
++            # IMPORTANT: never stall the page; always fulfill or continue after fetch.
+             try:
+                 response = await route.fetch()
+                 url = route.request.url
+                 if "/youtubei/v1/get_transcript" in url:
+                     self.route_fired = True
+                     if response.status != 200:
+                         evt("youtubei_direct_fetch_failed", video_id=self.video_id, job_id=self.job_id, status=response.status, url=url)
+                         if not self.transcript_future.done():
+                             self.transcript_future.set_result(None)
+                     else:
+                         body = await response.body()
+                         if body and not self.transcript_future.done():
+                             text_content = body.decode('utf-8', errors='ignore')
+                             self.transcript_future.set_result((url, text_content))
+-                # NOTE: previously we didn't release the route, which can stall the panel.
++                # Release request so panel can load
++                try:
++                    await route.fulfill(response=response)
++                except Exception:
++                    try:
++                        await route.continue_()
++                    except Exception:
++                        pass
+             except Exception as e:
+                 if not self.transcript_future.done():
+                     self.transcript_future.set_exception(e)
+@@ -212,6 +233,7 @@ class DeterministicYouTubeiCapture:
+         # Parse JSON or DOM fallback (existing)
+         # ...
+ 
+@@ -300,6 +322,8 @@ class DeterministicYouTubeiCapture:
+     async def _expand_description(self) -> bool:
+         # robust “...more” expansion with multiple selectors
+         sels = [
+             'ytd-text-inline-expander tp-yt-paper-button.more-button',
+             'tp-yt-paper-button:has-text("more")',
+             'button[aria-label*="more" i]',
+         ]
+         for sel in sels:
+             try:
+                 el = await self.page.query_selector(sel)
+                 if el:
+                     await el.click()
++                    logger.info("youtubei_dom: expanded description via %s", sel)
++                    evt("youtubei_dom_expanded_via", selector=sel)
+                     await self.page.wait_for_timeout(250)
+                     return True
+             except Exception:
+                 continue
+         evt("youtubei_dom_no_expander")
+         return False
+ 
+     async def _open_transcript(self) -> bool:
+         sels = [
+             'button:has-text("Show transcript")',
+             'tp-yt-paper-item:has-text("Show transcript")',
+             'button[aria-label*="transcript" i]',
+             'yt-button-shape:has-text("Transcript")',
+         ]
+         for sel in sels:
+             try:
+                 btn = await self.page.query_selector(sel)
+                 if btn:
+                     await btn.click()
++                    logger.info("youtubei_dom: clicked transcript launcher (%s)", sel)
++                    evt("youtubei_dom_clicked_transcript_via", selector=sel)
+                     return True
+             except Exception:
+                 continue
+         logger.warning("youtubei_dom: transcript button not found")
+         evt("youtubei_dom_transcript_not_found")
+         return False
+
+
+Receipts:
+
+You were still navigating with domcontentloaded, which often runs before the description hydrates. This flips to networkidle.
+
+Logs show “dom_no_expander” and “transcript button not found” (twice), confirming the open-sequence never succeeded — the positive breadcrumbs added above will prove it’s now clicking.
+
+Ensuring we fulfill() (or continue_()) after route.fetch() removes a potential stall on the intercepted request.
+
+2) transcript_service.py — stop hiding the Timedtext failure
+
+Why: Your logs still show outcome:"TypeError", dur_ms:0, detail:" [suppressed]". That blocks you from seeing the real root cause, and it happens immediately after the Timedtext stage starts. This tiny diff surfaces the real exception in logs.
+
+diff --git a/transcript_service.py b/transcript_service.py
+index 2de0a44..8a7c1b2 100644
+--- a/transcript_service.py
++++ b/transcript_service.py
+@@ -430,12 +430,19 @@ def try_timedtext(video_id, cookies, proxy_mgr):
+     evt("timedtext_start", job_id=job_id, video_id=video_id, cookie_source=cookie_src, proxy_enabled=True)
+     try:
+         text = timedtext_with_job_proxy(video_id, cookies=cookies, proxy_manager=proxy_mgr)
+         return text
+     except Exception as e:
+-        evt("stage_result", stage="timedtext", outcome="TypeError", dur_ms=0, detail=" [suppressed]")
++        # Expose the real failure for debugging; let the pipeline fall through.
++        logger.exception("timedtext stage failed")
++        evt("timedtext_error_detail", error=(str(e)[:400] if str(e) else type(e).__name__))
++        evt("stage_result", stage="timedtext", outcome=type(e).__name__, dur_ms=0, detail=(str(e)[:200] if str(e) else ""))
+         return ""
+
+
+Receipts: Your current log line proves suppression is still in place; this change replaces it.
+(And for context: your global config shows watchdog and stage budgets; this change won’t affect those.)
+
+3) ffmpeg_service.py (or wherever you write the audio) — reject tiny blobs + ffprobe-validate
+
+Why: After ASR eventually captured a videoplayback URL, Deepgram returned 400 “corrupt/unsupported,” which almost always means you uploaded HTML or a tiny/truncated file. You already check ffmpeg/ffprobe at boot, but not per-job. Add these guards so Deepgram never sees bad input.
+
+diff --git a/ffmpeg_service.py b/ffmpeg_service.py
+index 9a1c2b0..d3e4a61 100644
+--- a/ffmpeg_service.py
++++ b/ffmpeg_service.py
+@@ -180,6 +180,33 @@ def extract_audio_with_job_proxy(media_url, out_path, headers, proxy_env):
+     # existing ffmpeg invocation (with CRLF headers + proxy env) ...
+     run_ffmpeg(media_url, out_path, headers=headers, env=proxy_env)
+ 
++    # 1) Reject trivially small outputs (likely HTML or truncated)
++    try:
++        size = os.path.getsize(out_path)
++    except FileNotFoundError:
++        evt("asr_audio_missing_output")
++        raise RuntimeError("audio-missing")
++    if size < 1_000_000:  # ~1MB
++        evt("asr_audio_rejected_too_small", size=size)
++        raise RuntimeError("audio-too-small")
++
++    # 2) ffprobe validation before handing to Deepgram
++    import json, subprocess
++    probe = subprocess.run(
++        ["ffprobe","-v","error","-show_streams","-show_format","-print_format","json", out_path],
++        capture_output=True, text=True, timeout=10
++    )
++    meta = json.loads(probe.stdout or "{}")
++    streams = meta.get("streams") or []
++    has_audio = any(s.get("codec_type") == "audio" for s in streams)
++    if not has_audio:
++        evt("asr_audio_probe_failed", meta=meta if len(json.dumps(meta)) < 800 else {"note":"omitted"})
++        raise RuntimeError("audio-invalid")
++
+     return out_path
+
+
+Receipts:
+
+You only verify ffmpeg/ffprobe at startup today; these per-job guards prevent sending junk to Deepgram.
+
+Your run log shows ASR capture attempts, eventual URL capture, and then Deepgram 400 — this is the fix for that path.

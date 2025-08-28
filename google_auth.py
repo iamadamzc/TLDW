@@ -3,7 +3,6 @@ import os
 import logging
 
 import requests
-from app import db
 from flask import Blueprint, redirect, request, url_for, session, flash
 from flask_login import login_required, login_user, logout_user
 from models import User
@@ -159,6 +158,8 @@ def callback():
                 access_token=token_data.get("access_token"),
                 refresh_token=token_data.get("refresh_token")
             )
+            # Lazy import to avoid circular import
+            from database import db
             db.session.add(user)
         else:
             logging.info(f"Updating tokens for existing user: {users_email}")
@@ -181,12 +182,18 @@ def callback():
             logging.warning(f"No refresh token available for user {user.email} - may need frequent re-authentication")
         
         try:
+            # Lazy import to avoid circular import (if not already imported above)
+            if 'db' not in locals():
+                from database import db
             db.session.commit()
             login_user(user)
             logging.info(f"Successfully authenticated user: {users_email}")
             return redirect(url_for("main_routes.dashboard"))
         except Exception as e:
             logging.error(f"Database error during user authentication: {e}")
+            # Lazy import to avoid circular import (if not already imported above)
+            if 'db' not in locals():
+                from database import db
             db.session.rollback()
             flash("Authentication failed: Database error", "error")
             return redirect(url_for("main_routes.index"))

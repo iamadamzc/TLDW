@@ -209,17 +209,29 @@ from google_auth import google_auth
 from routes import main_routes
 from cookies_routes import bp_cookies
 
+# Setup after_request handlers before registering blueprints (Fix F)
+@app.after_request
+def after_request(response):
+    """Global after_request handler setup before blueprint registration."""
+    response.headers.add('X-Content-Type-Options', 'nosniff')
+    response.headers.add('X-Frame-Options', 'DENY')
+    response.headers.add('X-XSS-Protection', '1; mode=block')
+    return response
+
 app.register_blueprint(google_auth)
 app.register_blueprint(main_routes)
 app.register_blueprint(bp_cookies)
 
-# Register dashboard integration
-try:
-    from dashboard_integration import register_dashboard_routes
-    register_dashboard_routes(app)
-    logging.info("Dashboard integration registered successfully")
-except Exception as e:
-    logging.warning(f"Failed to register dashboard integration: {e}")
+# Register dashboard integration with registration guard (Fix F)
+_dashboard_registered = False
+if not _dashboard_registered:
+    try:
+        from dashboard_integration import register_dashboard_routes
+        register_dashboard_routes(app)
+        _dashboard_registered = True
+        logging.info("Dashboard integration registered successfully")
+    except Exception as e:
+        logging.warning(f"Failed to register dashboard integration: {e}")
 
 # Structured logging is now initialized via configure_logging() at startup
 # Backward compatibility maintained through feature flag USE_MINIMAL_LOGGING

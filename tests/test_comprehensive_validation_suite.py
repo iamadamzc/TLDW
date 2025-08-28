@@ -118,6 +118,9 @@ class TestSuiteRunner:
             ('test_dom_fallback_integration.py', 
              'DOM Fallback Implementation - Requirement 7'),
             
+            ('test_dom_validation_with_video_ids.py',
+             'DOM Validation with Specific Video IDs - Requirements 11.1-11.5'),
+            
             ('test_proxy_enforced_ffmpeg.py', 
              'Proxy-Enforced FFmpeg - Requirement 8'),
             
@@ -188,6 +191,7 @@ class TestSuiteRunner:
             'test_enhanced_timedtext_cookies.py': ['Req 4: Enhanced Cookie Integration'],
             'test_circuit_breaker_integration.py': ['Req 6: Circuit Breaker Integration'],
             'test_dom_fallback_integration.py': ['Req 7: DOM Fallback'],
+            'test_dom_validation_with_video_ids.py': ['Req 11.1-11.5: DOM Validation with Video IDs'],
             'test_proxy_enforced_ffmpeg.py': ['Req 8: Proxy-Enforced FFmpeg'],
             'test_ffmpeg_header_hygiene.py': ['Req 9: FFmpeg Header Hygiene'],
             'test_proxy_health_metrics.py': ['Req 16: Proxy Health Metrics'],
@@ -224,6 +228,7 @@ class TestSuiteRunner:
             'Requirement 5: Complete HTTP Adapter Config': self.results.get('test_transcript_service_enhancements_integration.py', {}).get('success', False),
             'Requirement 6: Circuit Breaker Integration': self.results.get('test_circuit_breaker_integration.py', {}).get('success', False),
             'Requirement 7: DOM Fallback Implementation': self.results.get('test_dom_fallback_integration.py', {}).get('success', False),
+            'Requirements 11.1-11.5: DOM Validation with Video IDs': self.results.get('test_dom_validation_with_video_ids.py', {}).get('success', False),
             'Requirement 8: Proxy-Enforced FFmpeg': self.results.get('test_proxy_enforced_ffmpeg.py', {}).get('success', False),
             'Requirement 9: FFmpeg Header Hygiene': self.results.get('test_ffmpeg_header_hygiene.py', {}).get('success', False),
             'Requirement 10: Comprehensive Metrics': self.results.get('test_transcript_service_enhancements_integration.py', {}).get('success', False),

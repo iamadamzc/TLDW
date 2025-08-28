@@ -17,9 +17,7 @@ import threading
 from performance_monitor import get_performance_monitor, get_dashboard_metrics
 from transcript_metrics import get_comprehensive_metrics
 from monitoring import TranscriptMetrics, JobMetrics, HealthChecker
-from transcript_service import get_circuit_breaker_status
-from logging_setup import get_logger
-from log_events import job_context as log_context
+from logging_setup import get_logger, set_job_ctx, get_job_ctx
 
 
 # Create blueprint for dashboard endpoints
@@ -62,8 +60,13 @@ class MetricsAggregator:
             # Get transcript metrics
             transcript_metrics = get_comprehensive_metrics()
             
-            # Get circuit breaker status
-            circuit_breaker_status = get_circuit_breaker_status()
+            # Get circuit breaker status (lazy import to avoid circular import issues)
+            try:
+                from transcript_service import get_circuit_breaker_status
+                circuit_breaker_status = get_circuit_breaker_status()
+            except ImportError as e:
+                self.logger.warning(f"Could not import get_circuit_breaker_status: {e}")
+                circuit_breaker_status = {"state": "unknown", "failure_count": 0}
             
             # Get system health
             health_checker = HealthChecker()
@@ -128,179 +131,218 @@ _metrics_aggregator = MetricsAggregator()
 @dashboard_bp.route('/metrics')
 def get_metrics():
     """Get comprehensive metrics for dashboard."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            hours = request.args.get('hours', 1, type=int)
-            hours = max(1, min(hours, 24))  # Limit to 1-24 hours
-            
-            metrics = _metrics_aggregator.get_aggregated_metrics(hours)
-            
-            logger.info(f"Dashboard metrics requested", 
-                       hours=hours, 
-                       metrics_count=len(metrics))
-            
-            return jsonify(metrics)
-            
-        except Exception as e:
-            logger.error(f"Error serving dashboard metrics: {e}")
-            return jsonify({"error": str(e)}), 500
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        hours = request.args.get('hours', 1, type=int)
+        hours = max(1, min(hours, 24))  # Limit to 1-24 hours
+        
+        metrics = _metrics_aggregator.get_aggregated_metrics(hours)
+        
+        logger.info(f"Dashboard metrics requested", 
+                   hours=hours, 
+                   metrics_count=len(metrics))
+        
+        return jsonify(metrics)
+        
+    except Exception as e:
+        logger.error(f"Error serving dashboard metrics: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/performance')
 def get_performance_metrics():
     """Get performance-specific metrics."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            hours = request.args.get('hours', 1, type=int)
-            stage = request.args.get('stage')  # Optional stage filter
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        hours = request.args.get('hours', 1, type=int)
+        stage = request.args.get('stage')  # Optional stage filter
+        
+        performance_data = get_dashboard_metrics(hours)
+        
+        # Filter by stage if requested
+        if stage:
+            filtered_data = {}
+            for metric_type, metrics in performance_data.get("metrics_by_type", {}).items():
+                if metric_type == "stage_duration":
+                    filtered_metrics = [
+                        m for m in metrics 
+                        if m.get("labels", {}).get("stage") == stage
+                    ]
+                    if filtered_metrics:
+                        filtered_data[metric_type] = filtered_metrics
             
-            performance_data = get_dashboard_metrics(hours)
-            
-            # Filter by stage if requested
-            if stage:
-                filtered_data = {}
-                for metric_type, metrics in performance_data.get("metrics_by_type", {}).items():
-                    if metric_type == "stage_duration":
-                        filtered_metrics = [
-                            m for m in metrics 
-                            if m.get("labels", {}).get("stage") == stage
-                        ]
-                        if filtered_metrics:
-                            filtered_data[metric_type] = filtered_metrics
-                
-                performance_data["metrics_by_type"] = filtered_data
-            
-            logger.info(f"Performance metrics requested", 
-                       hours=hours, 
-                       stage_filter=stage)
-            
-            return jsonify(performance_data)
-            
-        except Exception as e:
-            logger.error(f"Error serving performance metrics: {e}")
-            return jsonify({"error": str(e)}), 500
+            performance_data["metrics_by_type"] = filtered_data
+        
+        logger.info(f"Performance metrics requested", 
+                   hours=hours, 
+                   stage_filter=stage)
+        
+        return jsonify(performance_data)
+        
+    except Exception as e:
+        logger.error(f"Error serving performance metrics: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/circuit-breaker')
 def get_circuit_breaker_metrics():
     """Get circuit breaker specific metrics."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        # Lazy import to avoid circular import issues
         try:
+            from transcript_service import get_circuit_breaker_status
             status = get_circuit_breaker_status()
-            comprehensive_metrics = get_comprehensive_metrics()
-            
-            circuit_breaker_data = {
-                "current_status": status,
-                "recent_events": comprehensive_metrics.get("recent_circuit_breaker_events", []),
-                "monitoring_summary": get_performance_monitor().circuit_breaker_monitor.get_monitoring_summary()
-            }
-            
-            logger.info("Circuit breaker metrics requested")
-            
-            return jsonify(circuit_breaker_data)
-            
-        except Exception as e:
-            logger.error(f"Error serving circuit breaker metrics: {e}")
-            return jsonify({"error": str(e)}), 500
+        except ImportError as e:
+            logger.warning(f"Could not import get_circuit_breaker_status: {e}")
+            status = {"state": "unknown", "failure_count": 0}
+        
+        comprehensive_metrics = get_comprehensive_metrics()
+        
+        circuit_breaker_data = {
+            "current_status": status,
+            "recent_events": comprehensive_metrics.get("recent_circuit_breaker_events", []),
+            "monitoring_summary": get_performance_monitor().circuit_breaker_monitor.get_monitoring_summary()
+        }
+        
+        logger.info("Circuit breaker metrics requested")
+        
+        return jsonify(circuit_breaker_data)
+        
+    except Exception as e:
+        logger.error(f"Error serving circuit breaker metrics: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/browser-contexts')
 def get_browser_context_metrics():
     """Get browser context specific metrics."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            performance_monitor = get_performance_monitor()
-            context_stats = performance_monitor.browser_manager.get_context_stats()
-            
-            logger.info("Browser context metrics requested")
-            
-            return jsonify(context_stats)
-            
-        except Exception as e:
-            logger.error(f"Error serving browser context metrics: {e}")
-            return jsonify({"error": str(e)}), 500
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        performance_monitor = get_performance_monitor()
+        context_stats = performance_monitor.browser_manager.get_context_stats()
+        
+        logger.info("Browser context metrics requested")
+        
+        return jsonify(context_stats)
+        
+    except Exception as e:
+        logger.error(f"Error serving browser context metrics: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/health')
 def get_health_metrics():
     """Get system health metrics."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            health_checker = HealthChecker()
-            health_status = health_checker.run_health_checks()
-            
-            logger.info("Health metrics requested")
-            
-            return jsonify(health_status)
-            
-        except Exception as e:
-            logger.error(f"Error serving health metrics: {e}")
-            return jsonify({"error": str(e)}), 500
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        health_checker = HealthChecker()
+        health_status = health_checker.run_health_checks()
+        
+        logger.info("Health metrics requested")
+        
+        return jsonify(health_status)
+        
+    except Exception as e:
+        logger.error(f"Error serving health metrics: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/proxy')
 def get_proxy_metrics():
     """Get proxy health and performance metrics."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            proxy_summary = _metrics_aggregator._get_proxy_health_summary()
-            
-            logger.info("Proxy metrics requested")
-            
-            return jsonify(proxy_summary)
-            
-        except Exception as e:
-            logger.error(f"Error serving proxy metrics: {e}")
-            return jsonify({"error": str(e)}), 500
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        proxy_summary = _metrics_aggregator._get_proxy_health_summary()
+        
+        logger.info("Proxy metrics requested")
+        
+        return jsonify(proxy_summary)
+        
+    except Exception as e:
+        logger.error(f"Error serving proxy metrics: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/alerts')
 def get_alerts():
     """Get recent alerts and critical events."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            hours = request.args.get('hours', 24, type=int)
-            
-            # This would typically query an alerts database or log aggregation system
-            # For now, we'll return a placeholder structure
-            alerts_data = {
-                "collection_period_hours": hours,
-                "active_alerts": [],
-                "recent_alerts": [],
-                "alert_summary": {
-                    "critical": 0,
-                    "warning": 0,
-                    "info": 0
-                }
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        hours = request.args.get('hours', 24, type=int)
+        
+        # This would typically query an alerts database or log aggregation system
+        # For now, we'll return a placeholder structure
+        alerts_data = {
+            "collection_period_hours": hours,
+            "active_alerts": [],
+            "recent_alerts": [],
+            "alert_summary": {
+                "critical": 0,
+                "warning": 0,
+                "info": 0
             }
-            
-            logger.info(f"Alerts requested", hours=hours)
-            
-            return jsonify(alerts_data)
-            
-        except Exception as e:
-            logger.error(f"Error serving alerts: {e}")
-            return jsonify({"error": str(e)}), 500
+        }
+        
+        logger.info(f"Alerts requested", hours=hours)
+        
+        return jsonify(alerts_data)
+        
+    except Exception as e:
+        logger.error(f"Error serving alerts: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @dashboard_bp.route('/metrics/export')
 def export_metrics():
     """Export metrics in Prometheus format."""
-    with log_context(correlation_id=request.headers.get('X-Correlation-ID')):
-        try:
-            # Get comprehensive metrics
-            metrics = _metrics_aggregator.get_aggregated_metrics(1)
-            
-            # Convert to Prometheus format
-            prometheus_metrics = _convert_to_prometheus_format(metrics)
-            
-            logger.info("Metrics export requested", format="prometheus")
-            
-            return prometheus_metrics, 200, {'Content-Type': 'text/plain; charset=utf-8'}
-            
-        except Exception as e:
-            logger.error(f"Error exporting metrics: {e}")
-            return f"# Error exporting metrics: {e}\n", 500
+    # Set correlation ID for this request
+    correlation_id = request.headers.get('X-Correlation-ID')
+    if correlation_id:
+        set_job_ctx(job_id=correlation_id)
+    
+    try:
+        # Get comprehensive metrics
+        metrics = _metrics_aggregator.get_aggregated_metrics(1)
+        
+        # Convert to Prometheus format
+        prometheus_metrics = _convert_to_prometheus_format(metrics)
+        
+        logger.info("Metrics export requested", format="prometheus")
+        
+        return prometheus_metrics, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        
+    except Exception as e:
+        logger.error(f"Error exporting metrics: {e}")
+        return f"# Error exporting metrics: {e}\n", 500
 
 
 def _convert_to_prometheus_format(metrics: Dict[str, Any]) -> str:

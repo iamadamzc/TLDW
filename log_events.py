@@ -56,7 +56,7 @@ def perf_evt(**fields) -> None:
     event_data.update(fields)
     
     # Log to the dedicated performance logger
-    perf_logger.info("", extra=event_data)
+    perf_logger.debug("", extra=event_data)
 
 
 class StageTimer:

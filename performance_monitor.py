@@ -533,6 +533,7 @@ class DashboardMetricsCollector:
     def _collect_circuit_breaker_metrics(self):
         """Collect circuit breaker monitoring metrics."""
         try:
+            # Lazy import to avoid circular import issues during startup
             from transcript_service import get_circuit_breaker_status
             
             status = get_circuit_breaker_status()

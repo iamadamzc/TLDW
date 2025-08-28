@@ -53,20 +53,16 @@ class JsonFormatter(logging.Formatter):
     JSON formatter with standardized field order and context injection.
     
     Produces single-line JSON with stable schema:
-    ts, lvl, job_id, video_id, stage, event, outcome, dur_ms, detail
+    lvl, job_id, video_id, stage, event, outcome, dur_ms, detail
+    
+    Note: Timestamps are omitted as CloudWatch provides them automatically.
     """
     
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as single-line JSON."""
         try:
-            # Start with timestamp and level (always present)
-            # Truncate microseconds to milliseconds for consistent format
-            dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
-            # Format with milliseconds (3 digits)
-            timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S') + f'.{int(dt.microsecond / 1000):03d}Z'
-            
+            # Start with level only (CloudWatch provides timestamps)
             log_data = {
-                'ts': timestamp,
                 'lvl': record.levelname
             }
             
@@ -114,8 +110,8 @@ class JsonFormatter(logging.Formatter):
             return json.dumps(log_data, separators=(',', ':'), ensure_ascii=False)
             
         except Exception:
-            # Fallback to basic formatting on any error
-            return f'{{"ts":"{datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}","lvl":"{record.levelname}","detail":"{record.getMessage()}"}}'
+            # Fallback to basic formatting on any error (CloudWatch provides timestamps)
+            return f'{{"lvl":"{record.levelname}","detail":"{record.getMessage()}"}}'
 
 
 class RateLimitFilter(logging.Filter):

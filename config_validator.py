@@ -96,8 +96,7 @@ class ConfigValidator:
         if not config.get("ENABLE_YT_API") and not config.get("ENABLE_TIMEDTEXT"):
             errors.append("At least one of ENABLE_YT_API or ENABLE_TIMEDTEXT must be enabled")
         
-        if config.get("ENABLE_ASR_FALLBACK") and not config.get("ENABLE_YOUTUBEI"):
-            warnings.append("ASR fallback enabled without YouTubei - may have limited effectiveness")
+        # Removed misleading ASR warning (Fix G) - ASR works independently of YouTubei
         
         return config, errors, warnings
     

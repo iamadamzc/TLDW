@@ -18,6 +18,10 @@ from typing import Dict, Optional, Tuple
 import boto3
 import requests
 
+# Job-scoped session management
+_job_sessions: Dict[str, str] = {}
+_job_sessions_lock = threading.Lock()
+
 # YouTube preflight URLs for testing
 _YT_PREFLIGHT_URLS = [
     "https://www.youtube.com/generate_204",
@@ -759,6 +763,180 @@ class ProxyManager:
         except Exception as e:
             self.logger.log_event("error", f"Failed to generate proxy environment variables: {e}")
             return {}
+
+    def for_job(self, job_id: str) -> str:
+        """
+        Get or create a sticky session ID for a specific job.
+        
+        This ensures one proxy identity per job across all stages:
+        - Requests (Transcript API, timedtext)
+        - Playwright (--proxy-server or context proxy)
+        - ffmpeg (-http_proxy and env)
+        
+        Args:
+            job_id: Unique job identifier
+            
+        Returns:
+            Session ID that will be consistent for this job
+        """
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available for job", job_id=job_id)
+            return ""
+        
+        with _job_sessions_lock:
+            if job_id not in _job_sessions:
+                # Generate deterministic session ID based on job_id
+                session_hash = hashlib.sha256(job_id.encode()).hexdigest()[:12]
+                _job_sessions[job_id] = session_hash
+                
+                self.logger.log_event("info", "Created sticky session for job", 
+                                    job_id=job_id, 
+                                    session_hash=session_hash[:8] + "***",  # Mask for security
+                                    username_tail=self._get_masked_username_tail())
+            
+            return _job_sessions[job_id]
+    
+    def proxies_for_job(self, job_id: str) -> Dict[str, str]:
+        """
+        Get proxy configuration with job-scoped sticky session.
+        
+        Args:
+            job_id: Unique job identifier
+            
+        Returns:
+            Proxy dictionary for requests library
+        """
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available for job", job_id=job_id)
+            return {}
+        
+        session_id = self.for_job(job_id)
+        if not session_id:
+            return {}
+        
+        # Ensure we don't reuse blacklisted tokens
+        if session_id in self.session_blacklist:
+            self.logger.log_event("warning", "Job session blacklisted, generating new session", 
+                                job_id=job_id, session_hash=session_id[:8] + "***")
+            # Remove from job sessions to force regeneration
+            with _job_sessions_lock:
+                _job_sessions.pop(job_id, None)
+            # Recursively call to get new session
+            return self.proxies_for_job(job_id)
+        
+        proxy_url = self.secret.build_proxy_url(session_id)
+        return {"http": proxy_url, "https": proxy_url}
+    
+    def proxy_dict_for_job(self, job_id: str, client: str = "requests") -> Optional[Dict[str, str]]:
+        """
+        Get proxy configuration for specific client type with job-scoped sticky session.
+        
+        Args:
+            job_id: Unique job identifier
+            client: Client type - "requests" or "playwright"
+            
+        Returns:
+            Client-specific proxy configuration
+        """
+        if not self.in_use or self.secret is None:
+            return None if client == "playwright" else {}
+        
+        session_id = self.for_job(job_id)
+        if not session_id:
+            return None if client == "playwright" else {}
+        
+        # Check blacklist
+        if session_id in self.session_blacklist:
+            self.logger.log_event("warning", "Job session blacklisted for client", 
+                                job_id=job_id, client=client, session_hash=session_id[:8] + "***")
+            # Remove from job sessions to force regeneration
+            with _job_sessions_lock:
+                _job_sessions.pop(job_id, None)
+            # Recursively call to get new session
+            return self.proxy_dict_for_job(job_id, client)
+        
+        proxy_url = self.secret.build_proxy_url(session_id)
+        
+        if client == "requests":
+            return {"http": proxy_url, "https": proxy_url}
+        elif client == "playwright":
+            try:
+                from urllib.parse import urlparse
+                u = urlparse(proxy_url)
+                server = f"{u.scheme}://{u.hostname}:{u.port}"
+                return {
+                    "server": server,
+                    "username": u.username or "",
+                    "password": u.password or ""
+                }
+            except Exception as e:
+                self.logger.log_event("error", f"Failed to parse proxy URL for playwright job", 
+                                    job_id=job_id, error_type=type(e).__name__)
+                return None
+        else:
+            self.logger.log_event("error", f"Unsupported client type for job", 
+                                job_id=job_id, client=client)
+            return None
+    
+    def proxy_env_for_job(self, job_id: str) -> Dict[str, str]:
+        """
+        Get proxy environment variables for subprocess with job-scoped sticky session.
+        
+        Args:
+            job_id: Unique job identifier
+            
+        Returns:
+            Environment variables for subprocess proxy configuration
+        """
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available for job subprocess", job_id=job_id)
+            return {}
+        
+        session_id = self.for_job(job_id)
+        if not session_id:
+            return {}
+        
+        # Check blacklist
+        if session_id in self.session_blacklist:
+            self.logger.log_event("warning", "Job session blacklisted for subprocess", 
+                                job_id=job_id, session_hash=session_id[:8] + "***")
+            # Remove from job sessions to force regeneration
+            with _job_sessions_lock:
+                _job_sessions.pop(job_id, None)
+            # Recursively call to get new session
+            return self.proxy_env_for_job(job_id)
+        
+        try:
+            proxy_url = self.secret.build_proxy_url(session_id)
+            
+            # Return standard proxy environment variables
+            env_vars = {
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "all_proxy": proxy_url  # Some tools check this
+            }
+            
+            self.logger.log_event("debug", "Generated job-scoped proxy environment variables", 
+                                job_id=job_id, session_hash=session_id[:8] + "***")
+            return env_vars
+            
+        except Exception as e:
+            self.logger.log_event("error", f"Failed to generate job proxy environment variables", 
+                                job_id=job_id, error_type=type(e).__name__)
+            return {}
+    
+    def cleanup_job_session(self, job_id: str):
+        """
+        Clean up job-scoped session when job completes.
+        
+        Args:
+            job_id: Job identifier to clean up
+        """
+        with _job_sessions_lock:
+            if job_id in _job_sessions:
+                session_hash = _job_sessions.pop(job_id)
+                self.logger.log_event("info", "Cleaned up job session", 
+                                    job_id=job_id, session_hash=session_hash[:8] + "***")
 
     def emit_health_status(self) -> None:
         """Emit structured health status logs without credential leakage - Requirement 16.4"""
