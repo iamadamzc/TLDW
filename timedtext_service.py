@@ -190,8 +190,47 @@ def _validate_response(resp: requests.Response) -> Tuple[bool, str, str]:
     if len(body) < 50:  # Suspiciously small for a real transcript
         evt("timedtext_suspiciously_small", content_length=len(body), content_preview=body)
         return False, f"suspiciously_small={len(body)}", body[:80]
+    
+    # Check for blocking indicators in the content
+    if _is_blocking_response(body):
+        evt("timedtext_blocking_response_detected", content_preview=body[:100])
+        return False, "blocking_response", body[:80]
         
     return True, "valid", ""
+
+def _is_blocking_response(content: str) -> bool:
+    """Check if response contains blocking indicators, not actual transcript data"""
+    if not content or len(content.strip()) < 50:  # Too short to be real transcript
+        # Check if this looks like actual transcript content first
+        transcript_indicators = ['events', 'segs', 'utf8', 'transcript', 'text', 'start', 'dur']
+        content_lower = content.lower()
+        has_transcript_content = any(indicator in content_lower for indicator in transcript_indicators)
+        
+        # If it has transcript content, don't block it even if short
+        if has_transcript_content:
+            return False
+        return True
+        
+    blocking_indicators = [
+        'captcha', 'consent', 'robot', 'automated', 'access denied',
+        'before you continue', 'unusual traffic', 'verify you are human',
+        'security check', 'rate limit exceeded', 'cloudflare'
+    ]
+    
+    content_lower = content.lower()
+    
+    # Check if this looks like actual transcript content first
+    transcript_indicators = ['events', 'segs', 'utf8', 'transcript', 'text', 'start', 'dur']
+    has_transcript_content = any(indicator in content_lower for indicator in transcript_indicators)
+    
+    # If it has transcript content, don't block it
+    if has_transcript_content:
+        return False
+        
+    # Check for blocking indicators
+    has_blocking_content = any(indicator in content_lower for indicator in blocking_indicators)
+    
+    return has_blocking_content
 
 # --- Core Logic ---
 
