@@ -177,45 +177,38 @@ class DeterministicYouTubeiCapture:
                     expanded = await self._expand_description()
                     if expanded: evt("youtubei_dom_expanded_description")
                     
-                    # Try deterministic title-row menu approach first (Requirement 1.4)
-                    opened = await self._open_transcript_via_title_menu()
+                    # Use enhanced transcript panel opening with multiple strategies
+                    opened = await self.open_transcript_panel_enhanced()
                     if opened: 
-                        evt("youtubei_dom_clicked_transcript", method="title_menu")
+                        evt("youtubei_dom_clicked_transcript", method="enhanced")
+                        self.transcript_button_clicked = True
                     else:
-                        # Fallback to legacy transcript button detection
-                        evt("youtubei_dom_fallback_to_legacy",
+                        # Fallback: scroll and retry once if transcript button not found
+                        evt("youtubei_dom_scroll_retry",
                             video_id=self.video_id,
                             job_id=self.job_id,
-                            reason="title_menu_failed")
+                            reason="enhanced_strategies_failed")
                         
-                        opened = await self._open_transcript()
-                        if opened: 
-                            evt("youtubei_dom_clicked_transcript", method="legacy")
-                        else:
-                            # Scroll and retry once if transcript button not found
-                            evt("youtubei_dom_scroll_retry",
-                                video_id=self.video_id,
-                                job_id=self.job_id,
-                                reason="transcript_button_not_found_initial")
+                        try:
+                            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                            await page.wait_for_timeout(1000)
                             
-                            try:
-                                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                                await page.wait_for_timeout(1000)
-                                
-                                if not await self._open_transcript():
-                                    evt("youtubei_dom_transcript_retry_failed",
-                                        video_id=self.video_id,
-                                        job_id=self.job_id)
-                                    # Return empty string for fallback to next transcript method (Requirement 9.5)
-                                    return ""
-                            except Exception as scroll_error:
-                                # Graceful degradation: scroll failure should not break the pipeline
-                                evt("youtubei_dom_scroll_failed",
+                            # Retry with enhanced strategies after scroll
+                            opened = await self.open_transcript_panel_enhanced()
+                            if not opened:
+                                evt("youtubei_dom_transcript_retry_failed",
                                     video_id=self.video_id,
-                                    job_id=self.job_id,
-                                    error=str(scroll_error)[:100])
+                                    job_id=self.job_id)
                                 # Return empty string for fallback to next transcript method (Requirement 9.5)
                                 return ""
+                        except Exception as scroll_error:
+                            # Graceful degradation: scroll failure should not break the pipeline
+                            evt("youtubei_dom_scroll_failed",
+                                video_id=self.video_id,
+                                job_id=self.job_id,
+                                error=str(scroll_error)[:100])
+                            # Return empty string for fallback to next transcript method (Requirement 9.5)
+                            return ""
                             
                 except Exception as dom_error:
                     # Graceful degradation: DOM interaction failures should not break the pipeline (Requirement 9.4)
@@ -1026,15 +1019,88 @@ class DeterministicYouTubeiCapture:
                 error=str(e)[:100])
             return False
 
+    async def open_transcript_panel_enhanced(self):
+        """Multiple strategies to open transcript panel with better error handling"""
+        
+        strategies = [
+            # Strategy 1: Direct transcript button click (new YouTube layout)
+            lambda: self.page.click('button[aria-label*="transcript" i], button[aria-label*="Transcript" i]', timeout=5000),
+            
+            # Strategy 2: More actions menu → Show transcript
+            lambda: self._open_via_more_actions(),
+            
+            # Strategy 3: Keyboard shortcuts
+            lambda: self.page.keyboard.press("Shift+."),  # YouTube transcript shortcut
+            
+            # Strategy 4: JavaScript injection as last resort
+            lambda: self.page.evaluate("""() => {
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const transcriptBtn = buttons.find(btn => 
+                    btn.textContent && btn.textContent.match(/show transcript|transcript/i)
+                );
+                if (transcriptBtn) {
+                    transcriptBtn.click();
+                    return true;
+                }
+                return false;
+            }""")
+        ]
+        
+        for i, strategy in enumerate(strategies):
+            try:
+                result = await strategy()
+                if result is not False:  # Allow strategies to return false to continue
+                    return True
+            except Exception as e:
+                if i == len(strategies) - 1:  # Last strategy
+                    raise e
+                continue
+        
+        return False
+
+    async def _open_via_more_actions(self):
+        """Open transcript via More Actions menu with robust selectors"""
+        more_actions_selectors = [
+            'button[aria-label*="More actions" i]',
+            'button[aria-label*="More" i]',
+            'yt-button-shape[aria-label*="More" i]',
+            'tp-yt-paper-button[aria-label*="More" i]',
+            '#button-shape button[aria-haspopup="menu"]'
+        ]
+        
+        for selector in more_actions_selectors:
+            try:
+                await self.page.click(selector, timeout=3000)
+                await self.page.wait_for_timeout(1000)
+                
+                # Look for transcript option in the menu
+                transcript_options = [
+                    'div[role="menu"] [role="menuitem"]:has-text("Show transcript")',
+                    'div[role="menu"] [role="menuitem"]:has-text("Transcript")',
+                    'ytd-menu-popup-renderer [role="menuitem"]:has-text("transcript" i)'
+                ]
+                
+                for option_selector in transcript_options:
+                    try:
+                        await self.page.click(option_selector, timeout=2000)
+                        return True
+                    except:
+                        continue
+                        
+            except Exception:
+                continue
+        
+        return False
+
     async def _open_transcript_via_title_menu(self) -> bool:
         """
         Open transcript panel using deterministic title-row menu.
-        
+
         Implements Requirement 1.4:
         - Use title-row menu selector ytd-menu-renderer #button-shape button[aria-label*='More actions']
         - Confirm dropdown [opened] state before clicking transcript option
         - Add dropdown state verification before clicking transcript option
-        
+
         Returns:
             True if transcript panel opened successfully, False otherwise
         """
