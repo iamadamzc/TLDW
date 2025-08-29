@@ -1113,6 +1113,50 @@ def error_response(code: str, correlation_id: str, message: Optional[str] = None
 # Status codes that trigger session rotation
 BLOCK_STATUSES = {401, 403, 407, 429}
 
+def ensure_proxy_session(job_id: str, video_id: str):
+    """Ensure consistent proxy session for a job"""
+    # Import here to avoid circular imports
+    from shared_managers import shared_managers
+    
+    # Get ENFORCE_PROXY_ALL from environment
+    ENFORCE_PROXY_ALL = os.getenv("ENFORCE_PROXY_ALL", "false").lower() == "true"
+    
+    if not ENFORCE_PROXY_ALL:
+        return None
+        
+    try:
+        # Get or create sticky session for this job
+        session_id = f"yt_{job_id}_{video_id}"
+        proxy_config = shared_managers.get_proxy_manager().for_job(session_id)
+        
+        # Verify proxy is working
+        if not _verify_proxy_connection(proxy_config):
+            # Rotate proxy if current one is blocked
+            shared_managers.get_proxy_manager().rotate_session(session_id)
+            proxy_config = shared_managers.get_proxy_manager().for_job(session_id)
+            
+        return proxy_config
+    except Exception as e:
+        logging.error(f"Proxy session setup failed: {e}")
+        return None
+
+def _verify_proxy_connection(proxy_config):
+    """Quick check if proxy can access YouTube"""
+    # If no proxy config is provided, return False as we can't verify
+    if not proxy_config or not any(proxy_config.values()):
+        return False
+        
+    try:
+        test_url = "https://www.youtube.com/generate_204"
+        response = requests.get(
+            test_url, 
+            proxies=proxy_config,
+            timeout=10
+        )
+        return response.status_code == 204
+    except:
+        return False
+
 # Legacy compatibility - keep existing interface for gradual migration
 class ProxySession:
     """Legacy compatibility wrapper"""
