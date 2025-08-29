@@ -429,8 +429,80 @@ class PlaywrightCircuitBreaker:
         self._emit_state_change(current_state)
 
 
-# Global circuit breaker instance
-_playwright_circuit_breaker = PlaywrightCircuitBreaker()
+class ProxyAwareCircuitBreaker(PlaywrightCircuitBreaker):
+    """Circuit breaker that's more tolerant with proxies"""
+    
+    def __init__(self):
+        super().__init__()
+        # More lenient thresholds for proxy environments
+        self.FAILURE_THRESHOLD = 5  # Increased from 3
+        self.RECOVERY_TIME_SECONDS = 300  # 5 minutes instead of full hour
+    
+    def get_state(self) -> str:
+        """Get current circuit breaker state for monitoring with proxy-aware logic."""
+        if self.failure_count < self.FAILURE_THRESHOLD:
+            return "closed"
+        
+        if self.last_failure_time is None:
+            return "closed"
+        
+        time_since_failure = time.time() - self.last_failure_time
+        
+        # Check time-based states
+        if time_since_failure > self.RECOVERY_TIME_SECONDS:
+            return "closed"
+        elif time_since_failure >= (self.RECOVERY_TIME_SECONDS * 0.8):
+            # Half-open state: we're in the 80%-100% recovery window
+            return "half-open"
+        else:
+            return "open"
+        
+    def record_failure(self) -> None:
+        """Record failure but be more tolerant of timeouts with proxies"""
+        # Check if we're in half-open state BEFORE updating failure count and time
+        current_state = self.get_state()
+        is_half_open = (current_state == "half-open")
+        
+        # Update the failure time first
+        self.last_failure_time = time.time()
+        
+        # Don't penalize as harshly for timeouts when using proxies in half-open state
+        # Access ENFORCE_PROXY_ALL dynamically to support test mocking
+        from reliability_config import get_reliability_config
+        enforce_proxy_all = get_reliability_config().enforce_proxy_all
+        
+        if enforce_proxy_all and is_half_open:
+            self.failure_count += 0.5  # Partial failure count
+        else:
+            self.failure_count += 1.0
+        
+        # Get the updated state after failure count and time change
+        updated_state = self.get_state()
+
+        # Use enhanced metrics system for structured logging
+        from transcript_metrics import record_circuit_breaker_event
+
+        if self.failure_count >= self.FAILURE_THRESHOLD:
+            record_circuit_breaker_event(
+                event_type="activated",
+                failure_count=self.failure_count,
+                threshold=self.FAILURE_THRESHOLD,
+                recovery_time_seconds=self.RECOVERY_TIME_SECONDS,
+                state=updated_state
+            )
+        else:
+            record_circuit_breaker_event(
+                event_type="failure_recorded",
+                failure_count=self.failure_count,
+                threshold=self.FAILURE_THRESHOLD,
+                state=updated_state
+            )
+        
+        self._emit_state_change(updated_state)
+
+
+# Global circuit breaker instance - use proxy-aware version when proxies are enforced
+_playwright_circuit_breaker = ProxyAwareCircuitBreaker() if ENFORCE_PROXY_ALL else PlaywrightCircuitBreaker()
 
 
 def get_circuit_breaker_status() -> Dict[str, Any]:
@@ -3589,6 +3661,7 @@ class TranscriptService:
     ) -> str:
         """
         Internal pipeline execution (wrapped by global timeout watchdog).
+        Uses the new intelligent fallback strategy for smarter transcript extraction.
         """
         
         # ---- Cookie resolution (single source of truth) ----
@@ -3671,184 +3744,19 @@ class TranscriptService:
                 stage_winner = "cache"
                 return cached_transcript
 
-            # 1) Enhanced YouTube Transcript API stage
-            if ENABLE_YT_API:
-                stage_start = time.time()
-                try:
-                    transcript_text, selected_track = self._enhanced_yt_api_stage(
-                        video_id, language_codes, cookie_header, effective_proxy_manager, job_id
-                    )
-                    if transcript_text:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="yt_api", outcome="success", 
-                            dur_ms=stage_duration, selected_track=selected_track)
-                        stage_winner = "yt_api"
-                        pipeline_stages.append(("yt_api", "success", stage_duration))
-                        return transcript_text
-                    else:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="yt_api", outcome="NoTranscriptFound", dur_ms=stage_duration)
-                        pipeline_stages.append(("yt_api", "NoTranscriptFound", stage_duration))
-                except Exception as e:
-                    stage_duration = int((time.time() - stage_start) * 1000)
-                    error_class = type(e).__name__
-                    evt("stage_result", stage="yt_api", outcome=error_class, dur_ms=stage_duration)
-                    pipeline_stages.append(("yt_api", error_class, stage_duration))
-
-            # 2) Enhanced Timedtext stage
-            if ENABLE_TIMEDTEXT:
-                stage_start = time.time()
-                try:
-                    # Log cookie usage for timedtext stage
-                    cookie_source = "user_provided" if cookie_header else "none"
-                    evt("timedtext_cookie_usage", 
-                        video_id=video_id, 
-                        job_id=job_id, 
-                        cookie_source=cookie_source,
-                        has_cookies=bool(cookie_header))
-                    
-                    transcript_text = timedtext_with_job_proxy(
-                        video_id, job_id, effective_proxy_manager, cookie_header
-                    )
-                    if transcript_text:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="timedtext", outcome="success", dur_ms=stage_duration)
-                        stage_winner = "timedtext"
-                        pipeline_stages.append(("timedtext", "success", stage_duration))
-                        return transcript_text
-                    else:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="timedtext", outcome="no_captions", dur_ms=stage_duration)
-                        pipeline_stages.append(("timedtext", "no_captions", stage_duration))
-                except Exception as e:
-                    stage_duration = int((time.time() - stage_start) * 1000)
-                    error_class = type(e).__name__
-                    
-                    # Expose the real failure for debugging; let the pipeline fall through.
-                    logger.exception("timedtext stage failed")
-                    evt("timedtext_error_detail", error=(str(e)[:400] if str(e) else type(e).__name__))
-                    evt("stage_result", stage="timedtext", outcome=type(e).__name__, dur_ms=stage_duration, detail=(str(e)[:200] if str(e) else ""))
-                    pipeline_stages.append(("timedtext", error_class, stage_duration))
-
-            # 3) Enhanced YouTubei via Playwright with guaranteed storage state and fast-fail timeout detection
-            youtubei_fast_fail = False  # Flag to track navigation timeout fast-fail
-            if ENABLE_YOUTUBEI:
-                stage_start = time.time()
-                try:
-                    # Use playwright_cookies if provided, otherwise use cookie_header
-                    effective_cookies = playwright_cookies or cookie_header
-                    
-                    # Log cookie usage for youtubei stage
-                    cookie_source = "playwright" if playwright_cookies else ("user_provided" if cookie_header else "none")
-                    evt("youtubei_cookie_usage", 
-                        video_id=video_id, 
-                        job_id=job_id, 
-                        cookie_source=cookie_source,
-                        has_cookies=bool(effective_cookies))
-                    
-                    # Run YouTubei with fast-fail timeout detection (Requirement 3.4)
-                    transcript_text = self._run_youtubei_with_timeout(
-                        video_id, job_id, effective_proxy_manager, effective_cookies
-                    )
-                    
-                    if transcript_text:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="youtubei", outcome="success", dur_ms=stage_duration)
-                        stage_winner = "youtubei"
-                        pipeline_stages.append(("youtubei", "success", stage_duration))
-                        return transcript_text
-                    else:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="youtubei", outcome="no_transcript", dur_ms=stage_duration)
-                        pipeline_stages.append(("youtubei", "no_transcript", stage_duration))
-                except Exception as e:
-                    stage_duration = int((time.time() - stage_start) * 1000)
-                    error_class = type(e).__name__
-                    evt("stage_result", stage="youtubei", outcome=error_class, dur_ms=stage_duration)
-                    pipeline_stages.append(("youtubei", error_class, stage_duration))
-                    
-                    # Check for navigation timeout to trigger fast-fail to ASR (Requirements 3.4, 5.1)
-                    if self._is_navigation_timeout_error(e):
-                        evt("youtubei_nav_timeout_short_circuit",
-                            video_id=video_id,
-                            job_id=job_id,
-                            timeout_seconds=YOUTUBEI_HARD_TIMEOUT,
-                            error_type=error_class,
-                            next_stage="asr")
-                        # Set flag to skip any retry loops and immediately proceed to ASR (Requirement 5.1)
-                        youtubei_fast_fail = True
-                    
-                    # Log other YouTubei timeouts for monitoring
-                    if "timeout" in error_class.lower() or "TimeoutError" in error_class:
-                        evt("youtubei_timeout", 
-                            video_id=video_id, 
-                            job_id=job_id, 
-                            timeout_seconds=YOUTUBEI_HARD_TIMEOUT,
-                            next_stage="asr")
-
-            # 4) Enhanced ASR fallback with job-scoped proxy and fast-fail support
-            if ENABLE_ASR_FALLBACK:
-                stage_start = time.time()
-                
-                # Determine trigger reason for ASR stage (Requirement 3.4)
-                trigger_reason = "nav_timeout_fast_fail" if youtubei_fast_fail else "pipeline_fallback"
-                
-                # Log ASR start with trigger context
-                evt("asr_start", 
-                    video_id=video_id, 
-                    job_id=job_id,
-                    triggered_by=trigger_reason,
-                    fast_fail=youtubei_fast_fail)
-                try:
-                    # Use playwright_cookies if provided, otherwise use cookie_header
-                    effective_cookies = playwright_cookies or cookie_header
-                    
-                    # Log cookie usage for ASR stage
-                    cookie_source = "playwright" if playwright_cookies else ("user_provided" if cookie_header else "none")
-                    evt("asr_cookie_usage", 
-                        video_id=video_id, 
-                        job_id=job_id, 
-                        cookie_source=cookie_source,
-                        has_cookies=bool(effective_cookies))
-                    
-                    transcript_text = self._enhanced_asr_stage(
-                        video_id, job_id, effective_proxy_manager, effective_cookies
-                    )
-                    if transcript_text:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="asr", outcome="success", dur_ms=stage_duration)
-                        # Log ASR finish explicitly (Fix E)
-                        evt("asr_finish", 
-                            video_id=video_id, 
-                            job_id=job_id,
-                            outcome="success",
-                            transcript_length=len(transcript_text))
-                        stage_winner = "asr"
-                        pipeline_stages.append(("asr", "success", stage_duration))
-                        return transcript_text
-                    else:
-                        stage_duration = int((time.time() - stage_start) * 1000)
-                        evt("stage_result", stage="asr", outcome="no_transcript", dur_ms=stage_duration)
-                        # Log ASR finish even on failure (Fix E)
-                        evt("asr_finish", 
-                            video_id=video_id, 
-                            job_id=job_id,
-                            outcome="no_transcript")
-                        pipeline_stages.append(("asr", "no_transcript", stage_duration))
-                except Exception as e:
-                    stage_duration = int((time.time() - stage_start) * 1000)
-                    error_class = type(e).__name__
-                    evt("stage_result", stage="asr", outcome=error_class, dur_ms=stage_duration)
-                    # Log ASR finish on exception (Fix E)
-                    evt("asr_finish", 
-                        video_id=video_id, 
-                        job_id=job_id,
-                        outcome="error",
-                        error_type=error_class)
-                    pipeline_stages.append(("asr", error_class, stage_duration))
-
-            # No transcript found in any stage
-            return ""
+            # Use the new intelligent fallback strategy
+            transcript, source = get_transcript_with_intelligent_fallback(
+                video_id, job_id, cookie_header
+            )
+            
+            if transcript:
+                stage_winner = source
+                pipeline_stages.append((source, "success", int((time.time() - start_time) * 1000)))
+                return transcript
+            else:
+                # No transcript found in any stage
+                pipeline_stages.append(("none", "no_transcript", int((time.time() - start_time) * 1000)))
+                return ""
 
         finally:
             # Clean up job session
@@ -4880,3 +4788,103 @@ class TranscriptService:
             "cache_stats": self.get_cache_stats(),
             "proxy_available": self.proxy_manager is not None,
         }
+
+
+# --- Enhanced Fallback Strategy ---
+
+def get_transcript_with_intelligent_fallback(video_id, job_id, user_cookies=None):
+    """Smart fallback strategy based on error types"""
+    
+    # Try YouTube API first (fastest)
+    try:
+        transcript = get_captions_via_api(video_id, user_cookies)
+        if transcript:
+            return transcript, "youtube_api"
+    except (TranscriptsDisabled, NoTranscriptFound):
+        # Expected failure, continue to next method
+        pass
+    except Exception as e:
+        # Unexpected error - log but continue
+        logger.warning(f"YouTube API unexpected error: {e}")
+    
+    # Check if video might be age-restricted or blocked
+    if _is_likely_age_restricted(video_id):
+        # Skip to YouTubei which handles auth better
+        return _try_youtubei_with_auth(video_id, job_id, user_cookies)
+    
+    # Try timedtext
+    transcript = get_timedtext_with_retry(video_id)
+    if transcript:
+        return transcript, "timedtext"
+    
+    # Finally try YouTubei with enhanced DOM interaction
+    transcript = get_transcript_via_youtubei_enhanced(video_id, job_id, user_cookies)
+    if transcript:
+        return transcript, "youtubei"
+    
+    # Last resort: ASR
+    if ENABLE_ASR_FALLBACK:
+        transcript = asr_from_intercepted_audio(video_id, user_cookies)
+        if transcript:
+            return transcript, "asr"
+    
+    return None, "none"
+
+
+def _is_likely_age_restricted(video_id):
+    """Heuristic to detect age-restricted videos"""
+    # Check video metadata or previous error patterns
+    # This can be implemented based on historical data
+    # For now, return False - this can be enhanced with actual detection logic
+    return False
+
+
+def _try_youtubei_with_auth(video_id, job_id, user_cookies):
+    """Try YouTubei with enhanced authentication handling for age-restricted videos"""
+    try:
+        # Use enhanced YouTubei with authentication focus
+        transcript = get_transcript_via_youtubei_enhanced(video_id, job_id, user_cookies)
+        if transcript:
+            return transcript, "youtubei_auth"
+    except Exception as e:
+        logger.warning(f"YouTubei with auth failed for {video_id}: {e}")
+    
+    return None, "none"
+
+
+def get_timedtext_with_retry(video_id, max_retries=2):
+    """Enhanced timedtext with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            transcript = get_captions_via_timedtext(video_id)
+            if transcript:
+                return transcript
+        except Exception as e:
+            logger.warning(f"Timedtext attempt {attempt + 1} failed for {video_id}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1 + attempt)  # Exponential backoff
+    return None
+
+
+def get_captions_via_api(video_id, user_cookies):
+    """Wrapper function for the enhanced fallback strategy"""
+    # Create a temporary TranscriptService instance to use the method
+    service = TranscriptService()
+    return service.get_captions_via_api(video_id, ("en", "en-US", "es"))
+
+
+def asr_from_intercepted_audio(video_id, user_cookies):
+    """Wrapper function for ASR fallback"""
+    # Create a temporary TranscriptService instance to use the method
+    service = TranscriptService()
+    return service.asr_from_intercepted_audio(video_id, None, user_cookies)
+
+
+def get_transcript_via_youtubei_enhanced(video_id, job_id, user_cookies=None):
+    """Enhanced YouTubei extraction with better error handling"""
+    try:
+        # Use the existing YouTubei extraction with enhanced settings
+        return get_transcript_via_youtubei(video_id, None, user_cookies)
+    except Exception as e:
+        logger.warning(f"Enhanced YouTubei failed for {video_id}: {e}")
+        return None
