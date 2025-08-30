@@ -154,7 +154,7 @@ python test_reliability_fix_pack.py
 # Verify all new modules import correctly
 python -c "from timedtext_service import timedtext_attempt; print('✓ timedtext_service')"
 python -c "from storage_state_manager import get_storage_state_manager; print('✓ storage_state_manager')"
-python -c "from ffmpeg_service import extract_audio_with_job_proxy; print('✓ ffmpeg_service')"
+python -c "from transcript_service import ASRAudioExtractor; print('✓ ASRAudioExtractor')"
 python -c "from youtubei_service import extract_transcript_with_job_proxy; print('✓ youtubei_service')"
 ```
 

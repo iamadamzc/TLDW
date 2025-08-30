@@ -59,6 +59,12 @@ class ConfigValidator:
         errors.extend(asr_errors)
         warnings.extend(asr_warnings)
         
+        # Validate proxy configuration
+        proxy_config, proxy_errors, proxy_warnings = self._validate_proxy_config()
+        config.update(proxy_config)
+        errors.extend(proxy_errors)
+        warnings.extend(proxy_warnings)
+        
         is_valid = len(errors) == 0
         
         return ConfigValidationResult(
@@ -223,6 +229,40 @@ class ConfigValidator:
             config["DEEPGRAM_API_KEY_configured"] = bool(deepgram_key)
             if deepgram_key:
                 warnings.append("DEEPGRAM_API_KEY configured but ASR fallback disabled")
+        
+        return config, errors, warnings
+    
+    def _validate_proxy_config(self) -> tuple[Dict[str, Any], list[str], list[str]]:
+        """Validate proxy configuration and enforcement"""
+        config = {}
+        errors = []
+        warnings = []
+        
+        enforce_proxy_all = os.getenv("ENFORCE_PROXY_ALL", "0") == "1"
+        config["enforce_proxy_all"] = enforce_proxy_all
+        
+        if enforce_proxy_all:
+            # Check if ProxyManager can be imported and initialized
+            try:
+                from proxy_manager import ProxyManager
+                from shared_managers import shared_managers
+                
+                # Try to get proxy manager instance
+                proxy_manager = shared_managers.get_proxy_manager()
+                if proxy_manager and proxy_manager.in_use:
+                    config["proxy_manager_available"] = True
+                else:
+                    errors.append("ENFORCE_PROXY_ALL=1 but ProxyManager is not available or not in use")
+                    config["proxy_manager_available"] = False
+                    
+            except ImportError as e:
+                errors.append(f"ENFORCE_PROXY_ALL=1 but ProxyManager cannot be imported: {e}")
+                config["proxy_manager_available"] = False
+            except Exception as e:
+                warnings.append(f"ProxyManager validation failed: {e}")
+                config["proxy_manager_available"] = False
+        else:
+            config["proxy_manager_available"] = True  # Not required when not enforcing
         
         return config, errors, warnings
     

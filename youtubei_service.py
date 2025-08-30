@@ -1924,9 +1924,21 @@ def extract_transcript_with_job_proxy(
         capture = DeterministicYouTubeiCapture(job_id, video_id, proxy_manager)
         return await capture.extract_transcript(cookies)
     
-    # Run async extraction
+    # Run async extraction with robust event loop handling
     try:
-        return asyncio.run(_async_extract())
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're in an existing event loop, we need to run in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _async_extract)
+                    return future.result(timeout=60)  # 60 second timeout
+            else:
+                return loop.run_until_complete(_async_extract())
+        except RuntimeError:
+            # No event loop exists, create one
+            return asyncio.run(_async_extract())
     except Exception as e:
         evt("youtubei_async_error",
             video_id=video_id,

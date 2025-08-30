@@ -226,7 +226,7 @@ class TestReliabilityFixesIntegration(unittest.TestCase):
                 mock_youtubei.return_value = ""  # Empty string indicates failure
                 
                 # Mock successful ASR response
-                with patch('transcript_service.extract_audio_with_job_proxy') as mock_asr:
+                with patch('transcript_service.ASRAudioExtractor.extract_transcript') as mock_asr:
                     mock_asr.return_value = "ASR transcript content"
                     
                     # Mock proxy manager
@@ -390,7 +390,7 @@ class TestReliabilityFixesIntegration(unittest.TestCase):
                 mock_youtubei.side_effect = Exception("navigation timeout exceeded")
                 
                 # Mock successful ASR
-                with patch('transcript_service.extract_audio_with_job_proxy') as mock_asr:
+                with patch('transcript_service.ASRAudioExtractor.extract_transcript') as mock_asr:
                     mock_asr.return_value = "ASR transcript after timeout"
                     
                     # Mock proxy manager
@@ -457,7 +457,7 @@ class TestReliabilityFixesIntegration(unittest.TestCase):
             with patch('transcript_service.get_transcript') as mock_get_transcript, \
                  patch('transcript_service.timedtext_with_job_proxy') as mock_timedtext, \
                  patch('transcript_service.extract_transcript_with_job_proxy') as mock_youtubei, \
-                 patch('transcript_service.extract_audio_with_job_proxy') as mock_asr:
+                 patch('transcript_service.ASRAudioExtractor.extract_transcript') as mock_asr:
                 
                 # Configure all methods to fail
                 mock_get_transcript.side_effect = Exception("API error")

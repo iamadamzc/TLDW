@@ -836,7 +836,10 @@ def extract_audio_with_job_proxy(
     cookies: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
-    Extract audio using FFmpeg with job-scoped proxy session and fallback.
+    DEPRECATED: This function is no longer used by transcript_service.py.
+    
+    ASR extraction is now handled internally by ASRAudioExtractor._extract_audio_to_wav().
+    This function will be removed in a future version.
     
     Args:
         audio_url: URL of audio stream
@@ -848,6 +851,14 @@ def extract_audio_with_job_proxy(
     Returns:
         Tuple of (success, error_classification)
     """
+    import warnings
+    warnings.warn(
+        "extract_audio_with_job_proxy is deprecated. "
+        "Use ASRAudioExtractor._extract_audio_to_wav() instead. "
+        "This function will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     service = FFmpegService(job_id, proxy_manager)
     success, returncode, error_classification = service.extract_audio_to_wav(
         audio_url, output_path, cookies
