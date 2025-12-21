@@ -1,5 +1,5 @@
 # Use Playwright’s Python image that includes OS deps
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 # Set up working dir early
 WORKDIR /app
