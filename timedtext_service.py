@@ -359,13 +359,35 @@ def timedtext_attempt(
         
         try:
             resp = _execute_request(session, url, cookies, video_id)
+            
+            # Log response diagnostics before parsing
             last_response_summary = {
                 "status_last": resp.status_code,
                 "content_type_last": resp.headers.get("content-type", "unknown"),
                 "bytes_last": len(resp.content),
             }
             
-            is_valid, reason, preview = _validate_response(resp)
+            evt("timedtext_response_received",
+                video_id=video_id,
+                status_code=resp.status_code,
+                content_type=resp.headers.get("content-type", "unknown"),
+                body_length=len(resp.content),
+                format_attempted=fmt)
+            
+            # Validate response with error handling
+            try:
+                is_valid, reason, preview = _validate_response(resp)
+            except (TypeError, AttributeError) as validation_error:
+                evt("timedtext_validation_error",
+                    video_id=video_id,
+                    url=_mask_url_for_logging(url),
+                    error_type=type(validation_error).__name__,
+                    error=str(validation_error)[:200],
+                    response_type=str(type(resp)),
+                    has_text_attr=hasattr(resp, 'text'),
+                    has_headers_attr=hasattr(resp, 'headers'))
+                logger.warning(f"Timedtext validation failed for {video_id}: {type(validation_error).__name__}")
+                continue
             
             if not is_valid:
                 evt("timedtext_fetch_invalid", video_id=video_id, url=url, reason=reason, preview=preview)

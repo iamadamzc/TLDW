@@ -144,16 +144,37 @@ class DeterministicYouTubeiCapture:
                     job_id=self.job_id)
                 await self._setup_route_interception()
                 
-                # Navigate to video page with networkidle wait for better metadata loading
+                # Navigate to video page with robust wait strategy
                 url = f"https://www.youtube.com/watch?v={self.video_id}&hl=en"
+                
+                # Try networkidle with short timeout, fallback to domcontentloaded
+                navigation_strategy = "unknown"
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=60000)
+                    await page.goto(url, wait_until="networkidle", timeout=15000)
+                    navigation_strategy = "networkidle"
                 except Exception:
-                    # Proxy paths sometimes never reach 'networkidle'; fall back quickly.
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    # Networkidle timeout common with residential proxies; fallback to domcontentloaded
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        navigation_strategy = "domcontentloaded"
+                    except Exception as nav_error:
+                        evt("youtubei_navigation_failed",
+                            video_id=self.video_id,
+                            job_id=self.job_id,
+                            error=str(nav_error)[:100])
+                        return ""
+                
+                # Explicitly wait for key selectors to ensure DOM is ready
+                try:
+                    await page.wait_for_selector('ytd-watch-metadata', timeout=10000, state='visible')
+                except Exception:
+                    pass  # Continue anyway; hydration check will catch this
                 
                 evt("youtubei_navigation_complete", 
-                    video_id=self.video_id, job_id=self.job_id, url=url)
+                    video_id=self.video_id, 
+                    job_id=self.job_id, 
+                    url=url,
+                    strategy=navigation_strategy)
                 
                 # Fast-path caption extraction from ytInitialPlayerResponse (Requirements 1.2, 1.3)
                 fast_path_result = await self._extract_captions_from_player_response(cookies)
@@ -177,38 +198,49 @@ class DeterministicYouTubeiCapture:
                     expanded = await self._expand_description()
                     if expanded: evt("youtubei_dom_expanded_description")
                     
-                    # Use enhanced transcript panel opening with multiple strategies
-                    opened = await self.open_transcript_panel_enhanced()
-                    if opened: 
-                        evt("youtubei_dom_clicked_transcript", method="enhanced")
+                    # Try deterministic method first (modern YouTube flow)
+                    opened = await self._open_transcript_panel_deterministic()
+                    if opened:
+                        evt("youtubei_dom_clicked_transcript", method="deterministic")
                         self.transcript_button_clicked = True
                     else:
-                        # Fallback: scroll and retry once if transcript button not found
-                        evt("youtubei_dom_scroll_retry",
+                        # Fallback to enhanced multi-strategy method
+                        evt("youtubei_dom_deterministic_fallback",
                             video_id=self.video_id,
                             job_id=self.job_id,
-                            reason="enhanced_strategies_failed")
+                            reason="deterministic_failed")
                         
-                        try:
-                            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                            await page.wait_for_timeout(1000)
-                            
-                            # Retry with enhanced strategies after scroll
-                            opened = await self.open_transcript_panel_enhanced()
-                            if not opened:
-                                evt("youtubei_dom_transcript_retry_failed",
-                                    video_id=self.video_id,
-                                    job_id=self.job_id)
-                                # Return empty string for fallback to next transcript method (Requirement 9.5)
-                                return ""
-                        except Exception as scroll_error:
-                            # Graceful degradation: scroll failure should not break the pipeline
-                            evt("youtubei_dom_scroll_failed",
+                        opened = await self.open_transcript_panel_enhanced()
+                        if opened: 
+                            evt("youtubei_dom_clicked_transcript", method="enhanced")
+                            self.transcript_button_clicked = True
+                        else:
+                            # Last resort: scroll and retry once
+                            evt("youtubei_dom_scroll_retry",
                                 video_id=self.video_id,
                                 job_id=self.job_id,
-                                error=str(scroll_error)[:100])
-                            # Return empty string for fallback to next transcript method (Requirement 9.5)
-                            return ""
+                                reason="all_strategies_failed")
+                            
+                            try:
+                                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                                await page.wait_for_timeout(1000)
+                                
+                                # Retry deterministic method after scroll
+                                opened = await self._open_transcript_panel_deterministic()
+                                if not opened:
+                                    evt("youtubei_dom_transcript_retry_failed",
+                                        video_id=self.video_id,
+                                        job_id=self.job_id)
+                                    # Return empty string for fallback to next transcript method (Requirement 9.5)
+                                    return ""
+                            except Exception as scroll_error:
+                                # Graceful degradation: scroll failure should not break the pipeline
+                                evt("youtubei_dom_scroll_failed",
+                                    video_id=self.video_id,
+                                    job_id=self.job_id,
+                                    error=str(scroll_error)[:100])
+                                # Return empty string for fallback to next transcript method (Requirement 9.5)
+                                return ""
                             
                 except Exception as dom_error:
                     # Graceful degradation: DOM interaction failures should not break the pipeline (Requirement 9.4)
@@ -825,6 +857,159 @@ class DeterministicYouTubeiCapture:
                 error=str(e)[:100])
             
             # Graceful degradation: always return without raising exceptions
+            return False
+
+    async def _open_transcript_panel_deterministic(self) -> bool:
+        """
+        Deterministic sequence to open transcript panel on modern YouTube.
+        
+        Sequence:
+        1. Wait for page hydration (watch metadata/actions area visible)
+        2. Scroll controls into view
+        3. Click "More actions" kebab menu
+        4. Click "Show transcript" menu item
+        5. Confirm transcript panel opened
+        
+        Returns:
+            True if panel opened successfully, False otherwise
+        """
+        try:
+            # Step 1: Wait for page hydration
+            try:
+                await self.page.wait_for_selector('ytd-watch-metadata', timeout=10000, state='visible')
+                evt("youtubei_dom_hydration_complete",
+                    video_id=self.video_id,
+                    job_id=self.job_id)
+            except Exception as e:
+                evt("youtubei_dom_hydration_failed",
+                    video_id=self.video_id,
+                    job_id=self.job_id,
+                    error=str(e)[:100])
+                return False
+            
+            # Step 2: Scroll actions area into view
+            try:
+                await self.page.evaluate("""
+                    const actionsArea = document.querySelector('ytd-watch-metadata, #actions, #menu');
+                    if (actionsArea) {
+                        actionsArea.scrollIntoView({behavior: 'instant', block: 'center'});
+                    }
+                """)
+                await self.page.wait_for_timeout(500)
+            except Exception:
+                pass  # Non-critical
+            
+            # Step 3: Click "More actions" kebab (three dots menu)
+            more_actions_selectors = [
+                'ytd-menu-renderer #button-shape button[aria-label*="More actions"]',
+                'button[aria-label="More actions"]',
+                'button[aria-label*="More"]',
+                'yt-button-shape[aria-label="More actions"]',
+                'tp-yt-paper-button[aria-label="More actions"]'
+            ]
+            
+            kebab_clicked = False
+            for selector in more_actions_selectors:
+                try:
+                    btn = self.page.locator(selector).first
+                    await btn.wait_for(state="visible", timeout=3000)
+                    await btn.scroll_into_view_if_needed()
+                    await self.page.wait_for_timeout(200)
+                    await btn.click(timeout=5000)
+                    await self.page.wait_for_timeout(500)  # Wait for menu to open
+                    
+                    kebab_clicked = True
+                    evt("youtubei_kebab_clicked",
+                        video_id=self.video_id,
+                        job_id=self.job_id,
+                        selector=selector)
+                    logger.info(f"youtubei_dom: clicked More actions kebab [{selector}]")
+                    break
+                except Exception as e:
+                    evt("youtubei_kebab_selector_failed",
+                        video_id=self.video_id,
+                        job_id=self.job_id,
+                        selector=selector,
+                        error=str(e)[:100])
+                    continue
+            
+            if not kebab_clicked:
+                evt("youtubei_kebab_not_found",
+                    video_id=self.video_id,
+                    job_id=self.job_id)
+                return False
+            
+            # Step 4: Click "Show transcript" menu item
+            transcript_menu_selectors = [
+                'tp-yt-paper-listbox [role="menuitem"]:has-text("Show transcript")',
+                'ytd-menu-service-item-renderer:has-text("Show transcript")',
+                '[role="menuitem"]:has-text("Show transcript")',
+                'tp-yt-paper-item:has-text("Show transcript")',
+                'yt-formatted-string:has-text("Show transcript")',
+                # Language variants
+                '[role="menuitem"]:has-text("Transcript")',
+                '[role="menuitem"]:has-text("Transkript")',  # German
+                '[role="menuitem"]:has-text("Transcripción")',  # Spanish
+            ]
+            
+            menu_clicked = False
+            for selector in transcript_menu_selectors:
+                try:
+                    item = self.page.locator(selector).first
+                    await item.wait_for(state="visible", timeout=3000)
+                    await item.click(timeout=5000)
+                    
+                    menu_clicked = True
+                    evt("youtubei_transcript_menu_clicked",
+                        video_id=self.video_id,
+                        job_id=self.job_id,
+                        selector=selector)
+                    logger.info(f"youtubei_dom: clicked transcript menu item [{selector}]")
+                    break
+                except Exception as e:
+                    evt("youtubei_transcript_menu_selector_failed",
+                        video_id=self.video_id,
+                        job_id=self.job_id,
+                        selector=selector,
+                        error=str(e)[:100])
+                    continue
+            
+            if not menu_clicked:
+                evt("youtubei_transcript_menu_not_found",
+                    video_id=self.video_id,
+                    job_id=self.job_id)
+                return False
+            
+            # Step 5: Confirm transcript panel opened
+            try:
+                await self.page.wait_for_selector(
+                    'ytd-transcript-search-panel-renderer',
+                    timeout=8000,
+                    state='visible'
+                )
+                
+                evt("youtubei_panel_opened",
+                    video_id=self.video_id,
+                    job_id=self.job_id)
+                logger.info("youtubei_dom: transcript panel opened successfully")
+                
+                # Mark button as clicked for final state tracking
+                self.transcript_button_clicked = True
+                return True
+                
+            except Exception as panel_error:
+                evt("youtubei_panel_open_failed",
+                    video_id=self.video_id,
+                    job_id=self.job_id,
+                    error=str(panel_error)[:100])
+                return False
+                
+        except Exception as e:
+            evt("youtubei_dom_deterministic_failed",
+                video_id=self.video_id,
+                job_id=self.job_id,
+                error=str(e)[:100])
+            logger.warning(f"youtubei_dom: deterministic sequence failed: {str(e)[:100]}")
             return False
 
     async def _open_transcript(self) -> bool:
