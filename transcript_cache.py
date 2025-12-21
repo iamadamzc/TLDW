@@ -112,9 +112,23 @@ class TranscriptCache:
     def set(self, video_id: str, transcript: str, language: str = "en", 
             source: str = "transcript_api", ttl_days: Optional[int] = None) -> bool:
         """Cache transcript with specified TTL"""
-        if not transcript or not transcript.strip():
+        # Handle both list of segments and string formats
+        if not transcript:
             logging.warning(f"Attempted to cache empty transcript for video {video_id}")
             return False
+        
+        # If it's a list, check if it's not empty
+        if isinstance(transcript, list):
+            if len(transcript) == 0:
+                logging.warning(f"Attempted to cache empty transcript list for video {video_id}")
+                return False
+            # Convert list to JSON string for storage
+            transcript = json.dumps(transcript)
+        # If it's a string, check if it's not empty/whitespace  
+        elif isinstance(transcript, str):
+            if not transcript.strip():
+                logging.warning(f"Attempted to cache empty transcript for video {video_id}")
+                return False
         
         cache_key = self._get_cache_key(video_id, language)
         ttl_days = ttl_days or self.default_ttl_days
