@@ -1631,7 +1631,11 @@ class ASRAudioExtractor:
 
     def extract_transcript(self, video_id: str, job_id: str = None) -> str:
         """
-        Extract transcript using ASR fallback with HLS audio extraction and Deepgram transcription.
+        Extract transcript using ASR fallback with audio extraction and Deepgram transcription.
+        
+        Supports two audio extraction methods:
+        1. yt-dlp: Deterministic extraction (ASR_AUDIO_EXTRACTOR=yt_dlp)
+        2. Playwright HLS: Browser-based extraction (default)
         
         Args:
             video_id: YouTube video ID
@@ -1662,14 +1666,61 @@ class ASRAudioExtractor:
             
             evt("asr_start", video_id=video_id)
             
-            # Step 1: Extract HLS audio URL using Playwright
-            audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
+            # Step 1: Extract audio URL
+            # Check ASR_AUDIO_EXTRACTOR flag for yt-dlp support
+            asr_audio_extractor = os.getenv("ASR_AUDIO_EXTRACTOR", "").lower()
+            audio_url = None
+            
+            if asr_audio_extractor == "yt_dlp":
+                # Use yt-dlp for audio URL extraction
+                try:
+                    from ytdlp_service import extract_best_audio_url
+                    
+                    evt("asr_audio_source_select", source="yt_dlp", video_id=video_id)
+                    
+                    result = extract_best_audio_url(
+                        youtube_url=video_id,
+                        proxy_manager=self.proxy_manager,
+                        job_id=job_id
+                    )
+                    
+                    if result.get("success"):
+                        audio_url = result["url"]
+                        evt("asr_audio_source_selected",
+                            source="yt_dlp",
+                            format_id=result.get("format_id"),
+                            ext=result.get("ext"),
+                            abr=result.get("abr"),
+                            proxy_used=result.get("proxy_used"))
+                    else:
+                        # yt-dlp failed, log and fall back to Playwright
+                        evt("asr_audio_source_failed",
+                            source="yt_dlp",
+                            fail_class=result.get("fail_class"),
+                            error=result.get("error", "")[:200])
+                        
+                        # Graceful fallback to existing method
+                        evt("asr_fallback_to_playwright", reason="ytdlp_failed", video_id=video_id)
+                        audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
+                        
+                except Exception as e:
+                    # yt-dlp import or execution error, fall back to Playwright
+                    evt("asr_ytdlp_error",
+                        error=str(e)[:200],
+                        video_id=video_id)
+                    evt("asr_fallback_to_playwright", reason="ytdlp_exception", video_id=video_id)
+                    audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
+            
+            else:
+                # Default: Use existing Playwright HLS extraction
+                evt("asr_audio_source_select", source="playwright_hls", video_id=video_id)
+                audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
             
             if not audio_url:
-                evt("asr_step", step="hls_extraction", outcome="no_url", video_id=video_id)
+                evt("asr_step", step="audio_url_extraction", outcome="no_url", video_id=video_id)
                 return ""
             
-            evt("asr_step", step="hls_extraction", outcome="success", video_id=video_id)
+            evt("asr_step", step="audio_url_extraction", outcome="success", video_id=video_id)
             
             # Step 2: Extract audio to WAV using ffmpeg
             import tempfile
