@@ -2582,6 +2582,14 @@ class TranscriptService:
     def __init__(self, use_shared_managers: bool = True):
         self.deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
         
+        # DIAGNOSTIC: Log DEEPGRAM_API_KEY availability at initialization
+        deepgram_key_status = "configured" if self.deepgram_api_key else "MISSING"
+        deepgram_key_length = len(self.deepgram_api_key) if self.deepgram_api_key else 0
+        evt("transcript_service_init", 
+            deepgram_key_status=deepgram_key_status,
+            deepgram_key_length=deepgram_key_length,
+            detail=f"TranscriptService initialized: DEEPGRAM_API_KEY={deepgram_key_status} (length={deepgram_key_length})")
+        
         if use_shared_managers:
             self.proxy_manager = shared_managers.get_proxy_manager()
             self.cache = shared_managers.get_transcript_cache()
@@ -2760,9 +2768,23 @@ class TranscriptService:
                     error_class=error_class, error=str(e)[:100])
         
         # Method 4: ASR fallback
+        # Diagnostic logging for ASR eligibility (helps debug staging issues)
+        asr_enabled = ENABLE_ASR_FALLBACK
+        asr_key_configured = bool(self.deepgram_api_key)
+        evt("asr_eligibility_check",
+            video_id=video_id,
+            job_id=job_id,
+            asr_enabled=asr_enabled,
+            deepgram_key_configured=asr_key_configured)
+        
+        if not asr_enabled:
+            evt("asr_skipped", reason="asr_disabled", video_id=video_id, job_id=job_id)
+        elif not asr_key_configured:
+            evt("asr_skipped", reason="no_deepgram_key", video_id=video_id, job_id=job_id)
+        
         if ENABLE_ASR_FALLBACK and self.deepgram_api_key:
             try:
-                evt("transcript_method_start", method="asr", video_id=video_id)
+                evt("transcript_method_start", method="asr", video_id=video_id, job_id=job_id)
                 
                 asr_extractor = ASRAudioExtractor(
                     deepgram_api_key=self.deepgram_api_key,
@@ -2779,14 +2801,14 @@ class TranscriptService:
                         'duration': 0.0
                     }]
                     
-                    evt("transcript_method_success", method="asr", video_id=video_id)
+                    evt("transcript_method_success", method="asr", video_id=video_id, job_id=job_id)
                     log_successful_transcript_method("asr")
                     return segments
                     
             except Exception as e:
                 error_class = classify_transcript_error(e, video_id, "asr")
                 evt("transcript_method_failed", 
-                    method="asr", video_id=video_id, 
+                    method="asr", video_id=video_id, job_id=job_id,
                     error_class=error_class, error=str(e)[:100])
         
         # All methods failed
