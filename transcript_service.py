@@ -1691,7 +1691,10 @@ class ASRAudioExtractor:
                             format_id=result.get("format_id"),
                             ext=result.get("ext"),
                             abr=result.get("abr"),
-                            proxy_used=result.get("proxy_used"))
+                            proxy_used=result.get("proxy_used"),
+                            proxy_enabled=result.get("proxy_enabled"),
+                            proxy_host=result.get("proxy_host"),
+                            proxy_profile=result.get("proxy_profile"))
                     else:
                         # yt-dlp failed, log and fall back to Playwright
                         evt("asr_audio_source_failed",

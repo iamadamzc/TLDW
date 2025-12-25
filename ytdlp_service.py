@@ -236,15 +236,19 @@ def extract_best_audio_url(
     
     if proxy_manager and job_id:
         try:
-            proxy_dict = proxy_manager.get_job_proxy_dict(job_id)
-            if proxy_dict and "http" in proxy_dict:
-                proxy_url = proxy_dict["http"]
-                proxy_enabled = True
-                proxy_info = _sanitize_proxy_url(proxy_url)
-                evt("ytdlp_proxy_acquired",
-                    extractor="yt_dlp",
-                    proxy_enabled=True,
-                    **proxy_info)
+            # Use correct ProxyManager API for requests client
+            proxy_dict = proxy_manager.proxy_dict_for_job(job_id, "requests")
+            if proxy_dict:
+                # Prefer https proxy if available, else http
+                proxy_url = proxy_dict.get("https") or proxy_dict.get("http")
+                
+                if proxy_url:
+                    proxy_enabled = True
+                    proxy_info = _sanitize_proxy_url(proxy_url)
+                    evt("ytdlp_proxy_acquired",
+                        extractor="yt_dlp",
+                        proxy_enabled=True,
+                        **proxy_info)
         except Exception as e:
             evt("ytdlp_proxy_fetch_failed",
                 extractor="yt_dlp",
@@ -262,7 +266,10 @@ def extract_best_audio_url(
             "success": False,
             "fail_class": "proxy_unavailable",
             "error": "ENFORCE_PROXY_ALL=1 but ProxyManager returned no proxy URL",
-            "proxy_used": False
+            "proxy_used": False,
+            "proxy_enabled": False,
+            "proxy_host": None,
+            "proxy_profile": None
         }
     
     # Configure yt-dlp options
@@ -308,7 +315,10 @@ def extract_best_audio_url(
                 "ext": best_format.get('ext', 'unknown'),
                 "format_id": best_format.get('format_id', 'unknown'),
                 "abr": best_format.get('abr', 0),
-                "proxy_used": proxy_enabled
+                "proxy_used": proxy_enabled,
+                "proxy_enabled": proxy_enabled,
+                "proxy_host": proxy_info.get("proxy_host"),
+                "proxy_profile": proxy_info.get("proxy_profile")
             }
             
             # Log success
@@ -338,5 +348,8 @@ def extract_best_audio_url(
             "success": False,
             "fail_class": fail_class,
             "error": str(e),
-            "proxy_used": proxy_enabled
+            "proxy_used": proxy_enabled,
+            "proxy_enabled": proxy_enabled,
+            "proxy_host": proxy_info.get("proxy_host"),
+            "proxy_profile": proxy_info.get("proxy_profile")
         }

@@ -71,10 +71,11 @@ class TestYtdlpService(unittest.TestCase):
         """Test audio extraction with proxy"""
         from ytdlp_service import extract_best_audio_url
         
-        # Mock ProxyManager
+        # Mock ProxyManager with correct API
         mock_proxy_manager = mock.MagicMock()
-        mock_proxy_manager.get_job_proxy_dict.return_value = {
-            "http": "http://user:pass@proxy.example.com:8080"
+        mock_proxy_manager.proxy_dict_for_job.return_value = {
+            "http": "http://user:pass@proxy.example.com:8080",
+            "https": "https://user:pass@proxy.example.com:8080"
         }
         
         # Mock yt-dlp
@@ -100,14 +101,20 @@ class TestYtdlpService(unittest.TestCase):
             job_id="test_job"
         )
         
-        # Verify proxy was passed to yt-dlp
+        # Verify proxy_dict_for_job was called with correct arguments
+        mock_proxy_manager.proxy_dict_for_job.assert_called_once_with("test_job", "requests")
+        
+        # Verify proxy was passed to yt-dlp (prefer https)
         call_args = mock_ytdlp.YoutubeDL.call_args[0][0]
         self.assertIn('proxy', call_args)
-        self.assertEqual(call_args['proxy'], "http://user:pass@proxy.example.com:8080")
+        self.assertEqual(call_args['proxy'], "https://user:pass@proxy.example.com:8080")
         
         # Verify result includes proxy info
         self.assertTrue(result["success"])
         self.assertTrue(result["proxy_used"])
+        self.assertTrue(result["proxy_enabled"])
+        self.assertIsNotNone(result["proxy_host"])
+        self.assertIsNotNone(result["proxy_profile"])
         
     @mock.patch('ytdlp_service.yt_dlp')
     def test_error_classification(self, mock_ytdlp):
@@ -210,9 +217,9 @@ class TestYtdlpService(unittest.TestCase):
         # Set ENFORCE_PROXY_ALL
         os.environ["ENFORCE_PROXY_ALL"] = "1"
         
-        # Mock ProxyManager that returns no proxy
+        # Mock ProxyManager that returns empty dict (no proxy)
         mock_proxy_manager = mock.MagicMock()
-        mock_proxy_manager.get_job_proxy_dict.return_value = {}  # No proxy
+        mock_proxy_manager.proxy_dict_for_job.return_value = {}  # No proxy
         
         result = extract_best_audio_url(
             "dQw4w9WgXcQ",
@@ -220,11 +227,15 @@ class TestYtdlpService(unittest.TestCase):
             job_id="test_job"
         )
         
+        # Verify proxy_dict_for_job was called
+        mock_proxy_manager.proxy_dict_for_job.assert_called_once_with("test_job", "requests")
+        
         # Should fail with proxy_unavailable
         self.assertFalse(result["success"])
         self.assertEqual(result["fail_class"], "proxy_unavailable")
         self.assertIn("ENFORCE_PROXY_ALL", result["error"])
         self.assertFalse(result["proxy_used"])
+        self.assertFalse(result["proxy_enabled"])
         
         # Verify yt-dlp was NOT called
         mock_ytdlp.YoutubeDL.assert_not_called()
