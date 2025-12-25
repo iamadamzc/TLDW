@@ -30,7 +30,8 @@ from playwright.sync_api import sync_playwright, Page
 from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "playwright-fix-2025-08-24T2"
+APP_VERSION = "asr-debug-v1"
+evt("build_marker", marker="asr-fallback-debug-v1")
 
 # Startup sanity check to catch local module shadowing
 assert (
@@ -2771,18 +2772,18 @@ class TranscriptService:
         # Diagnostic logging for ASR eligibility (helps debug staging issues)
         asr_enabled = ENABLE_ASR_FALLBACK
         asr_key_configured = bool(self.deepgram_api_key)
+        
+        # Step 2: Prove ASR Gate
         evt("asr_eligibility_check",
             video_id=video_id,
             job_id=job_id,
             asr_enabled=asr_enabled,
-            deepgram_key_configured=asr_key_configured)
+            deepgram_key_configured=asr_key_configured,
+            enabled_var=str(ENABLE_ASR_FALLBACK),
+            key_var_present=bool(os.environ.get("DEEPGRAM_API_KEY")))
         
-        if not asr_enabled:
-            evt("asr_skipped", reason="asr_disabled", video_id=video_id, job_id=job_id)
-        elif not asr_key_configured:
-            evt("asr_skipped", reason="no_deepgram_key", video_id=video_id, job_id=job_id)
-        
-        if ENABLE_ASR_FALLBACK and self.deepgram_api_key:
+        # Step 3 & 4: Guarantee attempt and do not silently skip
+        if asr_enabled and asr_key_configured:
             try:
                 evt("transcript_method_start", method="asr", video_id=video_id, job_id=job_id)
                 
@@ -2804,12 +2805,24 @@ class TranscriptService:
                     evt("transcript_method_success", method="asr", video_id=video_id, job_id=job_id)
                     log_successful_transcript_method("asr")
                     return segments
+                else:
+                    evt("transcript_method_failed",
+                        method="asr", video_id=video_id, job_id=job_id,
+                        error_class="extraction_failed", error="empty_result")
                     
             except Exception as e:
                 error_class = classify_transcript_error(e, video_id, "asr")
                 evt("transcript_method_failed", 
                     method="asr", video_id=video_id, job_id=job_id,
                     error_class=error_class, error=str(e)[:100])
+        else:
+            # Step 4: Explicit skip reason
+            if not asr_enabled:
+                evt("asr_skipped", reason="asr_disabled_env", video_id=video_id, job_id=job_id)
+            elif not asr_key_configured:
+                evt("asr_skipped", reason="no_deepgram_key_attr", video_id=video_id, job_id=job_id)
+            else:
+                evt("asr_skipped", reason="unknown_condition", video_id=video_id, job_id=job_id)
         
         # All methods failed
         evt("transcript_all_methods_failed", video_id=video_id)
