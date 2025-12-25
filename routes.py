@@ -363,7 +363,7 @@ class JobManager:
                             
                             # Get transcript using enhanced hierarchical fallback
                             transcript_start_time = time.time()
-                            text = ts.get_transcript(vid, user_cookies=requests_cookies, playwright_cookies=playwright_cookies, user_id=user_id)
+                            text = ts.get_transcript(vid, cookie_header=requests_cookies, user_id=user_id, job_id=job_id)
                             transcript_duration_ms = int((time.time() - transcript_start_time) * 1000)
                             
                             # Determine transcript source from cache or logs
