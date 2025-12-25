@@ -30,8 +30,9 @@ from playwright.sync_api import sync_playwright, Page
 from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "asr-debug-v1"
-evt("build_marker", marker="asr-fallback-debug-v1")
+# --- Version marker for deployed image provenance ---
+APP_VERSION = "asr-fallthrough-debug-v2"
+evt("build_marker", marker="asr-fallthrough-debug-v2")
 
 # Startup sanity check to catch local module shadowing
 assert (
@@ -2767,8 +2768,23 @@ class TranscriptService:
                 evt("transcript_method_failed", 
                     method="youtubei", video_id=video_id, 
                     error_class=error_class, error=str(e)[:100])
+            finally:
+                evt(
+                    "transcript_method_exit",
+                    method="youtubei",
+                    video_id=video_id,
+                    job_id=job_id,
+                )
         
         # Method 4: ASR fallback
+        
+        # Step 2: ASR Block Entry Marker
+        evt(
+            "transcript_pipeline_enter_asr_block",
+            video_id=video_id,
+            job_id=job_id,
+        )
+        
         # Diagnostic logging for ASR eligibility (helps debug staging issues)
         asr_enabled = ENABLE_ASR_FALLBACK
         asr_key_configured = bool(self.deepgram_api_key)
@@ -2825,6 +2841,11 @@ class TranscriptService:
                 evt("asr_skipped", reason="unknown_condition", video_id=video_id, job_id=job_id)
         
         # All methods failed
+        evt(
+            "transcript_pipeline_returning_empty",
+            video_id=video_id,
+            job_id=job_id,
+        )
         evt("transcript_all_methods_failed", video_id=video_id)
         return []
 
