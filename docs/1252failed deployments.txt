@@ -1,0 +1,96 @@
+timestamp,message
+1756057854778,[2025-08-24 17:50:54 +0000] [8] [INFO] Starting gunicorn 23.0.0
+1756057854780,[2025-08-24 17:50:54 +0000] [8] [INFO] Listening at: http://0.0.0.0:8080 (8)
+1756057854780,[2025-08-24 17:50:54 +0000] [8] [INFO] Using worker: gthread
+1756057854784,[2025-08-24 17:50:54 +0000] [9] [INFO] Booting worker with pid: 9
+1756057854789,[2025-08-24 17:50:54 +0000] [9] [INFO] TL;DW Startup Dependency Check
+1756057854802,[2025-08-24 17:50:54 +0000] [11] [INFO] Booting worker with pid: 11
+1756057854806,[2025-08-24 17:50:54 +0000] [11] [INFO] TL;DW Startup Dependency Check
+1756057855023,[2025-08-24 17:50:55 +0000] [9] [INFO] STARTUP: ffmpeg at /usr/bin/ffmpeg
+1756057855027,[2025-08-24 17:50:55 +0000] [11] [INFO] STARTUP: ffmpeg at /usr/bin/ffmpeg
+1756057855106,[2025-08-24 17:50:55 +0000] [9] [INFO] STARTUP: ffprobe at /usr/bin/ffprobe
+1756057855106,[2025-08-24 17:50:55 +0000] [9] [INFO] STARTUP: FFMPEG_LOCATION=/usr/bin
+1756057855107,[2025-08-24 17:50:55 +0000] [9] [INFO] STARTUP: ALLOW_MISSING_DEPS=True
+1756057855107,[2025-08-24 17:50:55 +0000] [9] [INFO] STARTUP: Environment ready for application startup
+1756057855113,[2025-08-24 17:50:55 +0000] [11] [INFO] STARTUP: ffprobe at /usr/bin/ffprobe
+1756057855113,[2025-08-24 17:50:55 +0000] [11] [INFO] STARTUP: FFMPEG_LOCATION=/usr/bin
+1756057855113,[2025-08-24 17:50:55 +0000] [11] [INFO] STARTUP: ALLOW_MISSING_DEPS=True
+1756057855113,[2025-08-24 17:50:55 +0000] [11] [INFO] STARTUP: Environment ready for application startup
+1756057855928,[2025-08-24 17:50:55 +0000] [11] [ERROR] Exception in worker process
+1756057855928,Traceback (most recent call last):
+1756057855928,"  File ""/app/wsgi.py"", line 74, in <module>"
+1756057855928,    from app import app
+1756057855928,"  File ""/app/app.py"", line 168, in <module>"
+1756057855928,    import models  # noqa: F401
+1756057855928,ModuleNotFoundError: No module named 'models'
+1756057855928,"During handling of the above exception, another exception occurred:"
+1756057855928,Traceback (most recent call last):
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/arbiter.py"", line 608, in spawn_worker"
+1756057855928,    worker.init_process()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/gthread.py"", line 94, in init_process"
+1756057855928,    super().init_process()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/base.py"", line 135, in init_process"
+1756057855928,    self.load_wsgi()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/base.py"", line 147, in load_wsgi"
+1756057855928,    self.wsgi = self.app.wsgi()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/base.py"", line 66, in wsgi"
+1756057855928,    self.callable = self.load()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/wsgiapp.py"", line 57, in load"
+1756057855928,    return self.load_wsgiapp()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/wsgiapp.py"", line 47, in load_wsgiapp"
+1756057855928,    return util.import_app(self.app_uri)
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/util.py"", line 370, in import_app"
+1756057855928,    mod = importlib.import_module(module)
+1756057855928,"  File ""/usr/lib/python3.10/importlib/__init__.py"", line 126, in import_module"
+1756057855928,"    return _bootstrap._gcd_import(name[level:], package, level)"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 1050, in _gcd_import"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 1027, in _find_and_load"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 1006, in _find_and_load_unlocked"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 688, in _load_unlocked"
+1756057855928,"  File ""<frozen importlib._bootstrap_external>"", line 883, in exec_module"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 241, in _call_with_frames_removed"
+1756057855928,"  File ""/app/wsgi.py"", line 76, in <module>"
+1756057855928,    from main import app  # fallback if the app lives in main.py
+1756057855928,ModuleNotFoundError: No module named 'main'
+1756057855928,[2025-08-24 17:50:55 +0000] [9] [ERROR] Exception in worker process
+1756057855928,Traceback (most recent call last):
+1756057855928,"  File ""/app/wsgi.py"", line 74, in <module>"
+1756057855928,    from app import app
+1756057855928,"  File ""/app/app.py"", line 168, in <module>"
+1756057855928,    import models  # noqa: F401
+1756057855928,ModuleNotFoundError: No module named 'models'
+1756057855928,"During handling of the above exception, another exception occurred:"
+1756057855928,Traceback (most recent call last):
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/arbiter.py"", line 608, in spawn_worker"
+1756057855928,    worker.init_process()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/gthread.py"", line 94, in init_process"
+1756057855928,    super().init_process()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/base.py"", line 135, in init_process"
+1756057855928,    self.load_wsgi()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/workers/base.py"", line 147, in load_wsgi"
+1756057855928,    self.wsgi = self.app.wsgi()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/base.py"", line 66, in wsgi"
+1756057855928,    self.callable = self.load()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/wsgiapp.py"", line 57, in load"
+1756057855928,    return self.load_wsgiapp()
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/app/wsgiapp.py"", line 47, in load_wsgiapp"
+1756057855928,    return util.import_app(self.app_uri)
+1756057855928,"  File ""/usr/local/lib/python3.10/dist-packages/gunicorn/util.py"", line 370, in import_app"
+1756057855928,    mod = importlib.import_module(module)
+1756057855928,"  File ""/usr/lib/python3.10/importlib/__init__.py"", line 126, in import_module"
+1756057855928,"    return _bootstrap._gcd_import(name[level:], package, level)"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 1050, in _gcd_import"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 1027, in _find_and_load"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 1006, in _find_and_load_unlocked"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 688, in _load_unlocked"
+1756057855928,"  File ""<frozen importlib._bootstrap_external>"", line 883, in exec_module"
+1756057855928,"  File ""<frozen importlib._bootstrap>"", line 241, in _call_with_frames_removed"
+1756057855928,"  File ""/app/wsgi.py"", line 76, in <module>"
+1756057855928,    from main import app  # fallback if the app lives in main.py
+1756057855928,ModuleNotFoundError: No module named 'main'
+1756057855928,[2025-08-24 17:50:55 +0000] [9] [INFO] Worker exiting (pid: 9)
+1756057855929,[2025-08-24 17:50:55 +0000] [11] [INFO] Worker exiting (pid: 11)
+1756057856231,[2025-08-24 17:50:56 +0000] [8] [ERROR] Worker (pid:11) exited with code 3
+1756057856234,[2025-08-24 17:50:56 +0000] [8] [ERROR] Worker (pid:9) was sent SIGTERM!
+1756057856332,[2025-08-24 17:50:56 +0000] [8] [ERROR] Shutting down: Master
+1756057856332,[2025-08-24 17:50:56 +0000] [8] [ERROR] Reason: Worker failed to boot.

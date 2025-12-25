@@ -1,0 +1,317 @@
+1) youtubei_service.py
+
+Goal: (a) stop the silent no-ops (is_visible(timeout=...)), (b) short-circuit via captionTracks (no UI needed), (c) make the overflow-menu path deterministic (title-row menu), and (d) wire a real direct-POST fallback.
+
+Patch 1 — replace all locator.is_visible(timeout=...) with real waits
+
+Search and replace (safe across consent/expanders/menus):
+
+- if await element.is_visible(timeout=2000):
+-     await element.click(timeout=5000)
++ await element.wait_for(state="visible", timeout=5000)
++ await element.click(timeout=5000)
+
+
+Do this wherever we currently pass timeout to is_visible(...). Playwright Python does not accept timeout there, so your code wasn’t actually waiting.
+
+Patch 2 — try captionTracks immediately after first load (no UI)
+
+Add this right after your first successful page.goto(..., wait_until='domcontentloaded' | 'networkidle') and before any DOM clicks:
+
+@@ async def extract_transcript(...):
+-                evt("youtubei_navigation_complete", 
++                evt("youtubei_navigation_complete", 
+                     video_id=self.video_id, job_id=self.job_id, url=url)
+ 
+-                # DOM interaction sequence AFTER route interception setup
++                # ===== NEW: Try player captions without any UI clicks =====
++                try:
++                    tracks = await page.evaluate("""
++                        () => {
++                          try {
++                            const pr = window.ytInitialPlayerResponse || {};
++                            const list = pr.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
++                            return list.map(t => ({
++                              baseUrl: t.baseUrl,
++                              kind: t.kind || "",
++                              lang: t.languageCode || "",
++                              name: (t.name && t.name.simpleText) || ""
++                            }));
++                          } catch (e) { return []; }
++                        }
++                    """)
++                    if (tracks && tracks.length) {
++                        // choose best: prefer non-ASR English, else first
++                        const best = tracks.find(t => t.kind !== 'asr' && (t.lang || '').startsWith('en')) || tracks[0];
++                        if (best && best.baseUrl) {
++                            // fetch via python requests (proxied) using existing data path
++                            const resp = await self._fetch_transcript_xml_via_requests(best.baseUrl)
++                            if (resp) {
++                                evt("youtubei_captiontracks_shortcircuit", lang=best.lang, asr=(best.kind==='asr'))
++                                return resp  # <- entire method can return early with transcript text
++                            }
++                        }
++                    }
++                } catch (e) {
++                    evt("youtubei_captiontracks_probe_failed", err=(e && (e.message||String(e))).slice(0,120))
++                }
++
++                # DOM interaction sequence AFTER route interception setup
+                 evt("youtubei_dom_sequence_start",
+                     video_id=self.video_id,
+                     job_id=self.job_id)
+
+
+Add the small helper (anywhere in class):
+
+@@ class DeterministicYouTubeiCapture:
++    async def _fetch_transcript_xml_via_requests(self, url: str) -> Optional[str]:
++        """
++        Download the transcript XML via requests respecting ENFORCE_PROXY_ALL and job proxy.
++        Return XML text or None.
++        """
++        import requests
++        proxies = None
++        if self.proxy_manager and self.proxy_manager.in_use:
++            try:
++                proxies = self.proxy_manager.proxy_dict_for_job(self.job_id, "requests")
++            except Exception:
++                proxies = None
++        enforce = os.getenv("ENFORCE_PROXY_ALL", "0").lower() in ("1","true","yes")
++        if enforce and not proxies:
++            evt("youtubei_captiontracks_blocked", reason="enforce_proxy_no_proxy")
++            return None
++        try:
++            r = requests.get(url, timeout=(5,10), proxies=proxies, headers={"User-Agent": "Mozilla/5.0"})
++            if r.status_code == 200 and r.text.strip().startswith("<"):
++                return r.text
++            evt("youtubei_captiontracks_bad_resp", status=r.status_code)
++            return None
++        except Exception as e:
++            evt("youtubei_captiontracks_err", err=str(e)[:100])
++            return None
+
+Patch 3 — deterministic title-row overflow menu → “Show transcript”
+
+Add these constants and helper, then call the helper where you currently try _open_transcript():
+
+@@ class DeterministicYouTubeiCapture:
++    TITLE_ROW_MENU = "ytd-menu-renderer #button-shape button[aria-label*='More actions']"
++    SHOW_TRANSCRIPT_ITEM = "tp-yt-paper-listbox [role='menuitem']:has-text('Show transcript')"
++
++    async def _open_transcript_via_title_menu(self) -> bool:
++        try:
++            btn = self.page.locator(self.TITLE_ROW_MENU).first
++            await btn.wait_for(state="visible", timeout=5000)
++            await btn.click(timeout=5000)
++            await self.page.wait_for_selector("tp-yt-iron-dropdown[opened] tp-yt-paper-listbox", timeout=5000)
++            item = self.page.locator(self.SHOW_TRANSCRIPT_ITEM).first
++            await item.wait_for(state="visible", timeout=5000)
++            await item.click(timeout=5000)
++            self.transcript_button_clicked = True
++            return True
++        except Exception as e:
++            evt("youtubei_title_menu_open_failed", err=str(e)[:120])
++            return False
+
+
+Then, in your DOM flow:
+
+-                    opened = await self._open_transcript()
++                    opened = await self._open_transcript_via_title_menu()
+
+
+(Keep your panel wait right after—your code already has TRANSCRIPT_PANEL_SELECTOR logic.)
+
+Patch 4 — real direct-POST fallback using ytcfg (no dummy base64)
+
+Add/replace your direct-POST implementation to pull INNERTUBE_API_KEY, INNERTUBE_CONTEXT, and params from the page:
+
+@@ class DeterministicYouTubeiCapture:
+-    async def _direct_fetch_fallback(self):
+-        # (old dummy/base64 params) ...
++    async def _direct_fetch_fallback(self) -> Optional[str]:
++        """
++        Attempt a direct POST to /youtubei/v1/get_transcript using ytcfg contexts.
++        Returns XML string or None.
++        """
++        try:
++            api_key = await self.page.evaluate("() => (window.ytcfg && ytcfg.get && ytcfg.get('INNERTUBE_API_KEY')) || null")
++            context = await self.page.evaluate("() => (window.ytcfg && ytcfg.get && ytcfg.get('INNERTUBE_CONTEXT')) || null")
++            # Try to reuse params from any previously fired request (stored by route) or scrape it from the DOM
++            params = await self.page.evaluate("""
++                () => {
++                  try {
++                    // A number of places hold the blob; attempt a global stash first
++                    if (window.__YT_TRANSCRIPT_PARAMS__) return window.__YT_TRANSCRIPT_PARAMS__;
++                    // Fallback: search ytInitialData for the engagement panel
++                    const d = window.ytInitialData || {};
++                    const s = JSON.stringify(d);
++                    const m = s.match(/"params":"([^"]{20,})"/);
++                    return m ? m[1] : null;
++                  } catch { return null; }
++                }
++            """)
++            if not (api_key and context and params):
++                evt("youtubei_direct_missing_ctx", has_key=bool(api_key), has_ctx=bool(context), has_params=bool(params))
++                return None
++            url = f"https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false&key={api_key}"
++            body = {"context": context, "params": params}
++            # requests with proxy policy
++            import requests
++            proxies = None
++            if self.proxy_manager and self.proxy_manager.in_use:
++                try:
++                    proxies = self.proxy_manager.proxy_dict_for_job(self.job_id, "requests")
++                except Exception:
++                    proxies = None
++            enforce = os.getenv("ENFORCE_PROXY_ALL", "0").lower() in ("1","true","yes")
++            if enforce and not proxies:
++                evt("youtubei_direct_blocked", reason="enforce_proxy_no_proxy")
++                return None
++            r = requests.post(url, json=body, headers={"User-Agent":"Mozilla/5.0"}, proxies=proxies, timeout=(5,10))
++            if r.status_code != 200:
++                evt("youtubei_direct_http_error", status=r.status_code)
++                return None
++            data = r.json()
++            # pull transcript lines out of JSON structure (textRuns) and synthesize XML
++            # (keep your existing JSON→text mapping if you have it; otherwise simple join)
++            def _json_to_text(d):
++                try:
++                    actions = d.get("actions", [])
++                    for a in actions:
++                        panel = a.get("updateEngagementPanelAction", {}).get("content", {})
++                        trs = panel.get("transcriptRenderer", {}).get("content", {}).get("transcriptSearchPanelRenderer", {}).get("body", {}).get("transcriptSegmentListRenderer", {}).get("initialSegments", [])
++                        lines = []
++                        for seg in trs:
++                            r = seg.get("transcriptSegmentRenderer", {})
++                            txt = "".join(t.get("text", "") for t in r.get("snippet", {}).get("runs", []) if "text" in t).strip()
++                            if txt:
++                                lines.append(txt)
++                        return "\n".join(lines) if lines else None
++                except Exception:
++                    return None
++            text = _json_to_text(data)
++            if text:
++                self.direct_post_used = True
++                return text
++            return None
++        except Exception as e:
++            evt("youtubei_direct_exception", err=str(e)[:160])
++            return None
+
+
+Your existing route-based future remains; this POST only runs if the route didn’t deliver.
+
+2) ffmpeg_service.py
+
+Goal: (a) never do a direct (non-proxy) requests fallback when ENFORCE_PROXY_ALL=1, and (b) trim FFmpeg timeout to 60s to stop watchdog overruns.
+
+Patch 1 — lower ffmpeg timeout to 60s
+-FFMPEG_TIMEOUT = 120  # seconds
++FFMPEG_TIMEOUT = 60   # seconds
+
+Patch 2 — block non-proxy requests fallback when strict mode is on
+
+Inside your FFmpegService._requests_streaming_fallback(...) (or at the top of that method if it exists), add:
+
+@@ def _requests_streaming_fallback(...):
++        # Enforce proxy-only networking if required
++        if self.enforce_proxy:
++            # Build proxies dict the same way you do for extract attempts
++            proxies = None
++            try:
++                if self.proxy_manager and self.proxy_manager.in_use:
++                    proxies = self.proxy_manager.proxy_dict_for_job(self.job_id, "requests")
++            except Exception:
++                proxies = None
++            if not proxies:
++                evt("requests_fallback_blocked", job_id=self.job_id, reason="enforce_proxy_no_proxy")
++                return False
+
+
+This guarantees you don’t accidentally leak IPs on the fallback path.
+
+(If your _requests_streaming_fallback builds its own session in-line, put this guard before that session is created.)
+
+3) transcript_service.py
+
+Goal: (a) timedtext must verify response looks like XML before parsing (and retry once for consent/HTML), (b) YouTubei fails fast into ASR if goto times out, and (c) ASR starts playback so HLS actually appears.
+
+Patch 1 — timedtext content guards (no more “no element found” XML bombs)
+
+Add helpers near your imports:
+
++def _looks_like_xml(text: str) -> bool:
++    s = text.lstrip("\ufeff \t\r\n")
++    return s.startswith("<") and (("</" in s) or ("/>" in s))
++
++def _is_block_or_html(resp) -> bool:
++    ct = (resp.headers.get("content-type") or "").lower()
++    body = (resp.text or "")[:300].lower()
++    return ("html" in ct) or any(k in body for k in ["<html", "captcha", "consent", "access denied", "robot"])
+
+
+Wrap your timedtext list and track fetch calls (where you currently ET.fromstring(...)) with this pattern:
+
+-xml = resp.text
+-root = ET.fromstring(xml)
++txt = resp.text.strip() if resp and resp.text else ""
++if not txt:
++    evt("timedtext_empty_body"); raise ValueError("empty timedtext body")
++if _is_block_or_html(resp):
++    evt("timedtext_html_or_block"); raise ValueError("html/block page")
++if not _looks_like_xml(txt):
++    evt("timedtext_not_xml"); raise ValueError("not xml")
++root = ET.fromstring(txt.lstrip("\ufeff"))
+
+
+Add a single retry when _is_block_or_html(resp) fires: inject/ensure your CONSENT cookie (you already have cookie + storage-state infrastructure in this module) and retry once via the proxy, then give up and move to YouTubei.
+
+Patch 2 — YouTubei: fail fast into ASR when page.goto times out once
+
+Where you call into the YouTubei service (or inside extract_transcript_with_job_proxy wrapper), ensure you don’t loop the same path after a 30–60s goto timeout. Pseudocode diff:
+
+@@ def _run_youtubei_path(...):
+- result = extract_transcript_with_job_proxy(...)
+- # existing retries / long waits
++ result = extract_transcript_with_job_proxy(..., hard_timeout=YOUTUBEI_HARD_TIMEOUT)
++ if not result and "navigation timeout" in last_error.lower():
++     evt("youtubei_nav_timeout_short_circuit")
++     return ""  # jump to ASR immediately
+
+
+(Where “last_error” is whatever you log out of the YouTubei wrapper; the key is to not try the same slow path twice.)
+
+Patch 3 — ASR: start playback so HLS/MPD actually appears
+
+In your ASR HLS capture function (the Playwright path that listens for .m3u8 / videoplayback?mime=audio), start playback immediately after goto:
+
+@@ def _extract_hls_audio_url(...):
+- await page.goto(video_url, wait_until="domcontentloaded", timeout=...)
++ await page.goto(video_url, wait_until="domcontentloaded", timeout=...)
++ # Force playback to trigger manifest/audio requests
++ try:
++     await page.keyboard.press("k")  # YouTube play/pause toggle
++     await page.locator("video").first.click(timeout=2000)
++ except Exception:
++     pass
+
+
+Keep your response listeners as-is; they’ll start seeing .m3u8/audio URLs once playback begins.
+
+After applying
+
+Run unit/integration tests for transcript discovery to validate the new early-exit captionTracks path: it should succeed without opening the panel.
+
+Confirm logs now show:
+
+youtubei_captiontracks_shortcircuit when captions exist (fast path),
+
+no repeated timedtext_not_xml/ParseError,
+
+requests_fallback_blocked when strict proxy mode prevents a direct fallback,
+
+ffmpeg quits in ≤60s on dead streams,
+
+ASR > ffmpeg path receives a valid .m3u8 quickly on playable videos.

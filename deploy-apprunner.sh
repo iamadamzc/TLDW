@@ -29,10 +29,10 @@ if [[ -z "${APPRUNNER_SERVICE_ARN:-}" ]]; then
   fi
 fi
 
-# Tag for image
-GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-TIMESTAMP=$(date +%s)
-IMAGE_TAG="${GIT_SHA}-${TIMESTAMP}"
+# Unique image tag for provenance
+DATE_TAG=$(date -u +"%Y%m%d-%H%M%S")
+APP_TAG="playwright-fix-${DATE_TAG}"
+IMAGE_TAG="${APP_TAG}"
 
 REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 ECR_URI="${REGISTRY}/${ECR_REPOSITORY}"
@@ -146,16 +146,18 @@ else
   echo "🔨 Building Docker image: ${IMAGE_URI}..."
   docker build \
     --no-cache \
-    --build-arg YTDLP_VERSION=2025.8.18.232943.dev0 \
     --build-arg CACHE_BUSTER="${IMAGE_TAG}" \
     -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
 
   echo "🏷️  Tagging image for ECR..."
   docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${IMAGE_URI}"
+  docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_URI}:latest"
 
   echo "⬆️  Pushing image to ECR..."
   docker push "${IMAGE_URI}" >/dev/null || { echo "❌ Docker push failed"; exit 1; }
+  docker push "${ECR_URI}:latest" >/dev/null || { echo "❌ Latest tag push failed"; exit 1; }
   echo "✅ Pushed: ${IMAGE_URI}"
+  echo "✅ Pushed: ${ECR_URI}:latest"
 
   # (Nice) capture digest for logs
   DIGEST=$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --image-ids imageTag="${IMAGE_TAG}" --region "${AWS_REGION}" \
@@ -301,3 +303,5 @@ if [[ -n "$SERVICE_URL" && "$SERVICE_URL" != "null" ]]; then
   echo "   Health:      https://${SERVICE_URL}/healthz"
 fi
 echo "✅ New code is now running with container tag: ${IMAGE_TAG}"
+echo ""
+echo "Deployed image tag: ${APP_TAG}"

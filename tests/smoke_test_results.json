@@ -1,0 +1,49 @@
+{
+  "test_summary": {
+    "total_tests": 2,
+    "successful": 2,
+    "failed": 0,
+    "success_rate": "100.0%"
+  },
+  "performance_metrics": {
+    "avg_duration_ms": 0,
+    "avg_transcript_length": 48
+  },
+  "results_by_video": {
+    "dQw4w9WgXcQ": {
+      "success": 2,
+      "failed": 0
+    }
+  },
+  "results_by_connection": {
+    "direct": {
+      "success": 2,
+      "failed": 0
+    }
+  },
+  "results_by_source": {
+    "yt_api": 2
+  },
+  "detailed_results": [
+    {
+      "video_id": "dQw4w9WgXcQ",
+      "connection_type": "direct",
+      "user_agent_type": "desktop",
+      "success": true,
+      "transcript_source": "yt_api",
+      "transcript_length": 48,
+      "duration_ms": 1,
+      "error_message": null
+    },
+    {
+      "video_id": "dQw4w9WgXcQ",
+      "connection_type": "direct",
+      "user_agent_type": "mobile",
+      "success": true,
+      "transcript_source": "yt_api",
+      "transcript_length": 48,
+      "duration_ms": 0,
+      "error_message": null
+    }
+  ]
+}

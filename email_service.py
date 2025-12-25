@@ -5,35 +5,54 @@ from requests.exceptions import RequestException, Timeout, ConnectionError
 
 class EmailService:
     def __init__(self):
-        self.resend_api_key = os.environ.get("RESEND_API_KEY", "")
+        self.resend_api_key = os.environ.get("RESEND_API_KEY")
+        self.sender_email = os.environ.get("SENDER_EMAIL", "noreply@resend.dev")
         self.api_url = "https://api.resend.com/emails"
-        
+
         if not self.resend_api_key:
             logging.error("RESEND_API_KEY environment variable is required but not set")
-            raise ValueError("RESEND_API_KEY environment variable is required")
-        
+            raise ValueError("RESEND_API_KEY is required")
+        if not self.sender_email:
+            logging.error("No sender email available")
+            raise ValueError("SENDER_EMAIL missing")
+
         logging.info("Email service initialized successfully")
 
-    def send_digest_email(self, user_email, summaries_data):
+    def send_digest_email(self, user_email: str, items: list[dict]) -> bool:
         """
-        Send HTML email digest with video summaries
-        summaries_data: list of dicts with video info and summaries
-        """
-        if not user_email or not user_email.strip():
-            logging.error("User email is required for sending digest")
-            raise ValueError("User email is required")
+        Send consolidated digest email with flat item structure.
         
-        if not summaries_data or len(summaries_data) == 0:
-            logging.error("No summaries data provided for email digest")
-            raise ValueError("Summaries data is required")
+        Args:
+            user_email: Recipient email address
+            items: List of dicts with keys: title, thumbnail_url, video_url, summary
+            
+        Returns:
+            bool: True if email sent successfully, False otherwise
+        """
+        # Input validation with fault tolerance
+        if not isinstance(user_email, str) or not user_email.strip():
+            logging.error("Invalid user email provided")
+            return False
+        
+        if not isinstance(items, list):
+            logging.error("Items must be a list")
+            return False
+        
+        # Allow empty items list - send email saying no summaries generated
+        if len(items) == 0:
+            logging.info("No items provided - sending empty digest email")
+            items = []
 
+        # Single attempt email delivery (no retries per NFR)
         try:
             logging.info(f"Preparing to send digest email to {user_email}")
-            logging.debug(f"Number of summaries to include: {len(summaries_data)}")
-            html_content = self._generate_email_html(summaries_data)
+            logging.debug(f"Number of items to include: {len(items)}")
+            
+            # Generate HTML with fault-tolerant template
+            html_content = self._generate_email_html(items)
             
             payload = {
-                "from": "TL;DW <noreply@resend.dev>",
+                "from": f"TL;DW <{self.sender_email}>",
                 "to": [user_email],
                 "subject": "Your TL;DW Video Digest",
                 "html": html_content
@@ -46,63 +65,74 @@ class EmailService:
 
             response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
             
-            if response.status_code == 200:
-                logging.info(f"Email sent successfully to {user_email}")
+            # Check response status (accept any 2xx per NFR)
+            if 200 <= response.status_code < 300:
+                logging.info(f"Email sent successfully to {user_email} (status: {response.status_code})")
                 return True
-            elif response.status_code == 401:
-                logging.error(f"Resend API authentication failed - check API key: {response.text}")
-                raise requests.exceptions.HTTPError("Resend API authentication failed. Please check your API key.")
-            elif response.status_code == 429:
-                logging.error(f"Resend API rate limit exceeded: {response.text}")
-                raise requests.exceptions.HTTPError("Resend API rate limit exceeded. Please try again later.")
             else:
-                logging.error(f"Failed to send email: {response.status_code} - {response.text}")
-                raise requests.exceptions.HTTPError(f"Failed to send email: {response.status_code} - {response.text}")
+                # Log error but don't retry (single attempt per NFR)
+                logging.error(f"Email delivery failed: {response.status_code} - {response.text}")
+                return False
 
-        except Timeout as e:
-            logging.error(f"Timeout while sending email: {e}")
-            raise Timeout("Email service timeout. Please try again later.")
-        except ConnectionError as e:
-            logging.error(f"Connection error while sending email: {e}")
-            raise ConnectionError("Unable to connect to email service. Please check your internet connection.")
-        except RequestException as e:
-            logging.error(f"Request error while sending email: {e}")
-            raise RequestException(f"Email service request failed: {str(e)}")
         except Exception as e:
-            logging.error(f"Unexpected error sending email: {e}")
-            raise Exception(f"Unexpected error while sending email: {str(e)}")
+            # Single attempt - log error and return False (don't crash pipeline)
+            logging.error(f"Email delivery error for {user_email}: {e}")
+            return False
 
-    def _generate_email_html(self, summaries_data):
-        """Generate HTML content for the email digest"""
+    def _generate_email_html(self, items: list[dict]) -> str:
+        """
+        Generate HTML content for the email digest with fault tolerance.
         
-        # Build video cards HTML
+        Expected item structure:
+        {
+            "title": str,
+            "thumbnail_url": str, 
+            "video_url": str,
+            "summary": str
+        }
+        """
         video_cards = []
-        for data in summaries_data:
-            title = self._escape_html(data['title'])
-            channel_title = self._escape_html(data.get('channel_title', ''))
-            summary = data['summary']
-            video_url = f"https://www.youtube.com/watch?v={data['video_id']}"
-            thumbnail = data.get('thumbnail', '')
-            
-            card_html = f"""
-            <div style="background: white; margin-bottom: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); overflow: hidden; border: 1px solid #e1e5e9;">
-                <div style="padding: 24px; border-bottom: 2px solid #f0f2f5;">
-                    <img src="{thumbnail}" alt="Video thumbnail" style="width: 120px; height: 90px; object-fit: cover; border-radius: 8px; float: left; margin-right: 20px; border: 2px solid #e1e5e9;">
-                    <div style="font-size: 1.5em; font-weight: bold; margin-bottom: 12px; line-height: 1.3;">
-                        <a href="{video_url}" target="_blank" style="color: #2d3748; text-decoration: none; hover: text-decoration: underline;">{title}</a>
+        
+        for item in items:
+            try:
+                # Extract fields with safe defaults (never crash on malformed data)
+                title = self._escape_html(self._safe_get(item, "title", "(Untitled)"))
+                summary = self._escape_html(self._safe_get(item, "summary", "No transcript available."))
+                video_url = self._safe_get(item, "video_url", "#")
+                thumbnail_url = self._safe_get(item, "thumbnail_url", "")
+                
+                # Build video card HTML
+                card_html = f"""
+                <div style="background: white; margin-bottom: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); overflow: hidden; border: 1px solid #e1e5e9;">
+                    <div style="padding: 24px; border-bottom: 2px solid #f0f2f5;">
+                        {self._build_thumbnail_html(thumbnail_url)}
+                        <div style="font-size: 1.5em; font-weight: bold; margin-bottom: 12px; line-height: 1.3;">
+                            <a href="{video_url}" target="_blank" style="color: #2d3748; text-decoration: none;">{title}</a>
+                        </div>
+                        <div style="clear: both;"></div>
                     </div>
-                    <div style="color: #718096; font-size: 1.0em; font-weight: 500;">{channel_title}</div>
-                    <div style="clear: both;"></div>
+                    <div style="padding: 24px; font-size: 1.1em; line-height: 1.7; color: #4a5568;">
+                        {summary}
+                    </div>
                 </div>
-                <div style="padding: 24px; font-size: 1.1em; line-height: 1.7; color: #4a5568;">
-                    {summary}
-                </div>
+                """
+                video_cards.append(card_html)
+                
+            except Exception as e:
+                # Never crash on individual item - log and continue
+                logging.warning(f"Failed to process email item: {e}")
+                continue
+        
+        # Handle empty items case
+        if not video_cards:
+            all_videos_html = """
+            <div style="background: white; padding: 40px; border-radius: 12px; text-align: center; border: 1px solid #e1e5e9;">
+                <p style="margin: 0; color: #718096; font-size: 1.2em;">No summaries were generated for this request.</p>
+                <p style="margin: 16px 0 0 0; color: #a0aec0; font-size: 1em;">This may happen if videos don't have available transcripts.</p>
             </div>
             """
-            video_cards.append(card_html)
-        
-        # Combine all video cards
-        all_videos_html = "".join(video_cards)
+        else:
+            all_videos_html = "".join(video_cards)
         
         # Complete email HTML
         html_content = f"""
@@ -133,12 +163,44 @@ class EmailService:
         
         return html_content
     
+    def _safe_get(self, item: dict, key: str, default: str) -> str:
+        """Safely get value from item dict with default fallback"""
+        try:
+            if not isinstance(item, dict):
+                return default
+            value = item.get(key, default)
+            return str(value) if value is not None else default
+        except Exception:
+            return default
+    
+    def _build_thumbnail_html(self, thumbnail_url: str) -> str:
+        """Build thumbnail HTML with fallback for missing images"""
+        if thumbnail_url and thumbnail_url.strip():
+            return f"""
+            <img src="{thumbnail_url}" alt="Video thumbnail" 
+                 style="width: 120px; height: 90px; object-fit: cover; border-radius: 8px; 
+                        float: left; margin-right: 20px; border: 2px solid #e1e5e9;"
+                 onerror="this.style.display='none';">
+            """
+        else:
+            # Placeholder for missing thumbnail
+            return f"""
+            <div style="width: 120px; height: 90px; background: #f7fafc; border-radius: 8px; 
+                        float: left; margin-right: 20px; border: 2px solid #e1e5e9;
+                        display: flex; align-items: center; justify-content: center;">
+                <span style="color: #a0aec0; font-size: 0.8em;">No Image</span>
+            </div>
+            """
+    
     def _escape_html(self, text):
         """Escape HTML special characters"""
         if not text:
             return ""
-        return (text.replace('&', '&amp;')
-                   .replace('<', '&lt;')
-                   .replace('>', '&gt;')
-                   .replace('"', '&quot;')
-                   .replace("'", '&#x27;'))
+        try:
+            return (str(text).replace('&', '&amp;')
+                           .replace('<', '&lt;')
+                           .replace('>', '&gt;')
+                           .replace('"', '&quot;')
+                           .replace("'", '&#x27;'))
+        except Exception:
+            return ""

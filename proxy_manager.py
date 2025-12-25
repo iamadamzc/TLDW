@@ -18,6 +18,17 @@ from typing import Dict, Optional, Tuple
 import boto3
 import requests
 
+# Job-scoped session management
+_job_sessions: Dict[str, str] = {}
+_job_sessions_lock = threading.Lock()
+
+# YouTube preflight URLs for testing
+_YT_PREFLIGHT_URLS = [
+    "https://www.youtube.com/generate_204",
+    "https://i.ytimg.com/generate_204",
+    "https://redirector.googlevideo.com/generate_204",
+]
+
 # Exception hierarchy
 class ProxyError(Exception):
     """Base proxy error"""
@@ -256,6 +267,13 @@ class ProxyManager:
         self._preflight_window_start = time.time()
         self._healthy: Optional[bool] = None
         
+        # Health metrics tracking - Requirement 16.1, 16.5
+        self._preflight_hits = 0
+        self._preflight_misses = 0
+        self._preflight_total = 0
+        self._last_preflight_time: Optional[float] = None
+        self._preflight_durations = deque(maxlen=100)  # Keep last 100 durations for performance metrics
+        
         # Get secret name from environment variable for logging
         self.secret_name = os.getenv('PROXY_SECRET_NAME', 'proxy-secret')
         
@@ -332,21 +350,57 @@ class ProxyManager:
         
     @property
     def healthy(self) -> Optional[bool]:
-        """Get cached health status"""
+        """Get cached health status - Requirement 16.3"""
         if self._healthy is not None:
             return self._healthy
         cached = self.preflight_cache.get()
         return cached.healthy if cached else None
+    
+    def _get_masked_username_tail(self) -> str:
+        """Get masked username tail for identification - Requirement 16.2"""
+        if not self.secret or not self.secret.username:
+            return "***"
+        
+        username = self.secret.username
+        if len(username) <= 4:
+            return "***"
+        
+        # Show last 4 characters for identification
+        return f"...{username[-4:]}"
+    
+    def get_preflight_metrics(self) -> Dict[str, any]:
+        """Get preflight performance metrics - Requirement 16.5"""
+        hit_rate = (self._preflight_hits / self._preflight_total) if self._preflight_total > 0 else 0.0
+        
+        # Calculate average duration from recent preflights
+        avg_duration_ms = 0.0
+        if self._preflight_durations:
+            avg_duration_ms = sum(self._preflight_durations) / len(self._preflight_durations) * 1000
+        
+        return {
+            "preflight_hits": self._preflight_hits,
+            "preflight_misses": self._preflight_misses,
+            "preflight_total": self._preflight_total,
+            "hit_rate": round(hit_rate, 3),
+            "avg_duration_ms": round(avg_duration_ms, 2),
+            "last_check_time": self._last_preflight_time,
+            "proxy_username_tail": self._get_masked_username_tail(),
+            "healthy": self.healthy
+        }
         
     def preflight(self, timeout: float = 5.0) -> bool:
-        """Perform cached preflight check with stampede control"""
+        """Perform cached preflight check with comprehensive metrics - Requirements 16.1, 16.4, 16.5"""
+        start_time = time.time()
+        
         if not self.in_use or self.secret is None:
-            self.logger.log_event("info", "Proxy not in use, skipping preflight")
+            self.logger.log_event("info", "Proxy not in use, skipping preflight", 
+                                proxy_available=False, username_tail="N/A")
             self._healthy = False
             return False
             
         if self.preflight_disabled:
-            self.logger.log_event("info", "Proxy preflight disabled via OXY_PREFLIGHT_DISABLED")
+            self.logger.log_event("info", "Proxy preflight disabled via OXY_PREFLIGHT_DISABLED",
+                                proxy_available=True, username_tail=self._get_masked_username_tail())
             self._healthy = True
             return True
             
@@ -359,15 +413,29 @@ class ProxyManager:
         max_per_minute = int(os.getenv("OXY_PREFLIGHT_MAX_PER_MINUTE", "10"))
         if self._preflight_count >= max_per_minute:
             cached = self.preflight_cache.get()
+            self.logger.log_event("info", "Preflight rate limited, using cached result",
+                                cached_healthy=cached.healthy if cached else None,
+                                username_tail=self._get_masked_username_tail())
             return cached.healthy if cached else False
             
         with self._preflight_lock:  # Single-flight
             cached = self.preflight_cache.get()
             if cached and not self.preflight_cache.is_expired():
                 self._healthy = cached.healthy
+                # Log cache hit - Requirement 16.1
+                self._preflight_hits += 1
+                self._preflight_total += 1
+                self.logger.log_event("info", "Preflight cache hit",
+                                    cached_healthy=cached.healthy,
+                                    username_tail=self._get_masked_username_tail(),
+                                    cache_age_seconds=int((datetime.utcnow() - cached.timestamp).total_seconds()))
                 return cached.healthy
             
+            # Cache miss - perform actual preflight - Requirement 16.1
+            self._preflight_misses += 1
+            self._preflight_total += 1
             self._preflight_count += 1
+            self._last_preflight_time = now
             
             # Perform actual preflight with enhanced out-of-band validation
             proxies = self.proxies_for(None)
@@ -379,50 +447,91 @@ class ProxyManager:
             
             session_token = extract_session_from_proxies(proxies)
             
-            # Enhanced: Test with httpbin.org/ip first for pure proxy validation
             try:
+                # Enhanced: Test with httpbin.org/ip first for pure proxy validation
                 r = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=timeout)
                 if r.status_code == 200:
-                    # Log proxy validation success with masked username
+                    # Log proxy validation success with masked username - Requirement 16.2, 16.4
                     proxy_username = extract_session_from_proxies(proxies)
                     masked_username = f"...{proxy_username[-4:]}" if len(proxy_username) > 4 else "***"
-                    self.logger.log_event("info", f"Proxy out-of-band validation ok: httpbin returned 200, proxy_user={masked_username}")
+                    self.logger.log_event("info", "Proxy out-of-band validation ok: httpbin returned 200",
+                                        proxy_user_tail=masked_username,
+                                        username_tail=self._get_masked_username_tail())
                     
                     # Continue with YouTube-specific validation
                     for url in ("https://www.youtube.com/generate_204", "https://httpbin.org/status/204"):
                         try:
                             r = requests.get(url, proxies=proxies, timeout=timeout)
                             if r.status_code == 204:
+                                duration = time.time() - start_time
+                                self._preflight_durations.append(duration)
+                                
                                 self.preflight_cache.set(True)
                                 self._healthy = True
-                                self.logger.log_event("info", "Proxy preflight ok: status=204")
+                                
+                                # Structured logging with performance metrics - Requirement 16.4, 16.5
+                                self.logger.log_event("info", "Proxy preflight successful",
+                                                    status_code=204,
+                                                    duration_ms=round(duration * 1000, 2),
+                                                    username_tail=self._get_masked_username_tail(),
+                                                    hit_rate=round(self._preflight_hits / self._preflight_total, 3),
+                                                    total_checks=self._preflight_total)
                                 return True
                             if r.status_code in (401, 407):
+                                duration = time.time() - start_time
+                                self._preflight_durations.append(duration)
+                                
                                 self.preflight_cache.set(False, f"auth_{r.status_code}")
                                 self._healthy = False
-                                self.logger.log_event("warning", f"Proxy preflight auth failed: status={r.status_code}")
+                                
+                                # Log auth failure with metrics - Requirement 16.4
+                                self.logger.log_event("warning", "Proxy preflight auth failed",
+                                                    status_code=r.status_code,
+                                                    duration_ms=round(duration * 1000, 2),
+                                                    username_tail=self._get_masked_username_tail(),
+                                                    error_type="auth_failure")
                                 raise ProxyAuthError(f"proxy_auth_failed_{r.status_code}")
                             r.raise_for_status()
                         except requests.RequestException as e:
                             continue  # Try next URL
                     
                     # All YouTube URLs failed but httpbin worked - likely YouTube blocking
+                    duration = time.time() - start_time
+                    self._preflight_durations.append(duration)
+                    
                     self.preflight_cache.set(False, "youtube_blocked")
                     self._healthy = False
+                    
+                    self.logger.log_event("warning", "YouTube endpoints blocked but httpbin accessible",
+                                        duration_ms=round(duration * 1000, 2),
+                                        username_tail=self._get_masked_username_tail(),
+                                        error_type="youtube_blocked")
                     raise ProxyConfigError("proxy_preflight_youtube_blocked")
                     
                 elif r.status_code in (401, 407):
                     # Proxy auth failed at httpbin level - definitive failure
+                    duration = time.time() - start_time
+                    self._preflight_durations.append(duration)
+                    
                     self.preflight_cache.set(False, f"httpbin_auth_{r.status_code}")
                     self._healthy = False
-                    self.logger.log_event("warning", f"Proxy auth failed at httpbin: status={r.status_code}")
+                    
+                    self.logger.log_event("warning", "Proxy auth failed at httpbin level",
+                                        status_code=r.status_code,
+                                        duration_ms=round(duration * 1000, 2),
+                                        username_tail=self._get_masked_username_tail(),
+                                        error_type="httpbin_auth_failure")
                     raise ProxyAuthError(f"proxy_auth_failed_{r.status_code}")
                 else:
                     # Unexpected httpbin response
-                    self.logger.log_event("warning", f"Unexpected httpbin response: {r.status_code}")
+                    self.logger.log_event("warning", "Unexpected httpbin response",
+                                        status_code=r.status_code,
+                                        username_tail=self._get_masked_username_tail())
                     
             except requests.RequestException as e:
-                self.logger.log_event("warning", f"Httpbin preflight failed: {e}")
+                self.logger.log_event("warning", "Httpbin preflight failed, falling back to YouTube-only validation",
+                                    error=str(e),
+                                    username_tail=self._get_masked_username_tail())
                 # Fall back to original YouTube-only validation
                 pass
             
@@ -432,14 +541,30 @@ class ProxyManager:
                 try:
                     r = requests.get(url, proxies=proxies, timeout=timeout)
                     if r.status_code == 204:
+                        duration = time.time() - start_time
+                        self._preflight_durations.append(duration)
+                        
                         self.preflight_cache.set(True)
                         self._healthy = True
-                        self.logger.log_event("info", "Proxy preflight ok: status=204 (fallback)")
+                        
+                        self.logger.log_event("info", "Proxy preflight successful (fallback)",
+                                            status_code=204,
+                                            duration_ms=round(duration * 1000, 2),
+                                            username_tail=self._get_masked_username_tail(),
+                                            validation_method="fallback")
                         return True
                     if r.status_code in (401, 407):
+                        duration = time.time() - start_time
+                        self._preflight_durations.append(duration)
+                        
                         self.preflight_cache.set(False, f"auth_{r.status_code}")
                         self._healthy = False
-                        self.logger.log_event("warning", f"Proxy preflight auth failed: status={r.status_code}")
+                        
+                        self.logger.log_event("warning", "Proxy preflight auth failed (fallback)",
+                                            status_code=r.status_code,
+                                            duration_ms=round(duration * 1000, 2),
+                                            username_tail=self._get_masked_username_tail(),
+                                            error_type="auth_failure")
                         raise ProxyAuthError(f"proxy_auth_failed_{r.status_code}")
                     r.raise_for_status()
                 except requests.RequestException as e:
@@ -447,8 +572,19 @@ class ProxyManager:
                     continue
             
             # All URLs failed
+            duration = time.time() - start_time
+            self._preflight_durations.append(duration)
+            
             self.preflight_cache.set(False, str(last_err) if last_err else "unknown")
             self._healthy = False
+            
+            # Comprehensive failure logging - Requirement 16.4, 16.5
+            self.logger.log_event("error", "All proxy preflight endpoints failed",
+                                duration_ms=round(duration * 1000, 2),
+                                username_tail=self._get_masked_username_tail(),
+                                last_error=str(last_err) if last_err else "unknown",
+                                error_type="all_endpoints_failed",
+                                hit_rate=round(self._preflight_hits / self._preflight_total, 3))
             raise ProxyConfigError(f"proxy_preflight_unreachable: {last_err}")
         
     def proxies_for(self, video_id: Optional[str] = None) -> Dict[str, str]:
@@ -474,15 +610,422 @@ class ProxyManager:
             return f"{video_hash}{base_token}"
         return base_token
         
-    def rotate_session(self, failed_token: str):
-        """Blacklist failed session and force new token"""
+    def proxy_url(self, sticky: bool = True) -> Optional[str]:
+        """
+        Return a full URL with auth, e.g. http://user:pass@pr.oxylabs.io:10000
+        Return None if proxies disabled/unavailable.
+        """
+        if not self.in_use or not self.secret:
+            return None
+        token = self._generate_session_token()
+        return self.secret.build_proxy_url(token)
+
+    def proxy_dict_for(self, client: str = "requests", sticky: bool = True):
+        """
+        Unified proxy configuration for different client types.
+        
+        Args:
+            client: Client type - "requests" or "playwright"
+            sticky: Whether to use sticky session (default: True)
+            
+        Returns:
+            requests  -> {"http": url, "https": url}
+            playwright-> {"server": "http://host:port", "username": "...", "password": "..."}
+            None if proxy not available or client type unsupported
+        """
+        # Validate client type first
+        supported_clients = ["requests", "playwright"]
+        if client not in supported_clients:
+            self.logger.log_event("error", f"Unsupported proxy client type: {client}", 
+                                client_type=client, supported_clients=supported_clients)
+            # Fallback to requests format for unknown clients
+            self.logger.log_event("info", f"Falling back to requests format for unsupported client: {client}")
+            client = "requests"
+        
+        # Get proxy URL
+        try:
+            url = self.proxy_url(sticky=sticky)
+            if not url:
+                self.logger.log_event("debug", f"No proxy URL available for client: {client}")
+                return None
+
+            if client == "requests":
+                proxy_dict = {"http": url, "https": url}
+                self.logger.log_event("debug", f"Generated requests proxy dict for client: {client}")
+                return proxy_dict
+
+            if client == "playwright":
+                from urllib.parse import urlparse
+                try:
+                    u = urlparse(url)
+                    server = f"{u.scheme}://{u.hostname}:{u.port}"
+                    proxy_dict = {
+                        "server": server,
+                        "username": u.username or "",
+                        "password": u.password or ""
+                    }
+                    self.logger.log_event("debug", f"Generated playwright proxy dict for client: {client}")
+                    return proxy_dict
+                except Exception as e:
+                    self.logger.log_event("error", f"Failed to parse proxy URL for playwright: {e}", 
+                                        client_type=client, error_type=type(e).__name__)
+                    # Fallback to None for playwright parsing errors
+                    return None
+                    
+        except Exception as e:
+            self.logger.log_event("error", f"Failed to generate proxy dict for client {client}: {e}", 
+                                client_type=client, error_type=type(e).__name__)
+            # Return appropriate fallback based on client type
+            if client == "requests":
+                return {}  # Empty dict allows requests to work without proxy
+            else:  # playwright
+                return None  # None disables proxy for playwright
+        
+        # This should never be reached, but provide fallback
+        self.logger.log_event("warning", f"Unexpected code path in proxy_dict_for for client: {client}")
+        return None
+
+    def playwright_proxy(self) -> dict | None:
+        """
+        Returns Playwright proxy dict: {"server": "...", "username": "...", "password": "..."}
+        or None if proxies disabled.
+        """
+        proxy_url = self.proxy_url()
+        if not proxy_url:
+            return None
+        # Parse URL to components for Playwright
+        from urllib.parse import urlparse
+        u = urlparse(proxy_url)
+        auth = u.username, u.password
+        return {
+            "server": f"{u.scheme}://{u.hostname}:{u.port}",
+            **({"username": auth[0], "password": auth[1]} if all(auth) else {})
+        }
+
+    def is_production_environment(self) -> bool:
+        """Detect if running in production environment."""
+        return os.getenv('ENVIRONMENT') == 'production' or os.getenv('AWS_REGION') is not None
+
+    def rotate_session(self, failed_token: Optional[str] = None):
+        """Enhanced session rotation with automatic token extraction"""
         if not self.in_use or self.secret is None:
             self.logger.log_event("debug", "Proxy not in use, skipping session rotation")
+            return
+        
+        # If no token provided, generate a new one to force rotation
+        if failed_token is None:
+            # Clear preflight cache to force re-validation
+            self.preflight_cache = PreflightCache()
+            self._healthy = None
+            self.logger.log_event("info", "Session rotation requested: clearing preflight cache")
             return
             
         # Only log last 4 chars to prevent token leakage
         self.logger.log_event("info", f"Blacklisting session: ...{failed_token[-4:]}")
         self.session_blacklist.add(failed_token)
+        
+        # Clear preflight cache when rotating due to failures
+        self.preflight_cache = PreflightCache()
+        self._healthy = None
+
+    def _rotate(self):
+        """Best-effort session rotation implementation (e.g., Oxylabs sessid bump)"""
+        try:
+            # This is a placeholder for provider-specific rotation logic
+            # For Oxylabs, this could involve session ID manipulation
+            # For now, we just clear caches and force new session generation
+            self.preflight_cache = PreflightCache()
+            self._healthy = None
+            self.logger.log_event("info", "Internal session rotation completed")
+        except Exception as e:
+            self.logger.log_event("warning", f"Session rotation failed: {e}")
+
+    def proxy_env_for_subprocess(self) -> Dict[str, str]:
+        """Return environment variables for subprocess proxy configuration"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available, returning empty environment")
+            return {}
+        
+        try:
+            # Generate a fresh session token for subprocess
+            token = self._generate_session_token("subprocess")
+            proxy_url = self.secret.build_proxy_url(token)
+            
+            # Return standard proxy environment variables
+            env_vars = {
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url
+            }
+            
+            self.logger.log_event("debug", "Generated proxy environment variables for subprocess")
+            return env_vars
+            
+        except Exception as e:
+            self.logger.log_event("error", f"Failed to generate proxy environment variables: {e}")
+            return {}
+
+    def for_job(self, job_id: str) -> str:
+        """
+        Get or create a sticky session ID for a specific job.
+        
+        This ensures one proxy identity per job across all stages:
+        - Requests (Transcript API, timedtext)
+        - Playwright (--proxy-server or context proxy)
+        - ffmpeg (-http_proxy and env)
+        
+        Args:
+            job_id: Unique job identifier
+            
+        Returns:
+            Session ID that will be consistent for this job
+        """
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available for job", job_id=job_id)
+            return ""
+        
+        with _job_sessions_lock:
+            if job_id not in _job_sessions:
+                # Generate deterministic session ID based on job_id
+                session_hash = hashlib.sha256(job_id.encode()).hexdigest()[:12]
+                _job_sessions[job_id] = session_hash
+                
+                self.logger.log_event("info", "Created sticky session for job", 
+                                    job_id=job_id, 
+                                    session_hash=session_hash[:8] + "***",  # Mask for security
+                                    username_tail=self._get_masked_username_tail())
+            
+            return _job_sessions[job_id]
+    
+    def proxies_for_job(self, job_id: str) -> Dict[str, str]:
+        """
+        Get proxy configuration with job-scoped sticky session.
+        
+        Args:
+            job_id: Unique job identifier
+            
+        Returns:
+            Proxy dictionary for requests library
+        """
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available for job", job_id=job_id)
+            return {}
+        
+        session_id = self.for_job(job_id)
+        if not session_id:
+            return {}
+        
+        # Ensure we don't reuse blacklisted tokens
+        if session_id in self.session_blacklist:
+            self.logger.log_event("warning", "Job session blacklisted, generating new session", 
+                                job_id=job_id, session_hash=session_id[:8] + "***")
+            # Remove from job sessions to force regeneration
+            with _job_sessions_lock:
+                _job_sessions.pop(job_id, None)
+            # Recursively call to get new session
+            return self.proxies_for_job(job_id)
+        
+        proxy_url = self.secret.build_proxy_url(session_id)
+        return {"http": proxy_url, "https": proxy_url}
+    
+    def proxy_dict_for_job(self, job_id: str, client: str = "requests") -> Optional[Dict[str, str]]:
+        """
+        Get proxy configuration for specific client type with job-scoped sticky session.
+        
+        Args:
+            job_id: Unique job identifier
+            client: Client type - "requests" or "playwright"
+            
+        Returns:
+            Client-specific proxy configuration
+        """
+        if not self.in_use or self.secret is None:
+            return None if client == "playwright" else {}
+        
+        session_id = self.for_job(job_id)
+        if not session_id:
+            return None if client == "playwright" else {}
+        
+        # Check blacklist
+        if session_id in self.session_blacklist:
+            self.logger.log_event("warning", "Job session blacklisted for client", 
+                                job_id=job_id, client=client, session_hash=session_id[:8] + "***")
+            # Remove from job sessions to force regeneration
+            with _job_sessions_lock:
+                _job_sessions.pop(job_id, None)
+            # Recursively call to get new session
+            return self.proxy_dict_for_job(job_id, client)
+        
+        proxy_url = self.secret.build_proxy_url(session_id)
+        
+        if client == "requests":
+            return {"http": proxy_url, "https": proxy_url}
+        elif client == "playwright":
+            try:
+                from urllib.parse import urlparse
+                u = urlparse(proxy_url)
+                server = f"{u.scheme}://{u.hostname}:{u.port}"
+                return {
+                    "server": server,
+                    "username": u.username or "",
+                    "password": u.password or ""
+                }
+            except Exception as e:
+                self.logger.log_event("error", f"Failed to parse proxy URL for playwright job", 
+                                    job_id=job_id, error_type=type(e).__name__)
+                return None
+        else:
+            self.logger.log_event("error", f"Unsupported client type for job", 
+                                job_id=job_id, client=client)
+            return None
+    
+    def proxy_env_for_job(self, job_id: str) -> Dict[str, str]:
+        """
+        Get proxy environment variables for subprocess with job-scoped sticky session.
+        
+        Args:
+            job_id: Unique job identifier
+            
+        Returns:
+            Environment variables for subprocess proxy configuration
+        """
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("debug", "Proxy not available for job subprocess", job_id=job_id)
+            return {}
+        
+        session_id = self.for_job(job_id)
+        if not session_id:
+            return {}
+        
+        # Check blacklist
+        if session_id in self.session_blacklist:
+            self.logger.log_event("warning", "Job session blacklisted for subprocess", 
+                                job_id=job_id, session_hash=session_id[:8] + "***")
+            # Remove from job sessions to force regeneration
+            with _job_sessions_lock:
+                _job_sessions.pop(job_id, None)
+            # Recursively call to get new session
+            return self.proxy_env_for_job(job_id)
+        
+        try:
+            proxy_url = self.secret.build_proxy_url(session_id)
+            
+            # Return standard proxy environment variables
+            env_vars = {
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "all_proxy": proxy_url  # Some tools check this
+            }
+            
+            self.logger.log_event("debug", "Generated job-scoped proxy environment variables", 
+                                job_id=job_id, session_hash=session_id[:8] + "***")
+            return env_vars
+            
+        except Exception as e:
+            self.logger.log_event("error", f"Failed to generate job proxy environment variables", 
+                                job_id=job_id, error_type=type(e).__name__)
+            return {}
+    
+    def cleanup_job_session(self, job_id: str):
+        """
+        Clean up job-scoped session when job completes.
+        
+        Args:
+            job_id: Job identifier to clean up
+        """
+        with _job_sessions_lock:
+            if job_id in _job_sessions:
+                session_hash = _job_sessions.pop(job_id)
+                self.logger.log_event("info", "Cleaned up job session", 
+                                    job_id=job_id, session_hash=session_hash[:8] + "***")
+
+    def emit_health_status(self) -> None:
+        """Emit structured health status logs without credential leakage - Requirement 16.4"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("info", "Proxy health status: not configured",
+                                proxy_available=False,
+                                healthy=False,
+                                username_tail="N/A")
+            return
+        
+        metrics = self.get_preflight_metrics()
+        
+        # Emit comprehensive health status - Requirement 16.4, 16.5
+        self.logger.log_event("info", "Proxy health status report",
+                            healthy=metrics["healthy"],
+                            username_tail=metrics["proxy_username_tail"],
+                            hit_rate=metrics["hit_rate"],
+                            total_checks=metrics["preflight_total"],
+                            avg_duration_ms=metrics["avg_duration_ms"],
+                            last_check_timestamp=metrics["last_check_time"],
+                            provider=self.secret.provider if self.secret else "unknown")
+
+    def youtube_preflight(self, timeout: float = 5.0) -> bool:
+        """YouTube-specific preflight check with enhanced validation"""
+        if not self.in_use or self.secret is None:
+            self.logger.log_event("info", "Proxy not in use, skipping YouTube preflight (OK)")
+            return True
+            
+        if self.preflight_disabled:
+            self.logger.log_event("info", "YouTube preflight disabled via OXY_PREFLIGHT_DISABLED")
+            return True
+        
+        # Use existing rate limiting and caching infrastructure
+        with self._preflight_lock:
+            # Check if we have a recent YouTube-specific result
+            cached = self.preflight_cache.get()
+            if cached and not self.preflight_cache.is_expired():
+                return cached.healthy
+            
+            self._preflight_count += 1
+            
+            # Generate fresh session for YouTube testing
+            proxies = self.proxies_for("youtube_preflight")
+            
+            # YouTube-specific endpoints in order of preference
+            youtube_endpoints = [
+                "https://www.youtube.com/generate_204",
+                "https://m.youtube.com/generate_204", 
+                "https://www.youtube.com/favicon.ico"  # Fallback
+            ]
+            
+            last_error = None
+            for endpoint in youtube_endpoints:
+                try:
+                    r = requests.get(endpoint, proxies=proxies, timeout=timeout, 
+                                   headers={"User-Agent": "Mozilla/5.0 (compatible; TLDW/1.0)"})
+                    
+                    if r.status_code in (200, 204):
+                        self.preflight_cache.set(True)
+                        self._healthy = True
+                        self.logger.log_event("info", f"YouTube preflight ok: {endpoint} returned {r.status_code}")
+                        return True
+                    elif r.status_code in (401, 407):
+                        # Definitive auth failure
+                        self.preflight_cache.set(False, f"youtube_auth_{r.status_code}")
+                        self._healthy = False
+                        self.logger.log_event("warning", f"YouTube preflight auth failed: {endpoint} returned {r.status_code}")
+                        raise ProxyAuthError(f"youtube_proxy_auth_failed_{r.status_code}")
+                    elif r.status_code == 429:
+                        # Rate limited - might be temporary
+                        self.logger.log_event("warning", f"YouTube preflight rate limited: {endpoint}")
+                        last_error = f"rate_limited_{r.status_code}"
+                        continue
+                    else:
+                        # Other error codes - try next endpoint
+                        self.logger.log_event("debug", f"YouTube preflight unexpected status: {endpoint} returned {r.status_code}")
+                        last_error = f"unexpected_status_{r.status_code}"
+                        continue
+                        
+                except requests.RequestException as e:
+                    self.logger.log_event("debug", f"YouTube preflight request failed: {endpoint} - {e}")
+                    last_error = str(e)
+                    continue
+            
+            # All endpoints failed
+            self.preflight_cache.set(False, last_error or "all_endpoints_failed")
+            self._healthy = False
+            self.logger.log_event("warning", f"YouTube preflight failed: all endpoints unreachable - {last_error}")
+            return False
 
 # Helper functions for health endpoints and error responses
 def generate_correlation_id() -> str:
@@ -569,6 +1112,50 @@ def error_response(code: str, correlation_id: str, message: Optional[str] = None
 
 # Status codes that trigger session rotation
 BLOCK_STATUSES = {401, 403, 407, 429}
+
+def ensure_proxy_session(job_id: str, video_id: str):
+    """Ensure consistent proxy session for a job"""
+    # Import here to avoid circular imports
+    from shared_managers import shared_managers
+    
+    # Get ENFORCE_PROXY_ALL from environment
+    ENFORCE_PROXY_ALL = os.getenv("ENFORCE_PROXY_ALL", "false").lower() == "true"
+    
+    if not ENFORCE_PROXY_ALL:
+        return None
+        
+    try:
+        # Get or create sticky session for this job
+        session_id = f"yt_{job_id}_{video_id}"
+        proxy_config = shared_managers.get_proxy_manager().for_job(session_id)
+        
+        # Verify proxy is working
+        if not _verify_proxy_connection(proxy_config):
+            # Rotate proxy if current one is blocked
+            shared_managers.get_proxy_manager().rotate_session(session_id)
+            proxy_config = shared_managers.get_proxy_manager().for_job(session_id)
+            
+        return proxy_config
+    except Exception as e:
+        logging.error(f"Proxy session setup failed: {e}")
+        return None
+
+def _verify_proxy_connection(proxy_config):
+    """Quick check if proxy can access YouTube"""
+    # If no proxy config is provided, return False as we can't verify
+    if not proxy_config or not any(proxy_config.values()):
+        return False
+        
+    try:
+        test_url = "https://www.youtube.com/generate_204"
+        response = requests.get(
+            test_url, 
+            proxies=proxy_config,
+            timeout=10
+        )
+        return response.status_code == 204
+    except:
+        return False
 
 # Legacy compatibility - keep existing interface for gradual migration
 class ProxySession:

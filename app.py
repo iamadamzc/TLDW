@@ -1,19 +1,21 @@
 import os
 import logging
 
-from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.orm import DeclarativeBase
+from flask import Flask, jsonify
+from transcript_metrics import snapshot as transcript_metrics_snapshot
+from database import db
 from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_login import LoginManager
 
-# Set up logging for debugging
-logging.basicConfig(level=logging.DEBUG)
+# Import version marker
+from transcript_service import APP_VERSION
 
-class Base(DeclarativeBase):
-    pass
-
-db = SQLAlchemy(model_class=Base)
+# Configure minimal JSON logging
+from logging_setup import configure_logging
+configure_logging(
+    log_level=os.getenv("LOG_LEVEL", "INFO"),
+    use_json=os.getenv("USE_MINIMAL_LOGGING", "true").lower() == "true"
+)
 
 # create the app
 app = Flask(__name__)
@@ -77,20 +79,6 @@ def _check_dependencies():
     except Exception as e:
         dependencies['ffprobe'] = {'available': False, 'error': str(e)}
     
-    # Check yt-dlp
-    try:
-        import yt_dlp
-        version = yt_dlp.version.__version__
-        dependencies['yt_dlp'] = {
-            'available': True,
-            'version': version
-        }
-        # Structured JSON logging for yt-dlp version
-        logging.info(f'{{"component": "yt_dlp", "version": "{version}", "status": "loaded"}}')
-    except Exception as e:
-        dependencies['yt_dlp'] = {'available': False, 'error': str(e)}
-        logging.error(f'{{"component": "yt_dlp", "version": null, "status": "failed", "error": "{str(e)}"}}')
-    
     return dependencies
 
 def update_download_metadata(used_cookies=False, client_used="unknown"):
@@ -135,7 +123,6 @@ def _log_startup_dependencies():
     logging.info(f"Working directory: {os.getcwd()}")
     
     # Quick PATH check for critical binaries
-    logging.info(f"yt-dlp: {shutil.which('yt-dlp')}")
     logging.info(f"ffmpeg: {shutil.which('ffmpeg')}")
     logging.info(f"ffprobe: {shutil.which('ffprobe')}")
     
@@ -143,9 +130,9 @@ def _log_startup_dependencies():
     try:
         subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         subprocess.run(["ffprobe", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-        logging.info("✅ ffmpeg/ffprobe execution test passed")
+        logging.info("[OK] ffmpeg/ffprobe execution test passed")
     except Exception as e:
-        logging.error(f"❌ FFMPEG_NOT_AVAILABLE: {e}")
+        logging.error(f"[ERROR] FFMPEG_NOT_AVAILABLE: {e}")
     
     dependencies = _check_dependencies()
     
@@ -153,10 +140,10 @@ def _log_startup_dependencies():
         if dep_info['available']:
             version = dep_info.get('version', 'unknown')
             path = dep_info.get('path', 'python module')
-            logging.info(f"✅ {dep_name}: {version} (at {path})")
+            logging.info(f"[OK] {dep_name}: {version} (at {path})")
         else:
             error = dep_info.get('error', 'unknown error')
-            logging.error(f"❌ {dep_name}: NOT AVAILABLE - {error}")
+            logging.error(f"[ERROR] {dep_name}: NOT AVAILABLE - {error}")
     
     # Check if critical dependencies are missing
     critical_missing = []
@@ -164,16 +151,14 @@ def _log_startup_dependencies():
         critical_missing.append('ffmpeg')
     if not dependencies.get('ffprobe', {}).get('available'):
         critical_missing.append('ffprobe')
-    if not dependencies.get('yt_dlp', {}).get('available'):
-        critical_missing.append('yt-dlp')
     
     if critical_missing:
-        logging.error(f"🚨 CRITICAL: Missing dependencies {critical_missing} - ASR functionality will fail!")
-        logging.error("🔧 Install missing dependencies or check container build process")
+        logging.error(f"[CRITICAL] Missing dependencies {critical_missing} - ASR functionality will fail!")
+        logging.error("[CRITICAL] Install missing dependencies or check container build process")
         # Don't fail startup for missing dependencies - let health check handle it
         # This allows the service to start and report issues via /health endpoint
     else:
-        logging.info("✅ All critical dependencies available - ASR functionality ready")
+        logging.info("[OK] All critical dependencies available - ASR functionality ready")
     
     logging.info("=== End Dependency Check ===")
     
@@ -182,7 +167,18 @@ def _log_startup_dependencies():
 with app.app_context():
     # Import models to ensure tables are created
     import models  # noqa: F401
-    db.create_all()
+    
+    # Safe database initialization to prevent race conditions between gunicorn workers
+    try:
+        db.create_all()
+        logging.info("Database tables created successfully")
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "already exists" in error_msg or "duplicate" in error_msg:
+            logging.info("Database tables already exist, skipping creation")
+        else:
+            logging.error(f"Database initialization failed: {e}")
+            raise
     
     # Initialize download metadata tracking
     app.last_download_meta = {
@@ -191,17 +187,62 @@ with app.app_context():
         "timestamp": None
     }
     
+    # Log application version on startup
+    logging.info(f"App boot version: {APP_VERSION}")
+    
     # Log dependency status on startup
     _log_startup_dependencies()
+    
+    # Validate configuration on startup
+    from config_validator import validate_startup_config
+    config_valid = validate_startup_config()
+    
+    if not config_valid:
+        logging.warning("[WARNING] Application starting with configuration issues - some features may not work properly")
+    
+    # Setup secure logging with credential redaction
+    from security_manager import setup_secure_logging
+    setup_secure_logging()
 
 # Import and register blueprints
 from google_auth import google_auth
 from routes import main_routes
 from cookies_routes import bp_cookies
 
+# Setup after_request handlers before registering blueprints (Fix F)
+@app.after_request
+def after_request(response):
+    """Global after_request handler setup before blueprint registration."""
+    response.headers.add('X-Content-Type-Options', 'nosniff')
+    response.headers.add('X-Frame-Options', 'DENY')
+    response.headers.add('X-XSS-Protection', '1; mode=block')
+    return response
+
 app.register_blueprint(google_auth)
 app.register_blueprint(main_routes)
 app.register_blueprint(bp_cookies)
+
+# Register dashboard integration with registration guard (Fix F)
+_dashboard_registered = False
+if not _dashboard_registered:
+    try:
+        from dashboard_integration import register_dashboard_routes
+        register_dashboard_routes(app)
+        _dashboard_registered = True
+        logging.info("Dashboard integration registered successfully")
+    except Exception as e:
+        logging.warning(f"Failed to register dashboard integration: {e}")
+
+# Structured logging is now initialized via configure_logging() at startup
+# Backward compatibility maintained through feature flag USE_MINIMAL_LOGGING
+
+# Initialize performance monitoring
+try:
+    from performance_monitor import get_performance_monitor
+    performance_monitor = get_performance_monitor()
+    logging.info("Performance monitoring initialized")
+except Exception as e:
+    logging.warning(f"Failed to initialize performance monitoring: {e}")
 
 # Add new health endpoints for proxy monitoring
 @app.route('/health/live')
@@ -278,81 +319,18 @@ def health_check_apprunner():
     
     # Detailed diagnostics only when explicitly enabled (default off for security)
     if os.getenv('EXPOSE_HEALTH_DIAGNOSTICS', 'false').lower() == 'true':
-        try:
-            import yt_dlp
-            yt_dlp_version = yt_dlp.version.__version__
-        except:
-            yt_dlp_version = "unknown"
         
         # Check ffmpeg availability (boolean only, no path exposure)
-        ffmpeg_available = os.path.exists("/usr/bin/ffmpeg")
-        
-        # Get proxy status from ProxyManager if available
-        proxy_in_use = False
-        try:
-            import json
-            from proxy_manager import ProxyManager
-            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
-            if raw_config:
-                secret_data = json.loads(raw_config)
-                proxy_manager = ProxyManager(secret_data, logging.getLogger(__name__))
-                proxy_in_use = proxy_manager.in_use
-        except:
-            proxy_in_use = False
-        
-        # Get last download metadata (without sensitive data)
-        last_download_meta = getattr(app, 'last_download_meta', {})
-        
-        # Get comprehensive download attempt metadata
-        download_attempt_meta = {}
-        try:
-            from download_attempt_tracker import get_download_health_metadata
-            download_attempt_meta = get_download_health_metadata()
-        except ImportError:
-            # download_attempt_tracker not available
-            pass
-        except Exception:
-            # Don't fail health check on tracking errors
-            pass
+        import shutil
+        ffmpeg_available = bool(shutil.which("ffmpeg"))
         
         basic_health.update({
-            "yt_dlp_version": yt_dlp_version,
             "ffmpeg_available": ffmpeg_available,
-            "proxy_in_use": proxy_in_use,
-            "last_download_used_cookies": last_download_meta.get("used_cookies", False),
-            "last_download_client": last_download_meta.get("client_used", "unknown"),
-            "download_attempts": download_attempt_meta,
-            "timestamp": datetime.utcnow().isoformat()
+            "transcript_metrics": transcript_metrics_snapshot(),
         })
     
-    return basic_health, 200
+    return jsonify(basic_health), 200
 
-@app.route('/health/yt-dlp')
-def yt_dlp_health():
-    """Specific yt-dlp diagnostics endpoint"""
-    try:
-        import yt_dlp
-        
-        # Get proxy status
-        proxy_in_use = False
-        try:
-            import json
-            from proxy_manager import ProxyManager
-            raw_config = os.getenv('OXYLABS_PROXY_CONFIG', '').strip()
-            if raw_config:
-                secret_data = json.loads(raw_config)
-                proxy_manager = ProxyManager(secret_data, logging.getLogger(__name__))
-                proxy_in_use = proxy_manager.in_use
-        except:
-            proxy_in_use = False
-        
-        return {
-            "version": yt_dlp.version.__version__,
-            "proxy_in_use": proxy_in_use,
-            "status": "available"
-        }, 200
-    except Exception as e:
-        return {"status": "error", "error": str(e)}, 500
 
 @app.route('/health')
 def health_check_detailed():
@@ -369,15 +347,29 @@ def health_check_detailed():
     # Check critical dependencies
     health_info['dependencies'] = _check_dependencies()
     
-    # Add ffmpeg_location and yt_dlp_version fields
-    health_info['ffmpeg_location'] = os.environ.get('FFMPEG_LOCATION')
+    # Add configuration validation status
+    try:
+        from config_validator import config_validator
+        config_summary = config_validator.get_config_summary()
+        health_info['configuration'] = config_summary
+        
+        # Update overall health status based on configuration
+        if config_summary['validation_status'] != 'valid':
+            health_info['status'] = 'degraded'
+            health_info['message'] = f"Configuration issues detected ({config_summary['error_count']} errors, {config_summary['warning_count']} warnings)"
+    except Exception as e:
+        health_info['configuration'] = {'error': f'Configuration validation failed: {str(e)}'}
+        health_info['status'] = 'degraded'
     
-    # Extract yt-dlp version from dependencies
-    yt_dlp_dep = health_info['dependencies'].get('yt_dlp', {})
-    if yt_dlp_dep.get('available'):
-        health_info['yt_dlp_version'] = yt_dlp_dep.get('version', 'unknown')
-    else:
-        health_info['yt_dlp_version'] = None
+    # Add security status
+    try:
+        from security_manager import get_security_status
+        health_info['security'] = get_security_status()
+    except Exception as e:
+        health_info['security'] = {'error': f'Security status check failed: {str(e)}'}
+    
+    # Add ffmpeg_location
+    health_info['ffmpeg_location'] = os.environ.get('FFMPEG_LOCATION')
     
     # Add proxy status if enabled
     if health_info['proxy_enabled']:
@@ -488,8 +480,6 @@ def health_check_detailed():
     critical_missing = []
     if not health_info['dependencies']['ffmpeg']['available']:
         critical_missing.append('ffmpeg')
-    if not health_info['dependencies']['yt_dlp']['available']:
-        critical_missing.append('yt-dlp')
     
     if critical_missing:
         if allow_missing_deps:
@@ -508,3 +498,63 @@ def health_check_detailed():
     health_info['status'] = 'healthy'
     health_info['message'] = 'All dependencies available - ASR functionality ready'
     return health_info, 200
+
+
+@app.route('/metrics')
+def metrics_endpoint():
+    """Comprehensive metrics endpoint with stage durations, percentiles, and circuit breaker events"""
+    try:
+        from transcript_metrics import get_comprehensive_metrics
+        from transcript_service import get_circuit_breaker_status
+        
+        # Get comprehensive metrics including percentiles and recent events
+        metrics = get_comprehensive_metrics()
+        
+        # Add circuit breaker status
+        metrics['circuit_breaker_status'] = get_circuit_breaker_status()
+        
+        # Add timestamp for metrics collection
+        from datetime import datetime
+        metrics['timestamp'] = datetime.utcnow().isoformat()
+        
+        return jsonify(metrics), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': 'Failed to collect metrics',
+            'details': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
+
+
+@app.route('/metrics/percentiles')
+def metrics_percentiles():
+    """Stage duration percentiles for dashboard integration"""
+    try:
+        from transcript_metrics import get_stage_percentiles
+        
+        # Calculate percentiles for all known stages
+        stages = ["yt_api", "timedtext", "youtubei", "asr"]
+        percentiles = {}
+        
+        for stage in stages:
+            percentiles[stage] = get_stage_percentiles(stage)
+        
+        return jsonify({
+            'stage_percentiles': percentiles,
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': 'Failed to calculate percentiles',
+            'details': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
+
+
+@app.errorhandler(Exception)
+def handle_exc(e):
+    from flask import jsonify
+    code = getattr(e, "code", 500)
+    return jsonify({"error": str(e)}), code

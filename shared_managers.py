@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any
 from proxy_manager import ProxyManager
 from proxy_http import ProxyHTTPClient
 from user_agent_manager import UserAgentManager
+from transcript_cache import TranscriptCache
 
 class SharedManagers:
     """Factory for shared manager instances to avoid duplication"""
@@ -60,12 +61,27 @@ class SharedManagers:
         
         return self._managers['user_agent_manager']
     
+    def get_transcript_cache(self) -> Optional[TranscriptCache]:
+        """Get or create TranscriptCache instance"""
+        if 'transcript_cache' not in self._managers:
+            try:
+                cache_dir = os.getenv('TRANSCRIPT_CACHE_DIR', 'transcript_cache')
+                ttl_days = int(os.getenv('TRANSCRIPT_CACHE_TTL_DAYS', '7'))
+                self._managers['transcript_cache'] = TranscriptCache(cache_dir, ttl_days)
+                logging.info("Shared TranscriptCache initialized successfully")
+            except Exception as e:
+                logging.error(f"Failed to initialize shared TranscriptCache: {e}")
+                self._managers['transcript_cache'] = None
+        
+        return self._managers['transcript_cache']
+    
     def get_all_managers(self) -> Dict[str, Any]:
         """Get all manager instances as a dictionary"""
         return {
             'proxy_manager': self.get_proxy_manager(),
             'proxy_http_client': self.get_proxy_http_client(),
-            'user_agent_manager': self.get_user_agent_manager()
+            'user_agent_manager': self.get_user_agent_manager(),
+            'transcript_cache': self.get_transcript_cache()
         }
     
     def _create_proxy_manager(self) -> ProxyManager:
