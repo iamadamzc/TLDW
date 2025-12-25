@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Import the services we're testing
 from youtubei_service import DeterministicYouTubeiCapture, extract_transcript_with_job_proxy
 from transcript_service import TranscriptService, timedtext_with_job_proxy
-from ffmpeg_service import FFmpegService, extract_audio_with_job_proxy
+from ffmpeg_service import FFmpegService
 from log_events import evt
 from logging_setup import get_logger, set_job_ctx
 
@@ -597,13 +597,14 @@ def test_integration_points():
         # Verify all services can be imported
         from youtubei_service import extract_transcript_with_job_proxy as youtubei_extract
         from timedtext_service import timedtext_with_job_proxy
-        from ffmpeg_service import extract_audio_with_job_proxy
-        from transcript_service import TranscriptService
+        from transcript_service import TranscriptService, ASRAudioExtractor
         
         # Verify functions are callable
         assert callable(youtubei_extract)
         assert callable(timedtext_with_job_proxy)
-        assert callable(extract_audio_with_job_proxy)
+        # Verify ASRAudioExtractor can be instantiated and has extract_transcript method
+        asr_extractor = ASRAudioExtractor("dummy_key")
+        assert callable(asr_extractor.extract_transcript)
         
         # Verify TranscriptService can be instantiated
         service = TranscriptService()

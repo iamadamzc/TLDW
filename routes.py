@@ -223,6 +223,34 @@ from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from flask import current_app
 
+def _convert_transcript_to_text(transcript) -> str:
+    """
+    Convert transcript segments list to plain text string.
+    
+    Args:
+        transcript: Either list of dicts with 'text' key, or string
+        
+    Returns:
+        Plain text string with spaces between segments
+    """
+    if not transcript:
+        return ""
+    
+    # If it's already a string, return as-is
+    if isinstance(transcript, str):
+        return transcript
+    
+    # If it's a list of segments, join the text fields
+    if isinstance(transcript, list):
+        try:
+            return " ".join(segment.get('text', '') for segment in transcript if isinstance(segment, dict))
+        except (AttributeError, TypeError):
+            # Fallback: try to convert to string
+            return str(transcript)
+    
+    # Fallback for any other type
+    return str(transcript)
+
 # ---- Enhanced job processing system ----
 import threading
 import time
@@ -363,11 +391,13 @@ class JobManager:
                             
                             # Get transcript using enhanced hierarchical fallback
                             transcript_start_time = time.time()
-                            text = ts.get_transcript(vid, cookie_header=requests_cookies, user_id=user_id, job_id=job_id)
+                            transcript_segments = ts.get_transcript(vid, cookie_header=requests_cookies, user_id=user_id, job_id=job_id)
                             transcript_duration_ms = int((time.time() - transcript_start_time) * 1000)
                             
+                            # Convert segments to text string for summarization
+                            text = _convert_transcript_to_text(transcript_segments)
+                            
                             # Determine transcript source from cache or logs
-                            # This is a simplified approach - in production you'd get this from the transcript service
                             if text and text.strip():
                                 transcript_source = "acquired"  # Could be yt_api, timedtext, youtubei, or asr
                             else:
@@ -375,7 +405,7 @@ class JobManager:
                             
                             # Generate summary with enhanced error handling
                             summary_start_time = time.time()
-                            if not (text or "").strip():
+                            if not text or not text.strip():
                                 summary = "No transcript available for this video."
                                 logging.info(f"Job {job_id}: no transcript for {vid} - using default message")
                             else:

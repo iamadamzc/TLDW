@@ -121,7 +121,8 @@ def test_integration():
     try:
         from youtubei_service import DeterministicYouTubeiCapture, TRANSCRIPT_PANEL_SELECTOR
         from transcript_service import TranscriptService
-        from ffmpeg_service import extract_audio_with_job_proxy, FFmpegService
+        from ffmpeg_service import FFmpegService
+        from transcript_service import ASRAudioExtractor
         
         print("✓ All patched modules import successfully")
         

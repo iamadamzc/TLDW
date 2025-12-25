@@ -1,0 +1,55 @@
+{
+    "Service": {
+        "ServiceName": "tldw-app",
+        "ServiceId": "95e27599d3b841c58fa2ed2a2da49566",
+        "ServiceArn": "arn:aws:apprunner:us-west-2:528131355234:service/tldw-app/95e27599d3b841c58fa2ed2a2da49566",
+        "ServiceUrl": "tpwatm83b9.us-west-2.awsapprunner.com",
+        "CreatedAt": "2025-08-14T02:06:59+02:00",
+        "UpdatedAt": "2025-08-15T21:32:31+02:00",
+        "Status": "PAUSED",
+        "SourceConfiguration": {
+            "CodeRepository": {
+                "RepositoryUrl": "https://github.com/iamadamzc/TLDW",
+                "SourceCodeVersion": {
+                    "Type": "BRANCH",
+                    "Value": "main"
+                },
+                "CodeConfiguration": {
+                    "ConfigurationSource": "REPOSITORY"
+                },
+                "SourceDirectory": "/"
+            },
+            "AutoDeploymentsEnabled": true,
+            "AuthenticationConfiguration": {
+                "ConnectionArn": "arn:aws:apprunner:us-west-2:528131355234:connection/iamadamzc-github/6b451e02a0ab4df2b46e91654e8f5b2f"
+            }
+        },
+        "InstanceConfiguration": {
+            "Cpu": "1024",
+            "Memory": "2048",
+            "InstanceRoleArn": "arn:aws:iam::528131355234:role/TLDW-AppRunner-Instance-Role"
+        },
+        "HealthCheckConfiguration": {
+            "Protocol": "TCP",
+            "Path": "/",
+            "Interval": 5,
+            "Timeout": 2,
+            "HealthyThreshold": 1,
+            "UnhealthyThreshold": 5
+        },
+        "AutoScalingConfigurationSummary": {
+            "AutoScalingConfigurationArn": "arn:aws:apprunner:us-west-2:528131355234:autoscalingconfiguration/DefaultConfiguration/1/00000000000000000000000000000001",
+            "AutoScalingConfigurationName": "DefaultConfiguration",
+            "AutoScalingConfigurationRevision": 1
+        },
+        "NetworkConfiguration": {
+            "EgressConfiguration": {
+                "EgressType": "DEFAULT"
+            },
+            "IngressConfiguration": {
+                "IsPubliclyAccessible": true
+            },
+            "IpAddressType": "IPV4"
+        }
+    }
+}

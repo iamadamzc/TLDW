@@ -1,0 +1,79 @@
+{
+    "Service": {
+        "ServiceName": "tldw-container-app",
+        "ServiceId": "81cfdc5538c04039bddfedb791e69e6f",
+        "ServiceArn": "arn:aws:apprunner:us-west-2:528131355234:service/tldw-container-app/81cfdc5538c04039bddfedb791e69e6f",
+        "ServiceUrl": "wy2vvma4cw.us-west-2.awsapprunner.com",
+        "CreatedAt": "2025-08-16T00:18:22+02:00",
+        "UpdatedAt": "2025-12-25T12:53:34+01:00",
+        "Status": "RUNNING",
+        "SourceConfiguration": {
+            "ImageRepository": {
+                "ImageIdentifier": "528131355234.dkr.ecr.us-west-2.amazonaws.com/tldw:playwright-fix-20251225-120132",
+                "ImageConfiguration": {
+                    "RuntimeEnvironmentVariables": {
+                        "ALLOW_MISSING_DEPS": "true",
+                        "COOKIE_DIR": "/app/cookies",
+                        "COOKIE_LOCAL_DIR": "/app/cookies",
+                        "COOKIE_S3_BUCKET": "tldw-cookies-bucket",
+                        "ENABLE_ASR_FALLBACK": "1",
+                        "ENABLE_PLAYWRIGHT_PRIMARY": "true",
+                        "ENFORCE_PROXY_ALL": "1",
+                        "FFMPEG_LOCATION": "/usr/bin",
+                        "FORCE_UPDATE": "2025-08-16-05-40",
+                        "OXY_DISABLE_GEO": "true",
+                        "PORT": "8080",
+                        "PROXY_SECRET_NAME": "tldw-oxylabs-proxy-config",
+                        "PW_NAV_TIMEOUT_MS": "120000",
+                        "SENDER_EMAIL": "noreply@resend.dev",
+                        "USE_PROXIES": "true",
+                        "USE_PROXY_FOR_TIMEDTEXT": "1"
+                    },
+                    "Port": "8080",
+                    "RuntimeEnvironmentSecrets": {
+                        "DEEPGRAM_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-DEEPGRAM-API-KEY-6gvcFv",
+                        "GOOGLE_CLIENT_ID": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-ID-8Z22IN",
+                        "GOOGLE_CLIENT_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-GOOGLE-OAUTH-CLIENT-SECRET-LmUrPI",
+                        "OPENAI_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-OPENAI-API-KEY-5rNo6a",
+                        "OXYLABS_PROXY_CONFIG": "arn:aws:secretsmanager:us-west-2:528131355234:secret:tldw-oxylabs-proxy-config-mkbzlM",
+                        "RESEND_API_KEY": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-RESEND-API-KEY-5O5Kdx",
+                        "SESSION_SECRET": "arn:aws:secretsmanager:us-west-2:528131355234:secret:TLDW-SESSION-SECRET-hJDTQ1"
+                    }
+                },
+                "ImageRepositoryType": "ECR"
+            },
+            "AutoDeploymentsEnabled": false,
+            "AuthenticationConfiguration": {
+                "AccessRoleArn": "arn:aws:iam::528131355234:role/AppRunnerECRAccessRole"
+            }
+        },
+        "InstanceConfiguration": {
+            "Cpu": "1024",
+            "Memory": "2048",
+            "InstanceRoleArn": "arn:aws:iam::528131355234:role/AppRunnerInstanceRole"
+        },
+        "HealthCheckConfiguration": {
+            "Protocol": "HTTP",
+            "Path": "/healthz",
+            "Interval": 20,
+            "Timeout": 10,
+            "HealthyThreshold": 1,
+            "UnhealthyThreshold": 5
+        },
+        "AutoScalingConfigurationSummary": {
+            "AutoScalingConfigurationArn": "arn:aws:apprunner:us-west-2:528131355234:autoscalingconfiguration/DefaultConfiguration/1/00000000000000000000000000000001",
+            "AutoScalingConfigurationName": "DefaultConfiguration",
+            "AutoScalingConfigurationRevision": 1
+        },
+        "NetworkConfiguration": {
+            "EgressConfiguration": {
+                "EgressType": "VPC",
+                "VpcConnectorArn": "arn:aws:apprunner:us-west-2:528131355234:vpcconnector/tldw-prod-vpc-connector/1/4ce7c2f67d2f441e879682fec83fa5f5"
+            },
+            "IngressConfiguration": {
+                "IsPubliclyAccessible": true
+            },
+            "IpAddressType": "IPV4"
+        }
+    }
+}

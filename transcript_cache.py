@@ -100,10 +100,18 @@ class TranscriptCache:
                     return None
                 
                 with open(cache_file_path, 'r', encoding='utf-8') as f:
-                    transcript = f.read()
+                    transcript_data = f.read()
                 
-                logging.info(f"Cache hit for video {video_id} (lang: {language}, source: {row['source']})")
-                return transcript
+                # Deserialize JSON if transcript was stored as list
+                try:
+                    # Try to parse as JSON first (for list format)
+                    transcript = json.loads(transcript_data)
+                    logging.info(f"Cache hit for video {video_id} (lang: {language}, source: {row['source']})")
+                    return transcript
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, return as plain string (legacy format)
+                    logging.info(f"Cache hit for video {video_id} (lang: {language}, source: {row['source']}, legacy format)")
+                    return transcript_data
                 
         except Exception as e:
             logging.error(f"Error reading from cache for video {video_id}: {e}")
