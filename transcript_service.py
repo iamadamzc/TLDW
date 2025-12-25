@@ -150,7 +150,7 @@ ASR_MAX_VIDEO_MINUTES = _config.asr_max_video_minutes
 YOUTUBEI_HARD_TIMEOUT = _config.youtubei_hard_timeout
 PLAYWRIGHT_NAVIGATION_TIMEOUT = _config.playwright_navigation_timeout
 CIRCUIT_BREAKER_RECOVERY = _config.circuit_breaker_recovery
-GLOBAL_JOB_TIMEOUT = 240  # 4 minutes maximum job duration (global watchdog)
+GLOBAL_JOB_TIMEOUT = 1800  # 30 minutes maximum job duration (allows ASR fallback for long videos)
 
 # Log configuration for debugging deployment issues
 def _log_transcript_service_config():
