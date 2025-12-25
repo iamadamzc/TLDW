@@ -31,8 +31,8 @@ from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "asr-fallthrough-debug-v2"
-evt("build_marker", marker="asr-fallthrough-debug-v2")
+APP_VERSION = "asr-fallthrough-debug-v3"
+evt("build_marker", marker="asr-fallthrough-debug-v3")
 
 # Startup sanity check to catch local module shadowing
 assert (
