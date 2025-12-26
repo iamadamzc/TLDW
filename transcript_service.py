@@ -31,8 +31,8 @@ from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "asr-fallthrough-debug-v3"
-evt("build_marker", marker="asr-fallthrough-debug-v3")
+APP_VERSION = "asr-debug-v1"
+evt("build_marker", marker="asr-debug-v1")
 
 # Startup sanity check to catch local module shadowing
 assert (
@@ -64,6 +64,10 @@ from youtube_transcript_api._errors import (
 )
 # Import our compatibility layer
 from youtube_transcript_api_compat import get_transcript, list_transcripts, TranscriptApiError
+
+# Import robust timedtext service (replaces internal legacy implementation)
+from timedtext_service import timedtext_with_job_proxy
+
 
 # Import YouTubei service functions - DECISION: Use centralized service
 from youtubei_service import extract_transcript_with_job_proxy, DeterministicYouTubeiCapture
@@ -2683,7 +2687,8 @@ class TranscriptService:
                 user_cookies = get_user_cookies_with_fallback(user_id) if user_id else cookie_header
                 
                 # Try with compatibility layer
-                transcript_list = get_transcript(video_id, language_codes, user_cookies)
+                proxies = _requests_proxies(self.proxy_manager)
+                transcript_list = get_transcript(video_id, language_codes, user_cookies, proxies)
                 
                 if transcript_list:
                     # Convert to standard format
@@ -2698,6 +2703,7 @@ class TranscriptService:
                     if segments:
                         evt("transcript_method_success", method="youtube_api", video_id=video_id)
                         log_successful_transcript_method("youtube_api")
+                        # BUILD MARKER: fix-timedtext-proxy-v4
                         return segments
                         
             except Exception as e:
@@ -2714,10 +2720,11 @@ class TranscriptService:
                 # Get user cookies
                 user_cookies = get_user_cookies_with_fallback(user_id) if user_id else cookie_header
                 
-                transcript_text = get_captions_via_timedtext(
+                transcript_text = timedtext_with_job_proxy(
                     video_id=video_id,
+                    job_id=job_id,
                     proxy_manager=self.proxy_manager,
-                    user_cookies=user_cookies
+                    cookies=user_cookies
                 )
                 
                 if transcript_text and transcript_text.strip():
@@ -2785,6 +2792,18 @@ class TranscriptService:
             job_id=job_id,
         )
         
+        # TRACE: Log entry into ASR section with all state information
+        evt("asr_trace_entry",
+            video_id=video_id,
+            job_id=job_id,
+            env_ENABLE_ASR_FALLBACK=str(ENABLE_ASR_FALLBACK),
+            env_ASR_DISABLED=os.getenv("ASR_DISABLED", "false"),
+            env_DEEPGRAM_API_KEY_present=bool(os.environ.get("DEEPGRAM_API_KEY")),
+            instance_deepgram_api_key_present=bool(self.deepgram_api_key),
+            instance_deepgram_api_key_value_preview=str(self.deepgram_api_key)[:20] if self.deepgram_api_key else "None",
+            proxy_manager_present=bool(self.proxy_manager),
+            proxy_manager_in_use=self.proxy_manager.in_use if self.proxy_manager else False)
+        
         # Diagnostic logging for ASR eligibility (helps debug staging issues)
         asr_enabled = ENABLE_ASR_FALLBACK
         asr_key_configured = bool(self.deepgram_api_key)
@@ -2798,15 +2817,44 @@ class TranscriptService:
             enabled_var=str(ENABLE_ASR_FALLBACK),
             key_var_present=bool(os.environ.get("DEEPGRAM_API_KEY")))
         
+        # TRACE: Log exact boolean values before conditional evaluation
+        evt("asr_trace_booleans",
+            video_id=video_id,
+            job_id=job_id,
+            asr_enabled_value=asr_enabled,
+            asr_enabled_type=str(type(asr_enabled)),
+            asr_key_configured_value=asr_key_configured,
+            asr_key_configured_type=str(type(asr_key_configured)),
+            conditional_will_pass=bool(asr_enabled and asr_key_configured))
+        
         # Step 3 & 4: Guarantee attempt and do not silently skip
         if asr_enabled and asr_key_configured:
+            # TRACE: Conditional passed, entering ASR execution block
+            evt("asr_trace_conditional_passed",
+                video_id=video_id,
+                job_id=job_id,
+                about_to_log_method_start=True)
+            
             try:
                 evt("transcript_method_start", method="asr", video_id=video_id, job_id=job_id)
+                
+                # TRACE: Log ASR extractor instantiation attempt
+                evt("asr_trace_extractor_init_start",
+                    video_id=video_id,
+                    job_id=job_id,
+                    deepgram_key_length=len(self.deepgram_api_key) if self.deepgram_api_key else 0,
+                    proxy_manager_type=str(type(self.proxy_manager)))
                 
                 asr_extractor = ASRAudioExtractor(
                     deepgram_api_key=self.deepgram_api_key,
                     proxy_manager=self.proxy_manager
                 )
+                
+                # TRACE: Extractor instantiation successful
+                evt("asr_trace_extractor_init_success",
+                    video_id=video_id,
+                    job_id=job_id,
+                    extractor_type=str(type(asr_extractor)))
                 
                 transcript_text = asr_extractor.extract_transcript(video_id, job_id)
                 
@@ -2827,11 +2875,31 @@ class TranscriptService:
                         error_class="extraction_failed", error="empty_result")
                     
             except Exception as e:
+                # TRACE: Enhanced exception logging with stack trace
+                import traceback
+                stack_trace = traceback.format_exc()
+                
                 error_class = classify_transcript_error(e, video_id, "asr")
                 evt("transcript_method_failed", 
                     method="asr", video_id=video_id, job_id=job_id,
                     error_class=error_class, error=str(e)[:100])
+                
+                # TRACE: Log detailed exception information
+                evt("asr_trace_exception",
+                    video_id=video_id,
+                    job_id=job_id,
+                    exception_type=type(e).__name__,
+                    exception_message=str(e)[:200],
+                    stack_trace_preview=stack_trace[:500])
         else:
+            # TRACE: Conditional failed, log why
+            evt("asr_trace_conditional_failed",
+                video_id=video_id,
+                job_id=job_id,
+                asr_enabled=asr_enabled,
+                asr_key_configured=asr_key_configured,
+                reason_for_failure="asr_disabled" if not asr_enabled else "no_key" if not asr_key_configured else "unknown")
+            
             # Step 4: Explicit skip reason
             if not asr_enabled:
                 evt("asr_skipped", reason="asr_disabled_env", video_id=video_id, job_id=job_id)
