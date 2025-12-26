@@ -98,6 +98,16 @@ docker push "${ECR_URI}:latest"
 Write-Host "✅ Pushed: $IMAGE_URI" -ForegroundColor Green
 Write-Host "✅ Pushed: ${ECR_URI}:latest" -ForegroundColor Green
 
+# CRITICAL: Fetch image DIGEST from ECR to bypass tag caching
+Write-Host ""
+Write-Host "🔍 Fetching image digest from ECR (bypassing tag cache)..." -ForegroundColor Yellow
+$IMAGE_DETAILS = aws ecr describe-images --repository-name $ECR_REPOSITORY --region $AWS_REGION --image-ids imageTag=$IMAGE_TAG | ConvertFrom-Json
+$IMAGE_DIGEST = $IMAGE_DETAILS.imageDetails[0].imageDigest
+$IMAGE_URI_WITH_DIGEST = "${ECR_URI}@${IMAGE_DIGEST}"
+
+Write-Host "✅ Image digest: $IMAGE_DIGEST" -ForegroundColor Green
+Write-Host "✅ Digest-based URI: $IMAGE_URI_WITH_DIGEST" -ForegroundColor Cyan
+
 # Get current config
 Write-Host ""
 Write-Host "🔄 Preparing App Runner update..." -ForegroundColor Yellow
@@ -105,12 +115,12 @@ $CURRENT_CONFIG = aws apprunner describe-service --service-arn $SERVICE_ARN --re
 $PREVIOUS_IMAGE = $CURRENT_CONFIG.Service.SourceConfiguration.ImageRepository.ImageIdentifier
 Write-Host "📝 Previous image: $PREVIOUS_IMAGE"
 
-# Update App Runner
+# Update App Runner with DIGEST (not tag)
 Write-Host ""
-Write-Host "🚀 Starting App Runner deployment..." -ForegroundColor Yellow
+Write-Host "🚀 Starting DIGEST-BASED deployment..." -ForegroundColor Yellow
 $UPDATE_CONFIG = @{
     ImageRepository        = @{
-        ImageIdentifier     = $IMAGE_URI
+        ImageIdentifier     = $IMAGE_URI_WITH_DIGEST
         ImageRepositoryType = "ECR"
     }
     AutoDeploymentsEnabled = $false
