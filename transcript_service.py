@@ -31,8 +31,8 @@ from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "asr-debug-v1"
-evt("build_marker", marker="asr-debug-v1")
+APP_VERSION = "asr-debug-v2"
+evt("build_marker", marker="asr-debug-v2")
 
 # Startup sanity check to catch local module shadowing
 assert (
@@ -2776,12 +2776,16 @@ class TranscriptService:
                     method="youtubei", video_id=video_id, 
                     error_class=error_class, error=str(e)[:100])
             finally:
-                evt(
-                    "transcript_method_exit",
-                    method="youtubei",
-                    video_id=video_id,
-                    job_id=job_id,
-                )
+                try:
+                    evt(
+                        "transcript_method_exit",
+                        method="youtubei",
+                        video_id=video_id,
+                        job_id=job_id,
+                    )
+                except Exception as evt_error:
+                    # Prevent evt() exceptions from stopping ASR fallback
+                    logger.warning(f"Failed to log transcript_method_exit for youtubei: {evt_error}")
         
         # Method 4: ASR fallback
         
