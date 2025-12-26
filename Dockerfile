@@ -24,7 +24,7 @@ RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"
 # Copy application code
 COPY . .
 # DEBUG: Check if the new code made it in
-RUN grep "asr-debug-v2" transcript_service.py || (echo "CRITICAL: BUILD MARKER asr-debug-v2 NOT FOUND IN COPY" && exit 1)
+RUN grep "asr-debug-v3" transcript_service.py || (echo "CRITICAL: BUILD MARKER asr-debug-v3 NOT FOUND IN COPY" && exit 1)
 COPY templates/ templates/
 COPY static/ static/
 

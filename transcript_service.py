@@ -1,3 +1,4 @@
+print('!!! BOOTING VERSION ASR-DEBUG-V3 - DIGEST DEPLOYMENT !!!', flush=True)
 import os
 import logging
 from typing import Optional, Tuple, Dict, List, Any
@@ -31,8 +32,8 @@ from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "asr-debug-v2"
-evt("build_marker", marker="asr-debug-v2")
+APP_VERSION = "asr-debug-v3"
+evt("build_marker", marker="asr-debug-v3")
 
 # Startup sanity check to catch local module shadowing
 assert (
