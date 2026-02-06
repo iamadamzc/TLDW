@@ -6,6 +6,7 @@ Provides compatibility functions for migrating from youtube-transcript-api 0.6.2
 import logging
 from typing import List, Dict, Any, Optional, Union
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 
 class TranscriptApiError(Exception):
@@ -19,9 +20,10 @@ class YouTubeTranscriptApiCompat:
     Provides methods that match the old API while using the new implementation
     """
     
-    def __init__(self):
+    def __init__(self, proxy_config=None):
         self.logger = logging.getLogger(__name__)
         self._api_instance = None
+        self._proxy_config = proxy_config
         self._api_version = self._detect_api_version()
         
         # Log initialization with version detection
@@ -79,8 +81,12 @@ class YouTubeTranscriptApiCompat:
         """Get or create API instance"""
         if self._api_instance is None:
             try:
-                self._api_instance = YouTubeTranscriptApi()
-                self.logger.debug("Created new YouTubeTranscriptApi instance")
+                if self._proxy_config:
+                    self._api_instance = YouTubeTranscriptApi(proxy_config=self._proxy_config)
+                    self.logger.info(f"Created YouTubeTranscriptApi with proxy_config: {type(self._proxy_config).__name__}")
+                else:
+                    self._api_instance = YouTubeTranscriptApi()
+                    self.logger.debug("Created YouTubeTranscriptApi without proxy (direct connection)")
             except Exception as e:
                 raise TranscriptApiError(f"Failed to create API instance: {e}")
         return self._api_instance
@@ -138,30 +144,15 @@ class YouTubeTranscriptApiCompat:
             # Note: The new API fetch method signature is different
             # fetch(video_id, languages, preserve_formatting=False)
             
-            # Pass cookies and proxies to the new API if supported
-            fetch_kwargs = {}
-            if cookies:
-                fetch_kwargs['cookies'] = cookies
-                self.logger.debug("Adding cookies to API request")
-            if proxies:
-                fetch_kwargs['proxies'] = proxies
-                self.logger.debug(f"Adding proxies to API request: {proxies}")
+            # Note: proxies are now set at instance level via proxy_config in constructor
+            # The fetch() method does NOT accept proxies - they must be set at init time
             
             self.logger.debug(f"Fetching transcript for language: {best_language}")
+            self.logger.info(f"Proxy active: {self._proxy_config is not None}")
             
             try:
-                # Try with the best language and proxy/cookie parameters
-                if fetch_kwargs:
-                    self.logger.info(f"Calling API with additional parameters: {list(fetch_kwargs.keys())}")
-                    # CRITICAL LOGGING FOR PROXY VERIFICATION
-                    if 'proxies' in fetch_kwargs:
-                        logging.critical(f"CRITICAL_CHECK --- Calling youtube-transcript-api fetch with proxies: {fetch_kwargs['proxies']}")
-                    else:
-                        logging.critical(f"CRITICAL_CHECK --- Calling youtube-transcript-api fetch WITHOUT proxies (fetch_kwargs: {fetch_kwargs})")
-                    fetched_transcript = self.api_instance.fetch(video_id, [best_language], **fetch_kwargs)
-                else:
-                    logging.critical(f"CRITICAL_CHECK --- Calling youtube-transcript-api fetch with NO additional parameters (no proxies, no cookies)")
-                    fetched_transcript = self.api_instance.fetch(video_id, [best_language])
+                # Fetch with the best language (proxy is already configured at instance level)
+                fetched_transcript = self.api_instance.fetch(video_id, [best_language])
                 self.logger.debug(f"Got fetched transcript object: {type(fetched_transcript)}")
                 
                 # Convert FetchedTranscript to list of dicts for compatibility
@@ -186,27 +177,7 @@ class YouTubeTranscriptApiCompat:
                             'duration': snippet.duration
                         })
                 except Exception as fallback_error:
-                    # Try fallback with proxy/cookie parameters if they were provided
-                    if fetch_kwargs:
-                        try:
-                            self.logger.debug("Trying fallback with proxy/cookie parameters")
-                            # CRITICAL LOGGING FOR FALLBACK PROXY VERIFICATION
-                            if 'proxies' in fetch_kwargs:
-                                logging.critical(f"CRITICAL_CHECK --- FALLBACK: Calling youtube-transcript-api fetch with proxies: {fetch_kwargs['proxies']}")
-                            else:
-                                logging.critical(f"CRITICAL_CHECK --- FALLBACK: Calling youtube-transcript-api fetch WITHOUT proxies (fetch_kwargs: {fetch_kwargs})")
-                            fetched_transcript = self.api_instance.fetch(video_id, **fetch_kwargs)
-                            transcript = []
-                            for snippet in fetched_transcript:
-                                transcript.append({
-                                    'text': snippet.text,
-                                    'start': snippet.start,
-                                    'duration': snippet.duration
-                                })
-                        except Exception as final_error:
-                            raise TranscriptApiError(f"All fetch attempts failed. Last error: {final_error}")
-                    else:
-                        raise TranscriptApiError(f"Both specific and default language fetch failed: {fallback_error}")
+                    raise TranscriptApiError(f"All fetch attempts failed. Last error: {fallback_error}")
             
             self.logger.info(f"Successfully retrieved transcript: {len(transcript)} segments")
             return transcript
@@ -329,11 +300,11 @@ class YouTubeTranscriptApiCompat:
 _compat_instance = None
 
 
-def get_compat_instance() -> YouTubeTranscriptApiCompat:
-    """Get global compatibility instance"""
+def get_compat_instance(proxy_config=None) -> YouTubeTranscriptApiCompat:
+    """Get global compatibility instance. If proxy_config is provided, recreates the instance."""
     global _compat_instance
-    if _compat_instance is None:
-        _compat_instance = YouTubeTranscriptApiCompat()
+    if _compat_instance is None or proxy_config is not None:
+        _compat_instance = YouTubeTranscriptApiCompat(proxy_config=proxy_config)
     return _compat_instance
 
 
@@ -343,9 +314,18 @@ def get_transcript(video_id: str, languages: List[str] = None,
     """
     Compatibility function for YouTubeTranscriptApi.get_transcript()
     
-    This function provides the same interface as the old API while using the new implementation.
+    If proxies dict is provided, builds a GenericProxyConfig and passes to the instance.
+    This ensures the proxy is used at the API level (constructor), not at the method level.
     """
-    return get_compat_instance().get_transcript(video_id, languages, cookies, proxies)
+    proxy_config = None
+    if proxies:
+        http_url = proxies.get('http') or proxies.get('https')
+        https_url = proxies.get('https') or proxies.get('http')
+        if http_url or https_url:
+            proxy_config = GenericProxyConfig(http_url=http_url, https_url=https_url)
+            logging.getLogger(__name__).info(f"Built GenericProxyConfig from proxies dict for youtube-transcript-api")
+    
+    return get_compat_instance(proxy_config=proxy_config).get_transcript(video_id, languages, cookies, proxies)
 
 
 def list_transcripts(video_id: str) -> List[Dict[str, Any]]:

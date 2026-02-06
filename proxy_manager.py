@@ -282,13 +282,16 @@ class ProxyManager:
         
         # Initialize proxy configuration with graceful error handling
         try:
-            # Check if proxies are enabled via environment variable (CRITICAL FIX FOR YOUTUBE BLOCKING)
-            use_proxies = os.getenv('USE_PROXIES', 'false').lower() == 'true'
+            # Check if proxies are enabled via environment variable
+            use_proxies = os.getenv('USE_PROXIES', 'true').lower() == 'true'
             
             if not use_proxies:
                 self.logger.log_event("info", "Proxies disabled via USE_PROXIES environment variable",
                                     use_proxies=False)
                 return  # Exit early - don't initialize proxy even if secret exists
+            
+            self.logger.log_event("info", "Proxies enabled via USE_PROXIES environment variable",
+                                use_proxies=True)
             
             if secret_dict is None:
                 secret_dict = self._fetch_secret()
