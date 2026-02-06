@@ -1,3 +1,4 @@
+print('!!! BOOTING VERSION ASR-DEBUG-V3 - DIGEST DEPLOYMENT !!!', flush=True)
 import os
 import logging
 from typing import Optional, Tuple, Dict, List, Any
@@ -30,7 +31,9 @@ from playwright.sync_api import sync_playwright, Page
 from playwright.async_api import async_playwright
 
 # --- Version marker for deployed image provenance ---
-APP_VERSION = "playwright-fix-2025-08-24T2"
+# --- Version marker for deployed image provenance ---
+APP_VERSION = "asr-debug-v3"
+evt("build_marker", marker="asr-debug-v3")
 
 # Startup sanity check to catch local module shadowing
 assert (
@@ -62,6 +65,10 @@ from youtube_transcript_api._errors import (
 )
 # Import our compatibility layer
 from youtube_transcript_api_compat import get_transcript, list_transcripts, TranscriptApiError
+
+# Import robust timedtext service (replaces internal legacy implementation)
+from timedtext_service import timedtext_with_job_proxy
+
 
 # Import YouTubei service functions - DECISION: Use centralized service
 from youtubei_service import extract_transcript_with_job_proxy, DeterministicYouTubeiCapture
@@ -150,7 +157,7 @@ ASR_MAX_VIDEO_MINUTES = _config.asr_max_video_minutes
 YOUTUBEI_HARD_TIMEOUT = _config.youtubei_hard_timeout
 PLAYWRIGHT_NAVIGATION_TIMEOUT = _config.playwright_navigation_timeout
 CIRCUIT_BREAKER_RECOVERY = _config.circuit_breaker_recovery
-GLOBAL_JOB_TIMEOUT = 240  # 4 minutes maximum job duration (global watchdog)
+GLOBAL_JOB_TIMEOUT = 1800  # 30 minutes maximum job duration (allows ASR fallback for long videos)
 
 # Log configuration for debugging deployment issues
 def _log_transcript_service_config():
@@ -1631,7 +1638,11 @@ class ASRAudioExtractor:
 
     def extract_transcript(self, video_id: str, job_id: str = None) -> str:
         """
-        Extract transcript using ASR fallback with HLS audio extraction and Deepgram transcription.
+        Extract transcript using ASR fallback with audio extraction and Deepgram transcription.
+        
+        Supports two audio extraction methods:
+        1. yt-dlp: Deterministic extraction (ASR_AUDIO_EXTRACTOR=yt_dlp)
+        2. Playwright HLS: Browser-based extraction (default)
         
         Args:
             video_id: YouTube video ID
@@ -1662,14 +1673,64 @@ class ASRAudioExtractor:
             
             evt("asr_start", video_id=video_id)
             
-            # Step 1: Extract HLS audio URL using Playwright
-            audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
+            # Step 1: Extract audio URL
+            # Check ASR_AUDIO_EXTRACTOR flag for yt-dlp support
+            asr_audio_extractor = os.getenv("ASR_AUDIO_EXTRACTOR", "").lower()
+            audio_url = None
+            
+            if asr_audio_extractor == "yt_dlp":
+                # Use yt-dlp for audio URL extraction
+                try:
+                    from ytdlp_service import extract_best_audio_url
+                    
+                    evt("asr_audio_source_select", source="yt_dlp", video_id=video_id)
+                    
+                    result = extract_best_audio_url(
+                        youtube_url=video_id,
+                        proxy_manager=self.proxy_manager,
+                        job_id=job_id
+                    )
+                    
+                    if result.get("success"):
+                        audio_url = result["url"]
+                        evt("asr_audio_source_selected",
+                            source="yt_dlp",
+                            format_id=result.get("format_id"),
+                            ext=result.get("ext"),
+                            abr=result.get("abr"),
+                            proxy_used=result.get("proxy_used"),
+                            proxy_enabled=result.get("proxy_enabled"),
+                            proxy_host=result.get("proxy_host"),
+                            proxy_profile=result.get("proxy_profile"))
+                    else:
+                        # yt-dlp failed, log and fall back to Playwright
+                        evt("asr_audio_source_failed",
+                            source="yt_dlp",
+                            fail_class=result.get("fail_class"),
+                            error=result.get("error", "")[:200])
+                        
+                        # Graceful fallback to existing method
+                        evt("asr_fallback_to_playwright", reason="ytdlp_failed", video_id=video_id)
+                        audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
+                        
+                except Exception as e:
+                    # yt-dlp import or execution error, fall back to Playwright
+                    evt("asr_ytdlp_error",
+                        error=str(e)[:200],
+                        video_id=video_id)
+                    evt("asr_fallback_to_playwright", reason="ytdlp_exception", video_id=video_id)
+                    audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
+            
+            else:
+                # Default: Use existing Playwright HLS extraction
+                evt("asr_audio_source_select", source="playwright_hls", video_id=video_id)
+                audio_url = self._extract_hls_audio_url(video_id, self.proxy_manager, None)
             
             if not audio_url:
-                evt("asr_step", step="hls_extraction", outcome="no_url", video_id=video_id)
+                evt("asr_step", step="audio_url_extraction", outcome="no_url", video_id=video_id)
                 return ""
             
-            evt("asr_step", step="hls_extraction", outcome="success", video_id=video_id)
+            evt("asr_step", step="audio_url_extraction", outcome="success", video_id=video_id)
             
             # Step 2: Extract audio to WAV using ffmpeg
             import tempfile
@@ -2528,6 +2589,14 @@ class TranscriptService:
     def __init__(self, use_shared_managers: bool = True):
         self.deepgram_api_key = os.environ.get("DEEPGRAM_API_KEY", "")
         
+        # DIAGNOSTIC: Log DEEPGRAM_API_KEY availability at initialization
+        deepgram_key_status = "configured" if self.deepgram_api_key else "MISSING"
+        deepgram_key_length = len(self.deepgram_api_key) if self.deepgram_api_key else 0
+        evt("transcript_service_init", 
+            deepgram_key_status=deepgram_key_status,
+            deepgram_key_length=deepgram_key_length,
+            detail=f"TranscriptService initialized: DEEPGRAM_API_KEY={deepgram_key_status} (length={deepgram_key_length})")
+        
         if use_shared_managers:
             self.proxy_manager = shared_managers.get_proxy_manager()
             self.cache = shared_managers.get_transcript_cache()
@@ -2619,7 +2688,8 @@ class TranscriptService:
                 user_cookies = get_user_cookies_with_fallback(user_id) if user_id else cookie_header
                 
                 # Try with compatibility layer
-                transcript_list = get_transcript(video_id, language_codes, user_cookies)
+                proxies = _requests_proxies(self.proxy_manager)
+                transcript_list = get_transcript(video_id, language_codes, user_cookies, proxies)
                 
                 if transcript_list:
                     # Convert to standard format
@@ -2634,6 +2704,7 @@ class TranscriptService:
                     if segments:
                         evt("transcript_method_success", method="youtube_api", video_id=video_id)
                         log_successful_transcript_method("youtube_api")
+                        # BUILD MARKER: fix-timedtext-proxy-v4
                         return segments
                         
             except Exception as e:
@@ -2650,10 +2721,11 @@ class TranscriptService:
                 # Get user cookies
                 user_cookies = get_user_cookies_with_fallback(user_id) if user_id else cookie_header
                 
-                transcript_text = get_captions_via_timedtext(
+                transcript_text = timedtext_with_job_proxy(
                     video_id=video_id,
+                    job_id=job_id,
                     proxy_manager=self.proxy_manager,
-                    user_cookies=user_cookies
+                    cookies=user_cookies
                 )
                 
                 if transcript_text and transcript_text.strip():
@@ -2704,16 +2776,90 @@ class TranscriptService:
                 evt("transcript_method_failed", 
                     method="youtubei", video_id=video_id, 
                     error_class=error_class, error=str(e)[:100])
+            finally:
+                try:
+                    evt(
+                        "transcript_method_exit",
+                        method="youtubei",
+                        video_id=video_id,
+                        job_id=job_id,
+                    )
+                except Exception as evt_error:
+                    # Prevent evt() exceptions from stopping ASR fallback
+                    logger.warning(f"Failed to log transcript_method_exit for youtubei: {evt_error}")
         
         # Method 4: ASR fallback
-        if ENABLE_ASR_FALLBACK and self.deepgram_api_key:
+        
+        # Step 2: ASR Block Entry Marker
+        evt(
+            "transcript_pipeline_enter_asr_block",
+            video_id=video_id,
+            job_id=job_id,
+        )
+        
+        # TRACE: Log entry into ASR section with all state information
+        evt("asr_trace_entry",
+            video_id=video_id,
+            job_id=job_id,
+            env_ENABLE_ASR_FALLBACK=str(ENABLE_ASR_FALLBACK),
+            env_ASR_DISABLED=os.getenv("ASR_DISABLED", "false"),
+            env_DEEPGRAM_API_KEY_present=bool(os.environ.get("DEEPGRAM_API_KEY")),
+            instance_deepgram_api_key_present=bool(self.deepgram_api_key),
+            instance_deepgram_api_key_value_preview=str(self.deepgram_api_key)[:20] if self.deepgram_api_key else "None",
+            proxy_manager_present=bool(self.proxy_manager),
+            proxy_manager_in_use=self.proxy_manager.in_use if self.proxy_manager else False)
+        
+        # Diagnostic logging for ASR eligibility (helps debug staging issues)
+        asr_enabled = ENABLE_ASR_FALLBACK
+        asr_key_configured = bool(self.deepgram_api_key)
+        
+        # Step 2: Prove ASR Gate
+        evt("asr_eligibility_check",
+            video_id=video_id,
+            job_id=job_id,
+            asr_enabled=asr_enabled,
+            deepgram_key_configured=asr_key_configured,
+            enabled_var=str(ENABLE_ASR_FALLBACK),
+            key_var_present=bool(os.environ.get("DEEPGRAM_API_KEY")))
+        
+        # TRACE: Log exact boolean values before conditional evaluation
+        evt("asr_trace_booleans",
+            video_id=video_id,
+            job_id=job_id,
+            asr_enabled_value=asr_enabled,
+            asr_enabled_type=str(type(asr_enabled)),
+            asr_key_configured_value=asr_key_configured,
+            asr_key_configured_type=str(type(asr_key_configured)),
+            conditional_will_pass=bool(asr_enabled and asr_key_configured))
+        
+        # Step 3 & 4: Guarantee attempt and do not silently skip
+        if asr_enabled and asr_key_configured:
+            # TRACE: Conditional passed, entering ASR execution block
+            evt("asr_trace_conditional_passed",
+                video_id=video_id,
+                job_id=job_id,
+                about_to_log_method_start=True)
+            
             try:
-                evt("transcript_method_start", method="asr", video_id=video_id)
+                evt("transcript_method_start", method="asr", video_id=video_id, job_id=job_id)
+                
+                # TRACE: Log ASR extractor instantiation attempt
+                evt("asr_trace_extractor_init_start",
+                    video_id=video_id,
+                    job_id=job_id,
+                    deepgram_key_length=len(self.deepgram_api_key) if self.deepgram_api_key else 0,
+                    proxy_manager_type=str(type(self.proxy_manager)))
                 
                 asr_extractor = ASRAudioExtractor(
                     deepgram_api_key=self.deepgram_api_key,
                     proxy_manager=self.proxy_manager
                 )
+                
+                # TRACE: Extractor instantiation successful
+                evt("asr_trace_extractor_init_success",
+                    video_id=video_id,
+                    job_id=job_id,
+                    extractor_type=str(type(asr_extractor)))
                 
                 transcript_text = asr_extractor.extract_transcript(video_id, job_id)
                 
@@ -2725,17 +2871,54 @@ class TranscriptService:
                         'duration': 0.0
                     }]
                     
-                    evt("transcript_method_success", method="asr", video_id=video_id)
+                    evt("transcript_method_success", method="asr", video_id=video_id, job_id=job_id)
                     log_successful_transcript_method("asr")
                     return segments
+                else:
+                    evt("transcript_method_failed",
+                        method="asr", video_id=video_id, job_id=job_id,
+                        error_class="extraction_failed", error="empty_result")
                     
             except Exception as e:
+                # TRACE: Enhanced exception logging with stack trace
+                import traceback
+                stack_trace = traceback.format_exc()
+                
                 error_class = classify_transcript_error(e, video_id, "asr")
                 evt("transcript_method_failed", 
-                    method="asr", video_id=video_id, 
+                    method="asr", video_id=video_id, job_id=job_id,
                     error_class=error_class, error=str(e)[:100])
+                
+                # TRACE: Log detailed exception information
+                evt("asr_trace_exception",
+                    video_id=video_id,
+                    job_id=job_id,
+                    exception_type=type(e).__name__,
+                    exception_message=str(e)[:200],
+                    stack_trace_preview=stack_trace[:500])
+        else:
+            # TRACE: Conditional failed, log why
+            evt("asr_trace_conditional_failed",
+                video_id=video_id,
+                job_id=job_id,
+                asr_enabled=asr_enabled,
+                asr_key_configured=asr_key_configured,
+                reason_for_failure="asr_disabled" if not asr_enabled else "no_key" if not asr_key_configured else "unknown")
+            
+            # Step 4: Explicit skip reason
+            if not asr_enabled:
+                evt("asr_skipped", reason="asr_disabled_env", video_id=video_id, job_id=job_id)
+            elif not asr_key_configured:
+                evt("asr_skipped", reason="no_deepgram_key_attr", video_id=video_id, job_id=job_id)
+            else:
+                evt("asr_skipped", reason="unknown_condition", video_id=video_id, job_id=job_id)
         
         # All methods failed
+        evt(
+            "transcript_pipeline_returning_empty",
+            video_id=video_id,
+            job_id=job_id,
+        )
         evt("transcript_all_methods_failed", video_id=video_id)
         return []
 

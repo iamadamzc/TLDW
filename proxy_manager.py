@@ -282,6 +282,17 @@ class ProxyManager:
         
         # Initialize proxy configuration with graceful error handling
         try:
+            # Check if proxies are enabled via environment variable
+            use_proxies = os.getenv('USE_PROXIES', 'true').lower() == 'true'
+            
+            if not use_proxies:
+                self.logger.log_event("info", "Proxies disabled via USE_PROXIES environment variable",
+                                    use_proxies=False)
+                return  # Exit early - don't initialize proxy even if secret exists
+            
+            self.logger.log_event("info", "Proxies enabled via USE_PROXIES environment variable",
+                                use_proxies=True)
+            
             if secret_dict is None:
                 secret_dict = self._fetch_secret()
             
@@ -289,7 +300,7 @@ class ProxyManager:
                 self.secret = ProxySecret.from_dict(secret_dict)
                 self.in_use = True
                 self.logger.log_event("info", f"ProxyManager initialized successfully", 
-                                    secret_name=self.secret_name, provider=self.secret.provider)
+                                    secret_name=self.secret_name, provider=self.secret.provider, use_proxies=True)
             else:
                 self.logger.log_event("warning", "Invalid proxy secret schema, continuing without proxies",
                                     secret_name=self.secret_name)
@@ -634,7 +645,7 @@ class ProxyManager:
             None if proxy not available or client type unsupported
         """
         # Validate client type first
-        supported_clients = ["requests", "playwright"]
+        supported_clients = ["requests", "playwright", "httpx"]
         if client not in supported_clients:
             self.logger.log_event("error", f"Unsupported proxy client type: {client}", 
                                 client_type=client, supported_clients=supported_clients)
@@ -652,6 +663,12 @@ class ProxyManager:
             if client == "requests":
                 proxy_dict = {"http": url, "https": url}
                 self.logger.log_event("debug", f"Generated requests proxy dict for client: {client}")
+                return proxy_dict
+
+            if client == "httpx":
+                # httpx requires scheme-inclusive keys
+                proxy_dict = {"http://": url, "https://": url}
+                self.logger.log_event("debug", f"Generated httpx proxy dict for client: {client}")
                 return proxy_dict
 
             if client == "playwright":
@@ -859,6 +876,9 @@ class ProxyManager:
         
         if client == "requests":
             return {"http": proxy_url, "https": proxy_url}
+        elif client == "httpx":
+            # httpx requires scheme-inclusive keys
+            return {"http://": proxy_url, "https://": proxy_url}
         elif client == "playwright":
             try:
                 from urllib.parse import urlparse

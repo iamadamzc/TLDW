@@ -144,25 +144,68 @@ class DeterministicYouTubeiCapture:
                     job_id=self.job_id)
                 await self._setup_route_interception()
                 
-                # Navigate to video page with robust wait strategy
-                url = f"https://www.youtube.com/watch?v={self.video_id}&hl=en"
+                # Set page navigation timeout to 90s for resilience
+                page.set_default_navigation_timeout(90000)
                 
-                # Try networkidle with short timeout, fallback to domcontentloaded
+                # Setup lightweight resource blocking for faster page load (images/fonts/media only)
+                await page.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image", "font", "media"} else r.continue_())
+                
+                # Navigate to video page with desktop → mobile retry
+                desktop_url = f"https://www.youtube.com/watch?v={self.video_id}&hl=en"
+                mobile_url = f"https://m.youtube.com/watch?v={self.video_id}&hl=en"
+                
+                navigation_success = False
                 navigation_strategy = "unknown"
+                final_url = desktop_url
+                
+                # Try desktop URL first
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=15000)
-                    navigation_strategy = "networkidle"
-                except Exception:
-                    # Networkidle timeout common with residential proxies; fallback to domcontentloaded
+                    evt("youtubei_navigation_attempt",
+                        video_id=self.video_id,
+                        job_id=self.job_id,
+                        url=desktop_url,
+                        attempt=1,
+                        timeout_ms=90000,
+                        resource_blocking=True)
+                    
+                    await page.goto(desktop_url, wait_until="domcontentloaded", timeout=90000)
+                    navigation_success = True
+                    navigation_strategy = "desktop_domcontentloaded"
+                    
+                except Exception as desktop_error:
+                    # Desktop failed, retry with mobile URL
+                    evt("youtubei_navigation_retry",
+                        video_id=self.video_id,
+                        job_id=self.job_id,
+                        from_url=desktop_url,
+                        to_url=mobile_url,
+                        reason="timeout_or_error",
+                        error=str(desktop_error)[:100])
+                    
                     try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        navigation_strategy = "domcontentloaded"
-                    except Exception as nav_error:
+                        evt("youtubei_navigation_attempt",
+                            video_id=self.video_id,
+                            job_id=self.job_id,
+                            url=mobile_url,
+                            attempt=2,
+                            timeout_ms=90000,
+                            resource_blocking=True)
+                        
+                        await page.goto(mobile_url, wait_until="domcontentloaded", timeout=90000)
+                        navigation_success = True
+                        navigation_strategy = "mobile_domcontentloaded"
+                        final_url = mobile_url
+                        
+                    except Exception as mobile_error:
                         evt("youtubei_navigation_failed",
                             video_id=self.video_id,
                             job_id=self.job_id,
-                            error=str(nav_error)[:100])
+                            error=str(mobile_error)[:100],
+                            desktop_error=str(desktop_error)[:100])
                         return ""
+                
+                if not navigation_success:
+                    return ""
                 
                 # Explicitly wait for key selectors to ensure DOM is ready
                 try:
@@ -173,7 +216,7 @@ class DeterministicYouTubeiCapture:
                 evt("youtubei_navigation_complete", 
                     video_id=self.video_id, 
                     job_id=self.job_id, 
-                    url=url,
+                    url=final_url,
                     strategy=navigation_strategy)
                 
                 # Fast-path caption extraction from ytInitialPlayerResponse (Requirements 1.2, 1.3)

@@ -7,8 +7,8 @@ WORKDIR /app
 # Install system deps for ffmpeg, fonts, and cleanup (curl for health checks)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ffmpeg curl \
-        fonts-unifont fonts-liberation fonts-noto-color-emoji \
+    ffmpeg curl \
+    fonts-unifont fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -21,15 +21,16 @@ RUN playwright install --with-deps chromium
 # Verify FFmpeg is available during build
 RUN ffmpeg -version || echo "FFmpeg not found - downloads may fail"
 
-# Copy all Python application files
-COPY *.py ./
+# Copy application code
+COPY . .
+# DEBUG: Check if the new code made it in
+RUN grep "asr-debug-v3" transcript_service.py || (echo "CRITICAL: BUILD MARKER asr-debug-v3 NOT FOUND IN COPY" && exit 1)
 COPY templates/ templates/
 COPY static/ static/
 
 # Create non-root user for App Runner and ensure browser access
 RUN useradd -m app && \
-    chown -R app:app /app && \
-    (chown -R app:app /ms-playwright 2>/dev/null || true)
+    chown -R app:app /app
 USER app
 
 # Environment variables
@@ -49,7 +50,7 @@ RUN mkdir -p ${COOKIE_DIR}
 
 # Health check script
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:${PORT}/healthz || exit 1
+    CMD curl -f http://localhost:${PORT}/healthz || exit 1
 
 # Expose port and start Gunicorn
 EXPOSE 8080
