@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError
@@ -97,9 +98,12 @@ class EmailService:
             try:
                 # Extract fields with safe defaults (never crash on malformed data)
                 title = self._escape_html(self._safe_get(item, "title", "(Untitled)"))
-                summary = self._escape_html(self._safe_get(item, "summary", "No transcript available."))
+                raw_summary = self._safe_get(item, "summary", "No transcript available.")
                 video_url = self._safe_get(item, "video_url", "#")
                 thumbnail_url = self._safe_get(item, "thumbnail_url", "")
+                
+                # Convert markdown summary to formatted HTML
+                formatted_summary = self._format_summary_html(raw_summary)
                 
                 # Build video card HTML
                 card_html = f"""
@@ -111,8 +115,8 @@ class EmailService:
                         </div>
                         <div style="clear: both;"></div>
                     </div>
-                    <div style="padding: 24px; font-size: 1.1em; line-height: 1.7; color: #4a5568;">
-                        {summary}
+                    <div style="padding: 24px; font-size: 1em; line-height: 1.7; color: #4a5568;">
+                        {formatted_summary}
                     </div>
                 </div>
                 """
@@ -163,6 +167,131 @@ class EmailService:
         
         return html_content
     
+    def _format_summary_html(self, summary: str) -> str:
+        """
+        Convert GPT markdown summary to well-formatted HTML for email.
+        
+        Handles:
+        - **bold** → <strong>bold</strong>
+        - Bullet lists (- item) → <ul><li>
+        - Indented subpoints (  - item) → nested styling
+        - Newlines → proper paragraph/line breaks
+        - Preserves existing <a href> timestamp links from _add_timestamp_links()
+        """
+        if not summary or not isinstance(summary, str):
+            return "<p>No summary available.</p>"
+        
+        try:
+            # Step 1: Temporarily protect existing HTML <a> tags (timestamp links)
+            # These were already inserted by summarizer._add_timestamp_links()
+            link_placeholders = {}
+            link_counter = [0]
+            
+            def protect_link(match):
+                key = f"__LINK_{link_counter[0]}__"
+                link_placeholders[key] = match.group(0)
+                link_counter[0] += 1
+                return key
+            
+            # Protect <a href="...">...</a> tags
+            text = re.sub(r'<a\s+href="[^"]*"[^>]*>[^<]*</a>', protect_link, summary)
+            
+            # Step 2: Escape remaining HTML characters (but not our placeholders)
+            text = (text.replace('&', '&amp;')
+                       .replace('<', '&lt;')
+                       .replace('>', '&gt;')
+                       .replace('"', '&quot;'))
+            
+            # Step 3: Convert markdown bold **text** → <strong>text</strong>
+            text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+            
+            # Step 4: Process lines into structured HTML
+            lines = text.split('\n')
+            html_parts = []
+            in_list = False
+            in_sublist = False
+            
+            for line in lines:
+                stripped = line.strip()
+                
+                # Skip empty lines (add spacing)
+                if not stripped:
+                    if in_sublist:
+                        html_parts.append('</ul>')
+                        in_sublist = False
+                    if in_list:
+                        html_parts.append('</ul>')
+                        in_list = False
+                    html_parts.append('<div style="height: 8px;"></div>')
+                    continue
+                
+                # Detect indented subpoints (starts with spaces/tab + -)
+                is_subpoint = bool(re.match(r'^[\s]{2,}-\s', line)) or line.startswith('\t-')
+                # Detect main bullet points (starts with - )
+                is_bullet = stripped.startswith('- ') and not is_subpoint
+                
+                if is_subpoint:
+                    content = re.sub(r'^[\s]*-\s*', '', line).strip()
+                    if not in_sublist:
+                        in_sublist = True
+                        html_parts.append('<ul style="margin: 4px 0 4px 20px; padding-left: 16px; list-style-type: circle;">')
+                    html_parts.append(
+                        f'<li style="margin-bottom: 4px; color: #718096; font-size: 0.95em;">{content}</li>'
+                    )
+                elif is_bullet:
+                    content = stripped[2:]  # Remove "- "
+                    if in_sublist:
+                        html_parts.append('</ul>')
+                        in_sublist = False
+                    if not in_list:
+                        in_list = True
+                        html_parts.append('<ul style="margin: 12px 0; padding-left: 20px; list-style-type: disc;">')
+                    html_parts.append(
+                        f'<li style="margin-bottom: 8px; color: #4a5568;">{content}</li>'
+                    )
+                else:
+                    # Regular text (headings, paragraphs)
+                    if in_sublist:
+                        html_parts.append('</ul>')
+                        in_sublist = False
+                    if in_list:
+                        html_parts.append('</ul>')
+                        in_list = False
+                    
+                    # Style section headers differently
+                    if stripped.startswith('<strong>') and stripped.endswith('</strong>'):
+                        html_parts.append(
+                            f'<h3 style="margin: 20px 0 8px 0; font-size: 1.1em; color: #2d3748; '
+                            f'border-bottom: 1px solid #e2e8f0; padding-bottom: 6px;">{stripped}</h3>'
+                        )
+                    elif '<strong>' in stripped:
+                        html_parts.append(f'<p style="margin: 8px 0; color: #4a5568;">{stripped}</p>')
+                    else:
+                        html_parts.append(f'<p style="margin: 8px 0; color: #4a5568;">{stripped}</p>')
+            
+            # Close any open lists
+            if in_sublist:
+                html_parts.append('</ul>')
+            if in_list:
+                html_parts.append('</ul>')
+            
+            result = '\n'.join(html_parts)
+            
+            # Step 5: Restore protected link placeholders
+            for key, original_html in link_placeholders.items():
+                result = result.replace(key, original_html)
+            
+            return result
+            
+        except Exception as e:
+            logging.warning(f"Failed to format summary as HTML: {e}")
+            # Fallback: at minimum convert newlines to <br> and escape
+            fallback = (summary.replace('&', '&amp;')
+                              .replace('<', '&lt;')
+                              .replace('>', '&gt;')
+                              .replace('\n', '<br>'))
+            return fallback
+    
     def _safe_get(self, item: dict, key: str, default: str) -> str:
         """Safely get value from item dict with default fallback"""
         try:
@@ -193,7 +322,7 @@ class EmailService:
             """
     
     def _escape_html(self, text):
-        """Escape HTML special characters"""
+        """Escape HTML special characters (used for titles and other plain text)"""
         if not text:
             return ""
         try:

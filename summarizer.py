@@ -1,26 +1,26 @@
 import os
 import re
 import logging
-from openai import OpenAI
-from openai import AuthenticationError, RateLimitError, APIError
+import google.generativeai as genai
 
 class VideoSummarizer:
     def __init__(self):
-        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not self.openai_api_key:
-            logging.error("OPENAI_API_KEY environment variable is required but not set")
-            raise ValueError("OPENAI_API_KEY environment variable is required")
+        self.google_api_key = os.environ.get("GOOGLE_API_KEY", "")
+        if not self.google_api_key:
+            logging.error("GOOGLE_API_KEY environment variable is required but not set")
+            raise ValueError("GOOGLE_API_KEY environment variable is required")
         
         try:
-            self.client = OpenAI(api_key=self.openai_api_key)
-            logging.info("OpenAI client initialized successfully")
+            genai.configure(api_key=self.google_api_key)
+            self.model = genai.GenerativeModel('gemini-2.0-flash')
+            logging.info("Gemini Flash client initialized successfully")
         except Exception as e:
-            logging.error(f"Failed to initialize OpenAI client: {e}")
+            logging.error(f"Failed to initialize Gemini client: {e}")
             raise
 
     def summarize_video(self, *, transcript_text: str, video_id: str) -> str:
         """
-        Generate AI summary using OpenAI GPT-4o with specific formatting.
+        Generate AI summary using Google Gemini 2.0 Flash with specific formatting.
         
         Args:
             transcript_text: The video transcript text (keyword-only)
@@ -51,9 +51,9 @@ class VideoSummarizer:
         try:
             logging.info(f"Starting summarization for video {video_id}")
             logging.debug(f"Transcript length: {len(transcript_text)} characters")
+            
             # The prompt for the AI
-            prompt_text = f"""
-Summarize the following YouTube video transcript. Your goal is to create an engaging and easily digestible summary for a busy professional. Adopt a tone that is clear, insightful, and slightly informal.
+            prompt_text = f"""Summarize the following YouTube video transcript. Your goal is to create an engaging and easily digestible summary for a busy professional. Adopt a tone that is clear, insightful, and slightly informal.
 
 Your response must follow this exact format:
 
@@ -69,18 +69,19 @@ Transcript to summarize:
 {transcript_text}
 """
 
-            response = self.client.chat.completions.create(
-                model="gpt-4o",  # the newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
-                messages=[{"role": "user", "content": prompt_text}],
-                max_tokens=1500,
-                temperature=0.7
+            response = self.model.generate_content(
+                prompt_text,
+                generation_config={
+                    'temperature': 0.7,
+                    'max_output_tokens': 1500,
+                }
             )
             
-            if not response.choices or not response.choices[0].message.content:
-                logging.error("OpenAI API returned empty response")
-                raise APIError("OpenAI API returned empty response")
+            if not response or not response.text:
+                logging.error("Gemini API returned empty response")
+                return "Summary unavailable: API returned empty response."
             
-            summary = response.choices[0].message.content
+            summary = response.text
             logging.info(f"Successfully generated summary for video {video_id}")
             
             # Add timestamp links
@@ -88,18 +89,9 @@ Transcript to summarize:
             
             return summary_with_links
 
-        except AuthenticationError as e:
-            logging.error(f"OpenAI authentication failed for video {video_id}: {e}")
-            return "Summary unavailable: OpenAI authentication failed."
-        except RateLimitError as e:
-            logging.error(f"OpenAI rate limit exceeded for video {video_id}: {e}")
-            return "Summary unavailable: API rate limit exceeded."
-        except APIError as e:
-            logging.error(f"OpenAI API error for video {video_id}: {e}")
-            return "Summary unavailable: API error occurred."
         except Exception as e:
-            logging.error(f"Unexpected error during summarization for video {video_id}: {e}")
-            return "Summary unavailable: Processing error occurred."
+            logging.error(f"Gemini API error for video {video_id}: {e}")
+            return f"Summary unavailable: {str(e)}"
 
     def _add_timestamp_links(self, summary_text, video_id):
         """

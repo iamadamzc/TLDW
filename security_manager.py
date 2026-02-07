@@ -356,11 +356,11 @@ class CredentialProtector:
             return False, "API key appears to be a placeholder"
         
         # Type-specific validation
-        if key_type.lower() == 'openai':
-            if not key.startswith('sk-'):
-                return False, "OpenAI API key should start with 'sk-'"
-            if len(key) < 48:
-                return False, "OpenAI API key appears too short"
+        if key_type.lower() == 'google':
+            if not key.startswith('AIza'):
+                return False, "Google API key should start with 'AIza'"
+            if len(key) < 39:
+                return False, "Google API key appears too short"
         
         elif key_type.lower() == 'resend':
             if not key.startswith('re_'):
@@ -393,7 +393,7 @@ class CredentialProtector:
         
         # Check API key presence and format
         api_keys = {
-            "OPENAI_API_KEY": "openai",
+            "GOOGLE_API_KEY": "google",
             "RESEND_API_KEY": "resend", 
             "DEEPGRAM_API_KEY": "deepgram"
         }
