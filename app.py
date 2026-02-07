@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 
 from flask import Flask, jsonify
 from transcript_metrics import snapshot as transcript_metrics_snapshot
@@ -28,6 +29,17 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_recycle": 300,
     "pool_pre_ping": True,
 }
+
+# Disable static file caching to ensure fresh JS/CSS on each deploy
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+# Cache-bust token: set once at app startup so all requests in this
+# process lifetime use the same value, but a new deploy gets a new one.
+_CACHE_BUST = str(int(time.time()))
+
+@app.context_processor
+def inject_cache_bust():
+    return {"cache_bust": _CACHE_BUST}
 
 # initialize the app with the extension
 db.init_app(app)
