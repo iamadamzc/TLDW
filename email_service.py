@@ -348,7 +348,7 @@ class EmailService:
             return f"TL;DW: {title}"
         
         # Multiple videos: show count
-        return f"TL;DW: Your {len(items)} Video Summaries"
+        return f"Your TL;DW Video Summary"
     
     def _escape_html(self, text):
         """Escape HTML special characters (used for titles and other plain text)"""
