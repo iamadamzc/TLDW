@@ -103,44 +103,7 @@
                         </div>
                         {% endif %}
 
-                        <!-- Cookie Management Section -->
-                        <div class="card mb-4" id="cookie-management-section">
-                            <div class="card-body">
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <h5 class="card-title">
-                                            <i data-feather="shield"></i> YouTube Cookie Status
-                                        </h5>
-                                        {% if cookie_status.has_cookies %}
-                                        <span class="badge bg-{{ cookie_status.status_class }} me-2">{{
-                                            cookie_status.status_text }}</span>
-                                        {% if cookie_status.file_size_kb %}
-                                        <small class="text-muted">{{ cookie_status.file_size_kb }}KB uploaded</small>
-                                        {% endif %}
-                                        <p class="text-muted mb-0 mt-2">Your YouTube cookies are active, improving video
-                                            access reliability.</p>
-                                        {% else %}
-                                        <span class="badge bg-{{ cookie_status.status_class }} me-2">{{
-                                            cookie_status.status_text }}</span>
-                                        <p class="text-muted mb-0 mt-2">Upload your YouTube cookies to improve video
-                                            processing reliability and reduce failures.</p>
-                                        {% endif %}
-                                    </div>
-                                    <div>
-                                        {% if cookie_status.has_cookies %}
-                                        <a href="{{ url_for('cookies_routes.cookies_page') }}"
-                                            class="btn btn-outline-primary">
-                                            <i data-feather="settings"></i> Manage Cookies
-                                        </a>
-                                        {% else %}
-                                        <a href="{{ url_for('cookies_routes.cookies_page') }}" class="btn btn-primary">
-                                            <i data-feather="upload"></i> Upload Cookies
-                                        </a>
-                                        {% endif %}
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
+
 
                         <!-- Playlist Selection -->
                         <div class="card mb-4">
