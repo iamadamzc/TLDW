@@ -52,10 +52,13 @@ class EmailService:
             # Generate HTML with fault-tolerant template
             html_content = self._generate_email_html(items)
             
+            # Generate dynamic subject line based on content
+            subject = self._generate_subject_line(items)
+            
             payload = {
                 "from": f"TL;DW <{self.sender_email}>",
                 "to": [user_email],
-                "subject": "Your TL;DW Video Digest",
+                "subject": subject,
                 "html": html_content
             }
 
@@ -320,6 +323,32 @@ class EmailService:
                 <span style="color: #a0aec0; font-size: 0.8em;">No Image</span>
             </div>
             """
+    
+    
+    def _generate_subject_line(self, items):
+        """
+        Generate dynamic subject line based on video content.
+        
+        Args:
+            items: List of video items (each with 'title' key)
+            
+        Returns:
+            str: Formatted subject line
+        """
+        if not items or len(items) == 0:
+            return "Your TL;DW Video Digest"
+        
+        if len(items) == 1:
+            # Single video: use the video title (truncated if needed)
+            title = self._safe_get(items[0], "title", "Video")
+            # Truncate long titles to keep subject line reasonable
+            max_length = 60
+            if len(title) > max_length:
+                title = title[:max_length].rsplit(' ', 1)[0] + "..."
+            return f"TL;DW: {title}"
+        
+        # Multiple videos: show count
+        return f"TL;DW: Your {len(items)} Video Summaries"
     
     def _escape_html(self, text):
         """Escape HTML special characters (used for titles and other plain text)"""
